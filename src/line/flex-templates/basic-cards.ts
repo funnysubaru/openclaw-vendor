@@ -332,7 +332,7 @@ export function createNotificationBubble(
 ): FlexBubble {
   // Color based on notification type
   const colors = {
-    info: { accent: "#3B82F6", bg: "#EFF6FF" },
+    info: { accent: "#7c3aed", bg: "#f5f3ff" },
     success: { accent: "#06C755", bg: "#F0FDF4" },
     warning: { accent: "#F59E0B", bg: "#FFFBEB" },
     error: { accent: "#EF4444", bg: "#FEF2F2" },

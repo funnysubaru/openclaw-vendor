@@ -64,7 +64,7 @@
   --danger: #ef4444;
   --danger-muted: rgba(239, 68, 68, 0.75);
   --danger-subtle: rgba(239, 68, 68, 0.12);
-  --info: #3b82f6;
+  --info: #8b5cf6;
 
   /* Focus - With glow */
   --focus: rgba(255, 92, 92, 0.25);
@@ -169,7 +169,7 @@
   --danger: #dc2626;
   --danger-muted: rgba(220, 38, 38, 0.75);
   --danger-subtle: rgba(220, 38, 38, 0.1);
-  --info: #2563eb;
+  --info: #7c3aed;
 
   --focus: rgba(220, 38, 38, 0.2);
   --focus-glow: 0 0 0 2px var(--bg), 0 0 0 4px var(--ring), 0 0 16px var(--accent-glow);

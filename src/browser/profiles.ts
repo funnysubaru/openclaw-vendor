@@ -80,7 +80,7 @@ export function getUsedPorts(
 
 export const PROFILE_COLORS = [
   "#FF4500", // Orange-red (openclaw default)
-  "#0066CC", // Blue
+  "#7e22ce", // Purple (dark)
   "#00AA00", // Green
   "#9933FF", // Purple
   "#FF6699", // Pink

@@ -63,8 +63,8 @@
   --warn-subtle: rgba(245, 158, 11, 0.08);
   --danger: #ef4444;
   --danger-muted: rgba(239, 68, 68, 0.75);
-  --danger-subtle: rgba(239, 68, 68, 0.08);
-  --info: #3b82f6;
+  --danger-subtle: rgba(239, 68, 68, 0.12);
+  --info: #8b5cf6;
 
   /* Focus */
   --focus: rgba(255, 92, 92, 0.2);
@@ -168,8 +168,8 @@
   --warn-subtle: rgba(217, 119, 6, 0.08);
   --danger: #dc2626;
   --danger-muted: rgba(220, 38, 38, 0.75);
-  --danger-subtle: rgba(220, 38, 38, 0.08);
-  --info: #2563eb;
+  --danger-subtle: rgba(220, 38, 38, 0.1);
+  --info: #7c3aed;
 
   --focus: rgba(220, 38, 38, 0.15);
   --focus-ring: 0 0 0 2px var(--bg), 0 0 0 3px color-mix(in srgb, var(--ring) 50%, transparent);

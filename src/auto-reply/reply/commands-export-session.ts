@@ -39,7 +39,7 @@ function generateHtml(sessionData: SessionData): string {
   // Use pi-mono dark theme colors (matching their theme/dark.json)
   const themeVars = `
     --cyan: #00d7ff;
-    --blue: #5f87ff;
+    --blue: #9333ea;
     --green: #b5bd68;
     --red: #cc6666;
     --yellow: #ffff00;
@@ -56,8 +56,8 @@ function generateHtml(sessionData: SessionData): string {
     --text: #e0e0e0;
     --dim: #666666;
     --muted: #808080;
-    --border: #5f87ff;
-    --borderAccent: #00d7ff;
+    --border: #9333ea;
+    --borderAccent: #c084fc;
     --borderMuted: #505050;
     --success: #b5bd68;
     --error: #cc6666;
@@ -71,7 +71,7 @@ function generateHtml(sessionData: SessionData): string {
     --toolTitle: #e0e0e0;
     --toolOutput: #808080;
     --mdHeading: #f0c674;
-    --mdLink: #81a2be;
+    --mdLink: #a78bfa;
     --mdLinkUrl: #666666;
     --mdCode: #8abeb7;
     --mdCodeBlock: #b5bd68;

@@ -1,29 +1,25 @@
 ---
-summary: "Legacy iMessage support via imsg (JSON-RPC over stdio). New setups should use BlueBubbles."
+summary: "Native iMessage support via imsg (JSON-RPC over stdio). Preferred for new OpenClaw iMessage setups when host requirements fit."
 read_when:
   - Setting up iMessage support
   - Debugging iMessage send/receive
 title: "iMessage"
 ---
 
-# iMessage (legacy: imsg)
+<Note>
+For new OpenClaw iMessage deployments, start here when you can run `imsg` on a signed-in macOS Messages host. BlueBubbles remains available as a legacy fallback for existing setups that depend on its HTTP server, webhooks, or richer private-API actions.
+</Note>
 
-<Warning>
-For new iMessage deployments, use <a href="/channels/bluebubbles">BlueBubbles</a>.
-
-The `imsg` integration is legacy and may be removed in a future release.
-</Warning>
-
-Status: legacy external CLI integration. Gateway spawns `imsg rpc` and communicates over JSON-RPC on stdio (no separate daemon/port).
+Status: native external CLI integration. Gateway spawns `imsg rpc` and communicates over JSON-RPC on stdio (no separate daemon/port).
 
 <CardGroup cols={3}>
-  <Card title="BlueBubbles (recommended)" icon="message-circle" href="/channels/bluebubbles">
-    Preferred iMessage path for new setups.
+  <Card title="BlueBubbles (legacy fallback)" icon="message-circle" href="/channels/bluebubbles">
+    Keep using it for existing BlueBubbles-backed routing; avoid it for new setups when imsg fits.
   </Card>
   <Card title="Pairing" icon="link" href="/channels/pairing">
     iMessage DMs default to pairing mode.
   </Card>
-  <Card title="Configuration reference" icon="settings" href="/gateway/configuration-reference#imessage">
+  <Card title="Configuration reference" icon="settings" href="/gateway/config-channels#imessage">
     Full iMessage field reference.
   </Card>
 </CardGroup>
@@ -50,7 +46,7 @@ imsg rpc --help
     imessage: {
       enabled: true,
       cliPath: "/usr/local/bin/imsg",
-      dbPath: "/Users/<you>/Library/Messages/chat.db",
+      dbPath: "/Users/user/Library/Messages/chat.db",
     },
   },
 }
@@ -184,6 +180,58 @@ imsg send <handle> "test"
   </Tab>
 </Tabs>
 
+## ACP conversation bindings
+
+Legacy iMessage chats can also be bound to ACP sessions.
+
+Fast operator flow:
+
+- Run `/acp spawn codex --bind here` inside the DM or allowed group chat.
+- Future messages in that same iMessage conversation route to the spawned ACP session.
+- `/new` and `/reset` reset the same bound ACP session in place.
+- `/acp close` closes the ACP session and removes the binding.
+
+Configured persistent bindings are supported through top-level `bindings[]` entries with `type: "acp"` and `match.channel: "imessage"`.
+
+`match.peer.id` can use:
+
+- normalized DM handle such as `+15555550123` or `user@example.com`
+- `chat_id:<id>` (recommended for stable group bindings)
+- `chat_guid:<guid>`
+- `chat_identifier:<identifier>`
+
+Example:
+
+```json5
+{
+  agents: {
+    list: [
+      {
+        id: "codex",
+        runtime: {
+          type: "acp",
+          acp: { agent: "codex", backend: "acpx", mode: "persistent" },
+        },
+      },
+    ],
+  },
+  bindings: [
+    {
+      type: "acp",
+      agentId: "codex",
+      match: {
+        channel: "imessage",
+        accountId: "default",
+        peer: { kind: "group", id: "chat_id:123" },
+      },
+      acp: { label: "codex-group" },
+    },
+  ],
+}
+```
+
+See [ACP Agents](/tools/acp-agents) for shared ACP binding behavior.
+
 ## Deployment patterns
 
 <AccordionGroup>
@@ -256,6 +304,7 @@ exec ssh -T bot@mac-mini.tailnet-1234.ts.net imsg "$@"
       - default root pattern: `/Users/*/Library/Messages/Attachments`
     - SCP uses strict host-key checking (`StrictHostKeyChecking=yes`)
     - outbound media size uses `channels.imessage.mediaMaxMb` (default 16 MB)
+
   </Accordion>
 
   <Accordion title="Outbound chunking">
@@ -263,6 +312,7 @@ exec ssh -T bot@mac-mini.tailnet-1234.ts.net imsg "$@"
     - chunk mode: `channels.imessage.chunkMode`
       - `length` (default)
       - `newline` (paragraph-first splitting)
+
   </Accordion>
 
   <Accordion title="Addressing formats">
@@ -361,7 +411,15 @@ imsg send <handle> "test"
 
 ## Configuration reference pointers
 
-- [Configuration reference - iMessage](/gateway/configuration-reference#imessage)
+- [Configuration reference - iMessage](/gateway/config-channels#imessage)
 - [Gateway configuration](/gateway/configuration)
 - [Pairing](/channels/pairing)
 - [BlueBubbles](/channels/bluebubbles)
+
+## Related
+
+- [Channels Overview](/channels) — all supported channels
+- [Pairing](/channels/pairing) — DM authentication and pairing flow
+- [Groups](/channels/groups) — group chat behavior and mention gating
+- [Channel Routing](/channels/channel-routing) — session routing for messages
+- [Security](/gateway/security) — access model and hardening

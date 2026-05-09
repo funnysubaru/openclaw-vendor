@@ -98,6 +98,17 @@ export const SessionsResetParamsSchema = Type.Object(
   { additionalProperties: false },
 );
 
+// sessions.refreshBootstrap params:
+//   仅清除指定 sessionKey 的 bootstrap workspace-files 缓存（SOUL.md / context-files
+//   等下一轮回复重新装载时拿到新内容），**不归档 jsonl、不切 sessionId、不动长期记忆**。
+//   适用场景：用户改完 SOUL.md 想让新版立刻在下一轮回复生效，但不想丢当前对话上下文。
+export const SessionsRefreshBootstrapParamsSchema = Type.Object(
+  {
+    key: NonEmptyString,
+  },
+  { additionalProperties: false },
+);
+
 export const SessionsDeleteParamsSchema = Type.Object(
   {
     key: NonEmptyString,

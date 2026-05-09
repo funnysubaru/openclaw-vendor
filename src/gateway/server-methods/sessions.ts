@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { resolveDefaultAgentId } from "../../agents/agent-scope.js";
+import { clearBootstrapSnapshot } from "../../agents/bootstrap-cache.js";
 import { loadConfig } from "../../config/config.js";
 import {
   loadSessionStore,
@@ -17,6 +18,7 @@ import {
   validateSessionsListParams,
   validateSessionsPatchParams,
   validateSessionsPreviewParams,
+  validateSessionsRefreshBootstrapParams,
   validateSessionsResetParams,
   validateSessionsResolveParams,
 } from "../protocol/index.js";
@@ -273,6 +275,46 @@ export const sessionsHandlers: GatewayRequestHandlers = {
       return;
     }
     respond(true, { ok: true, key: result.key, entry: result.entry }, undefined);
+  },
+  // sessions.refreshBootstrap —— 软刷新：仅清掉指定 sessionKey 的 bootstrap workspace-files
+  // 缓存（SOUL.md / context-files 等），让下一轮回复重新装载磁盘上的最新内容。
+  //
+  // 与 sessions.reset 的关键差别：
+  //   reset           = 归档 jsonl + 起新 sessionId + 清 bootstrap 缓存（破坏性，丢对话历史）
+  //   refreshBootstrap = 仅清 bootstrap 缓存（非破坏性，对话历史保留）
+  //
+  // 适用场景：
+  //   用户在 Yuiclaw 面板里改完 SOUL.md，希望下一轮回复立刻用新版 SOUL，但又不想丢
+  //   当前的对话上下文。Yuiclaw 侧 /apply-soul 端点的 "soft" 模式调用此 RPC。
+  //
+  // 幂等性：
+  //   即便指定 key 的缓存当前为空（首次访问还没装载过），也返回 ok:true。
+  //   不需要预先 sessions.list / sessions.get 校验 key 存在。
+  //
+  // 不做的事：
+  //   - 不归档 jsonl
+  //   - 不切 sessionId
+  //   - 不动长期记忆（MEMORY.md / USER.md / IDENTITY.md / memory/）
+  //   - 不触发 sessionUnbound lifecycle 事件
+  //   - 不调用 executeSyncNow（workspace 文件 sync 是上游链路的事，应在调用方先做）
+  "sessions.refreshBootstrap": ({ params, respond }) => {
+    if (
+      !assertValidParams(
+        params,
+        validateSessionsRefreshBootstrapParams,
+        "sessions.refreshBootstrap",
+        respond,
+      )
+    ) {
+      return;
+    }
+    const p = params;
+    const key = requireSessionKey(p.key, respond);
+    if (!key) {
+      return;
+    }
+    clearBootstrapSnapshot(key);
+    respond(true, { ok: true, key }, undefined);
   },
   "sessions.delete": async ({ params, respond, client, isWebchatConnect }) => {
     if (!assertValidParams(params, validateSessionsDeleteParams, "sessions.delete", respond)) {

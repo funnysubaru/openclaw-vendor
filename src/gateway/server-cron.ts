@@ -10,6 +10,7 @@ import {
 import { resolveStorePath } from "../config/sessions/paths.js";
 import { resolveFailureDestination, sendFailureNotificationAnnounce } from "../cron/delivery.js";
 import { runCronIsolatedAgentTurn } from "../cron/isolated-agent.js";
+import { resolveCronRunSessionKey } from "../cron/isolated-agent/cron-run-session-key.js";
 import { resolveDeliveryTarget } from "../cron/isolated-agent/delivery-target.js";
 import {
   appendCronRunLog,
@@ -154,14 +155,14 @@ export function buildGatewayCronService(params: {
     const runtimeConfig = loadConfig();
     const normalized =
       typeof requested === "string" && requested.trim() ? normalizeAgentId(requested) : undefined;
-    const hasAgent =
-      normalized !== undefined &&
-      Array.isArray(runtimeConfig.agents?.list) &&
-      runtimeConfig.agents.list.some(
-        (entry) =>
-          entry && typeof entry.id === "string" && normalizeAgentId(entry.id) === normalized,
-      );
-    const agentId = hasAgent ? normalized : resolveDefaultAgentId(runtimeConfig);
+    // 业务意图：requested agentId 即使不在 config.agents.list 里也接受——host (如 Yuiclaw)
+    // 把 agent 的 SOUL/IDENTITY/workspace 写在 ~/.openclaw/agents/<id>/ 目录里，但不一定
+    // 同步到 openclaw.json.agents.list。run.ts:235 的 requestedAgentId 解析持同样契约
+    // ("Use the requested agentId even when there is no explicit agent config entry")，
+    // 这里之前的 hasAgent 检查会把 Yuiclaw 的 custom-* / orch-* 等动态 agent 错兜底成
+    // default agent (main)，导致 cron 跑到 main 而不是 jobs.json 里 jobCreate.agentId
+    // 指定的那个 agent (实战：5/14 12:07 Ralph Lauren cron 跑到 main 没 vision 工具)。
+    const agentId = normalized ?? resolveDefaultAgentId(runtimeConfig);
     return { agentId, cfg: runtimeConfig };
   };
 
@@ -284,6 +285,10 @@ export function buildGatewayCronService(params: {
     },
     runIsolatedAgentJob: async ({ job, message, abortSignal }) => {
       const { agentId, cfg: runtimeConfig } = resolveCronAgent(job.agentId);
+      // 业务意图：当 job.sessionKey 是合法 `agent:<...>` 前缀 session key 时复用，
+      // 否则用 `cron:<jobId>` 派生独立 isolated session。详见 cron-run-session-key.ts
+      // 文件头注释 + 单测。
+      const cronSessionKey = resolveCronRunSessionKey(job);
       return await runCronIsolatedAgentTurn({
         cfg: runtimeConfig,
         deps: params.deps,
@@ -291,7 +296,7 @@ export function buildGatewayCronService(params: {
         message,
         abortSignal,
         agentId,
-        sessionKey: `cron:${job.id}`,
+        sessionKey: cronSessionKey,
         lane: "cron",
       });
     },

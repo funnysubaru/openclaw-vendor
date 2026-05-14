@@ -7,6 +7,10 @@ import {
 import type { CronJobCreate, CronJobPatch } from "../../cron/types.js";
 import { validateScheduleTimestamp } from "../../cron/validate-timestamp.js";
 import {
+  validateCronJobCreateDelivery,
+  validateCronJobPatchDelivery,
+} from "../../cron/validate-delivery-channel.js";
+import {
   ErrorCodes,
   errorShape,
   formatValidationErrors,
@@ -111,6 +115,14 @@ export const cronHandlers: GatewayRequestHandlers = {
       );
       return;
     }
+    // 业务白名单校验：delivery.channel 必须是 deliverable channel 或 "webchat"
+    // (拦下 AI/CLI 误灌的 `webchat-control-ui` 等杜撰 channel id；详见
+    // validate-delivery-channel.ts 文件头)
+    const deliveryValidation = validateCronJobCreateDelivery(jobCreate);
+    if (!deliveryValidation.ok) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, deliveryValidation.message));
+      return;
+    }
     const job = await context.cron.add(jobCreate);
     context.logGateway.info("cron: job created", { jobId: job.id, schedule: jobCreate.schedule });
     respond(true, job, undefined);
@@ -157,6 +169,19 @@ export const cronHandlers: GatewayRequestHandlers = {
         );
         return;
       }
+    }
+    // 同 cron.add：patch.delivery 走业务白名单校验。
+    // **作用域（Low 5，PR #39 review）**：本校验只看 patch 字段本身，**不**与原 job 的
+    // delivery merge 后再校验。语义 = "patch 自身合法即放行"：
+    //   - patch.delivery 缺省 → 不做校验（让原 job.delivery 沿用，由 cron.add 时已校验过）
+    //   - patch.delivery 存在但缺 channel → 同 cron.add 放行，依赖运行时 fallback
+    //   - patch.delivery.channel 非法字面量 → 拦截
+    // 这与 patch 语义一致。若产品层希望"patch 一旦带 delivery 必须是完整合法 delivery
+    // 对象"，应在更上层加 schema 强约束，本层不假设。
+    const deliveryValidation = validateCronJobPatchDelivery(patch);
+    if (!deliveryValidation.ok) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, deliveryValidation.message));
+      return;
     }
     const job = await context.cron.update(jobId, patch);
     context.logGateway.info("cron: job updated", { jobId });

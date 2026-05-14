@@ -7,6 +7,10 @@ import {
 import type { CronJobCreate, CronJobPatch } from "../../cron/types.js";
 import { validateScheduleTimestamp } from "../../cron/validate-timestamp.js";
 import {
+  validateCronJobCreateDelivery,
+  validateCronJobPatchDelivery,
+} from "../../cron/validate-delivery-channel.js";
+import {
   ErrorCodes,
   errorShape,
   formatValidationErrors,
@@ -111,6 +115,14 @@ export const cronHandlers: GatewayRequestHandlers = {
       );
       return;
     }
+    // 业务白名单校验：delivery.channel 必须是 deliverable channel 或 "webchat"
+    // (拦下 AI/CLI 误灌的 `webchat-control-ui` 等杜撰 channel id；详见
+    // validate-delivery-channel.ts 文件头)
+    const deliveryValidation = validateCronJobCreateDelivery(jobCreate);
+    if (!deliveryValidation.ok) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, deliveryValidation.message));
+      return;
+    }
     const job = await context.cron.add(jobCreate);
     context.logGateway.info("cron: job created", { jobId: job.id, schedule: jobCreate.schedule });
     respond(true, job, undefined);
@@ -157,6 +169,12 @@ export const cronHandlers: GatewayRequestHandlers = {
         );
         return;
       }
+    }
+    // 同 cron.add：patch.delivery 走业务白名单校验
+    const deliveryValidation = validateCronJobPatchDelivery(patch);
+    if (!deliveryValidation.ok) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, deliveryValidation.message));
+      return;
     }
     const job = await context.cron.update(jobId, patch);
     context.logGateway.info("cron: job updated", { jobId });

@@ -5,6 +5,14 @@
  * 调用顺序：当 validateCronJobCreateDelivery / validateCronJobPatchDelivery 返回
  * `{ ok: false }` 时，cron.add / cron.update 必须 INVALID_REQUEST 短路，**不**调用
  * context.cron.add / context.cron.update（防止后续有人调整顺序、把校验放到落库后）。
+ *
+ * **依赖（Low 3，PR #39 follow-up-3 review）**：本文件的"非法 channel → 短路"用例
+ * 依赖 `validateCronAddParams` / `validateCronUpdateParams` 先对 params shape 放行。
+ * 若日后 schema 收紧（如对 delivery 结构更严的 Ajv 规则），同一 fixture 可能在
+ * shape 校验阶段就被拒，错误形态会从「delivery.channel 非法」变成「invalid cron.add
+ * params」。届时需要：① 调 fixture 以满足新 shape；或 ② 拆成两条用例，分别
+ * 验证 shape-invalid 与 channel-invalid 的短路。这里把假设显式写下来，便于以后
+ * 维护者理解失败信号。
  */
 import { describe, expect, it, vi } from "vitest";
 import { cronHandlers } from "./cron.js";
@@ -104,6 +112,41 @@ describe("cronHandlers delivery validation short-circuit", () => {
       code: ErrorCodes.INVALID_REQUEST,
       message: expect.stringContaining("not-a-real-channel"),
     });
+  });
+
+  it("cron.update: patch without delivery field → DOES call context.cron.update (happy path)", async () => {
+    // Info 4 (PR #39 follow-up-3 review)：防回归——patch 不带 delivery 字段时不应被
+    // delivery 白名单误拦。模拟"只改 schedule"或"只改 name" 这种最常见的 cron.update
+    // 用法。
+    const { context, cronUpdate } = buildContextStub();
+    const respond = vi.fn();
+    cronUpdate.mockResolvedValue({ id: "job-xyz", name: "renamed" });
+
+    const params = {
+      id: "job-xyz",
+      patch: {
+        name: "renamed-cron-job",
+        // 故意不写 delivery 字段
+      },
+    };
+
+    await cronHandlers["cron.update"]({
+      req: {} as never,
+      params: params as unknown as Record<string, unknown>,
+      client: null,
+      isWebchatConnect: () => false,
+      respond,
+      context,
+    });
+
+    expect(cronUpdate).toHaveBeenCalledOnce();
+    expect(cronUpdate).toHaveBeenCalledWith(
+      "job-xyz",
+      expect.objectContaining({ name: "renamed-cron-job" }),
+    );
+    expect(respond).toHaveBeenCalledOnce();
+    const [ok] = respond.mock.calls[0];
+    expect(ok).toBe(true);
   });
 
   it("cron.add: valid announce channel (webchat) passes validation → DOES call context.cron.add", async () => {

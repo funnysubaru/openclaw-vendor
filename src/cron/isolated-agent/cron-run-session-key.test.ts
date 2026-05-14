@@ -42,11 +42,12 @@ describe("resolveCronRunSessionKey", () => {
     expect(resolveCronRunSessionKey({ id: "job-8", sessionKey: mainKey })).toBe(mainKey);
   });
 
-  it("is case-insensitive on the 'agent:' prefix detection", () => {
-    // 防御性：大小写混合的 sessionKey 仍按 agent: 前缀复用
+  it("is case-insensitive on the 'agent:' prefix detection and lowercases the full key", () => {
+    // 防御性：大小写混合的 sessionKey 仍按 agent: 前缀识别；返回时全文 lowercase
+    // 以匹配 vendor 其它路径 (toAgentStoreSessionKey) 的 canonical 形式
     expect(
-      resolveCronRunSessionKey({ id: "job-9", sessionKey: "Agent:custom:user:x:y" }),
-    ).toBe("Agent:custom:user:x:y");
+      resolveCronRunSessionKey({ id: "job-9", sessionKey: "Agent:Custom:User:X:Y" }),
+    ).toBe("agent:custom:user:x:y");
   });
 
   it("trims surrounding whitespace before evaluation", () => {

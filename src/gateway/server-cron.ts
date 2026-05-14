@@ -10,7 +10,7 @@ import {
 import { resolveStorePath } from "../config/sessions/paths.js";
 import { resolveFailureDestination, sendFailureNotificationAnnounce } from "../cron/delivery.js";
 import { runCronIsolatedAgentTurn } from "../cron/isolated-agent.js";
-import { resolveCronRunSessionKey } from "../cron/isolated-agent/cron-run-session-key.js";
+import { resolveCronRunTarget } from "../cron/isolated-agent/cron-run-target.js";
 import { resolveDeliveryTarget } from "../cron/isolated-agent/delivery-target.js";
 import {
   appendCronRunLog,
@@ -284,19 +284,31 @@ export function buildGatewayCronService(params: {
       });
     },
     runIsolatedAgentJob: async ({ job, message, abortSignal }) => {
-      const { agentId, cfg: runtimeConfig } = resolveCronAgent(job.agentId);
-      // 业务意图：当 job.sessionKey 是合法 `agent:<...>` 前缀 session key 时复用，
-      // 否则用 `cron:<jobId>` 派生独立 isolated session。详见 cron-run-session-key.ts
-      // 文件头注释 + 单测。
-      const cronSessionKey = resolveCronRunSessionKey(job);
+      const { agentId: requestedAgentId, cfg: runtimeConfig } = resolveCronAgent(job.agentId);
+      // 业务意图：当 job.sessionKey 是 canonical `agent:<sid>:...` 前缀 session key 时，
+      // 把 sid 作为真相之源（决定 jsonl 落到哪个 agent 目录），避免 job.agentId 与
+      // sessionKey 嵌入 agentId 不一致时 "运行 agent" 与 "写入 jsonl 路径" 分裂。
+      // 详见 cron-run-target.ts 文件头注释 + Open Question 修复。
+      const target = resolveCronRunTarget(job, requestedAgentId);
+      if (target.divergence) {
+        cronLogger.warn(
+          "cron: job.agentId differs from sessionKey-embedded agentId; running on sessionKey's agent to keep jsonl ownership consistent",
+          {
+            jobId: job.id,
+            jobAgentId: target.divergence.jobAgentId,
+            sessionKeyAgentId: target.divergence.sessionKeyAgentId,
+            sessionKey: target.sessionKey,
+          },
+        );
+      }
       return await runCronIsolatedAgentTurn({
         cfg: runtimeConfig,
         deps: params.deps,
         job,
         message,
         abortSignal,
-        agentId,
-        sessionKey: cronSessionKey,
+        agentId: target.agentId,
+        sessionKey: target.sessionKey,
         lane: "cron",
       });
     },

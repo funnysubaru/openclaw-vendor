@@ -149,8 +149,10 @@ describe("cronHandlers delivery validation short-circuit", () => {
     expect(ok).toBe(true);
   });
 
-  it("cron.add: valid announce channel (webchat) passes validation → DOES call context.cron.add", async () => {
-    // 对照用例：白名单内 channel 不被误拦，保护 happy path
+  it("cron.add: valid announce channel (line) passes validation → DOES call context.cron.add", async () => {
+    // 对照用例：白名单内 channel 不被误拦，保护 happy path。
+    // 注意 (P1.1 修复后)：webchat 已从白名单移除 —— Yuiclaw 投递 panel session 走
+    // job.sessionKey 复用，不走 delivery.channel="webchat"。
     const { context, cronAdd } = buildContextStub();
     const respond = vi.fn();
     cronAdd.mockResolvedValue({ id: "new-job-id", name: "ok" });
@@ -159,8 +161,8 @@ describe("cronHandlers delivery validation short-circuit", () => {
       ...buildValidCronAddParams(),
       delivery: {
         mode: "announce" as const,
-        channel: "webchat",
-        to: "agent:main:user:abc:panel-xyz",
+        channel: "line",
+        to: "U1234567890",
       },
     };
 

@@ -246,16 +246,18 @@ describe("buildGatewayCronService", () => {
         // sessionKey 透传给运行,canonical lowercase
         expect(callArgs.sessionKey).toBe("agent:custom-cbd0fe4a:user:abc:panel-xyz");
 
-        // PR #41 follow-up review (#3): warn 必须打出,让有人删掉 warn 块时测试会红
-        expect(cronWarnMock).toHaveBeenCalledOnce();
-        const [warnMessage, warnContext] = cronWarnMock.mock.calls[0];
-        expect(warnMessage).toContain("differs from sessionKey-embedded agentId");
-        expect(warnContext).toMatchObject({
-          jobId: job.id,
-          jobAgentId: "main",
-          sessionKeyAgentId: "custom-cbd0fe4a",
-          sessionKey: "agent:custom-cbd0fe4a:user:abc:panel-xyz",
-        });
+        // PR #43 follow-up review (#1)：按内容断言而非"调用次数",防止 cron.run 路径
+        // 同时打出别的 warn (如过期 schedule / failure / run log) 让测试假阳。
+        // 之后有人删掉 divergence warn 块,这条 toHaveBeenCalledWith 仍会红。
+        expect(cronWarnMock).toHaveBeenCalledWith(
+          expect.stringContaining("differs from sessionKey-embedded agentId"),
+          expect.objectContaining({
+            jobId: job.id,
+            jobAgentId: "main",
+            sessionKeyAgentId: "custom-cbd0fe4a",
+            sessionKey: "agent:custom-cbd0fe4a:user:abc:panel-xyz",
+          }),
+        );
       } finally {
         state.cron.stop();
       }
@@ -293,9 +295,12 @@ describe("buildGatewayCronService", () => {
         expect(callArgs.agentId).toBe("custom-cbd0fe4a");
         expect(callArgs.sessionKey).toBe(`cron:${job.id}`);
 
-        // 非 canonical sessionKey 走 cron:<jobId> 派生 —— **不** 应该 log warning
-        // (没有 divergence)。PR #41 follow-up review (#3)。
-        expect(cronWarnMock).not.toHaveBeenCalled();
+        // 非 canonical sessionKey 走 cron:<jobId> 派生 —— **不** 应该 log divergence
+        // warning。按内容断言以容忍同路径里的其它无关 warn (PR #43 follow-up review #1)。
+        expect(cronWarnMock).not.toHaveBeenCalledWith(
+          expect.stringContaining("differs from sessionKey-embedded agentId"),
+          expect.anything(),
+        );
       } finally {
         state.cron.stop();
       }

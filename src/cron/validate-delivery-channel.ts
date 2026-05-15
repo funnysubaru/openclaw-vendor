@@ -3,14 +3,14 @@
  * 白名单校验。在 schema (Ajv) 校验之后、落库之前拦下"非 deliverable channel id
  * 灌入 delivery.channel 字段"的事故。
  *
- * **作用域（Low 4，PR #39 review）**：本模块**仅**校验 `delivery.mode === "announce"`
- * 时的 `delivery.channel` 字面量是否落在白名单内。其它情况一律放行：
- *   - `delivery.mode === "none" | "webhook" | undefined` —— 由 schema / webhook URL 校验
- *     等其它层负责（不在本模块责任范围）；
- *   - announce 但 channel 缺失/非 string —— vendor 自身有 fallback "Channel is required when
- *     multiple channels are configured" 或单 channel auto-pick 的逻辑兜底；
- *   - 将来若新增 mode 字面量（如 "queue" / "mqtt"），需要校验时**在此显式扩展**，不要假设
- *     本模块自动覆盖。
+ * **作用域**：本模块校验 `delivery.channel` 字面量是否落在白名单内。
+ *   - **channel 字段一旦写入就跑白名单（PR #40 follow-up Medium 2 修复）** —— 与
+ *     `delivery.mode` 无关。`mode === "none"` + 写入非法 channel 也会被拒，避免 legacy
+ *     升格出 `{ mode: "none", channel: "bogus" }` 这类绕白名单的脏 DB 字段。
+ *   - channel 缺失 / 非 string / 空白 —— 一律放行（不强制要求 channel 字段；missing 由
+ *     vendor runtime 的 "Channel is required when multiple channels..." fallback 兜底）。
+ *   - announce 之外的 mode 没有 channel 字段同样放行（none / webhook / undefined）。
+ *   - 将来若新增 mode 字面量（如 "queue" / "mqtt"），channel 写入仍走同一白名单。
  *
  * 业务意图（详见 Yuiclaw 项目 plan §2 根因 + CLAUDE.md §8 Debugging Protocol）：
  * 2026-05-13 实战发现 AI 调 cron tool 时把 `openclaw-control-ui` (client id) 误记成

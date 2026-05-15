@@ -56,7 +56,24 @@ export function buildDeliveryFromLegacyPayload(
  * jobs.ts:701）。两者触发条件不同，长期可能漂移再次造出"校验拦住 / 服务层另一条
  * 路写进去"的洞。本函数提到这里成为**共享单一源**：
  *   - service-layer `updateJob` import 这个函数（替代私有版本）
- *   - validate 也 import 这个函数（确保两边判断一致）
+ *   - cron.update 路径的 `validateCronJobPatchDelivery` 也 import 这个函数
+ *     （确保两边判断一致）
+ *
+ * **cron.add 与 cron.update 的对称性（PR #41 follow-up review #1）**：
+ * cron.add 路径**不**走本函数 —— 走的是上游 `normalizeCronJobCreate (applyDefaults: true)`
+ * → `normalizeLegacyDeliveryInput` → `buildDeliveryPatchFromLegacyPayload`（宽口径，
+ * channel 单独存在就触发升格，并读 `payload.provider`）。两条路径**有意不对称**：
+ *   - **cron.add** 是新 job 入口，要尽可能宽容地把历史 / 第三方客户端写的 legacy 形态
+ *     升格成现代 `delivery` 结构；升格后再走相同的白名单校验。
+ *   - **cron.update** 是 patch 入口，只在"真的会让 service-layer 改 job.delivery 落库"
+ *     的情况下做校验（避免对孤立 `payload.channel` 之类无效 patch 误拦）。
+ *   - 主事故路径 (`channel + to` / `webchat-control-ui` 类杜撰 channel) 两条路径都被
+ *     拦下：cron.add 在 normalize 后由 `validateCronJobCreateDelivery` 校验；
+ *     cron.update 在 patch 预览后由 `validateCronJobPatchDelivery` 校验。
+ *
+ * 若未来要把 add/update 统一到完全相同的升格函数，需要先评估 cron.add 收紧
+ * `hasLegacyDeliveryHints`（去掉 channel-alone 和 provider）对现网 host 的兼容性。
+ * 当前**有意保持不对称**，本注释作为决策落档。
  */
 export function buildLegacyDeliveryPatchForServiceUpdate(
   payload: Record<string, unknown>,

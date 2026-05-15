@@ -29,12 +29,28 @@ describe("validateCronDeliveryChannel", () => {
     expect(validateCronDeliveryChannel({})).toEqual({ ok: true });
   });
 
-  it("accepts delivery.mode = none / webhook with any channel value (white-listed elsewhere)", () => {
-    expect(
-      validateCronDeliveryChannel({ mode: "none", channel: "anything" }),
-    ).toEqual({ ok: true });
+  it("accepts delivery without a channel field regardless of mode (none / webhook / undefined)", () => {
+    expect(validateCronDeliveryChannel({ mode: "none" })).toEqual({ ok: true });
     expect(
       validateCronDeliveryChannel({ mode: "webhook", to: "https://example.com" }),
+    ).toEqual({ ok: true });
+  });
+
+  it("rejects channel field with non-whitelisted value even when mode is not announce (Medium 2 修复)", () => {
+    // 之前版本只在 mode === "announce" 时校验 channel,导致 legacy 升格出的
+    // { mode: "none", channel: "bogus" } 绕过白名单 → DB 留脏 channel 字段。
+    // 现在策略:写了 channel 就跑白名单,与 mode 无关。
+    expect(
+      validateCronDeliveryChannel({ mode: "none", channel: "webchat-control-ui" }).ok,
+    ).toBe(false);
+    expect(
+      validateCronDeliveryChannel({ mode: "none", channel: "webchat" }).ok,
+    ).toBe(false);
+  });
+
+  it("accepts mode=none + valid channel (channel 字段允许提示用途,只要在白名单内)", () => {
+    expect(
+      validateCronDeliveryChannel({ mode: "none", channel: "line" }),
     ).toEqual({ ok: true });
   });
 
@@ -110,12 +126,44 @@ describe("validateCronJobPatchDelivery — legacy payload.channel coverage (P1.2
     }
   });
 
-  it("rejects legacy payload.channel 'webchat' (P1.1 + P1.2 交叉)", () => {
+  it("rejects legacy payload.channel 'webchat' + to (触发 service-layer 升格的最小完整形式)", () => {
+    // 单独 payload.channel 没有 to/deliver 时,service-layer hasLegacyHints=false,不会
+    // 实际升格落库 -> validate 也跟着 ok (统一源行为一致)。带上 to 才真正触发 service
+    // 升格 -> 此时校验必须拦下。
     const patch = {
-      payload: { kind: "agentTurn", message: "x", channel: "webchat" },
+      payload: { kind: "agentTurn", message: "x", channel: "webchat", to: "main" },
     };
     const result = validateCronJobPatchDelivery(patch);
     expect(result.ok).toBe(false);
+  });
+
+  it("does NOT reject legacy payload.channel alone (no to/deliver → service-layer 不升格)", () => {
+    // 共享单一源:service-layer buildLegacyDeliveryPatchForServiceUpdate 的 hasLegacyHints
+    // 不含 channel,所以孤立的 payload.channel 不会被升格成 delivery 落库 -> 校验也跟着放行。
+    // 不是漏洞:这种 patch 不会改变 job.delivery。
+    const patch = {
+      payload: { kind: "agentTurn", message: "x", channel: "webchat-control-ui" },
+    };
+    expect(validateCronJobPatchDelivery(patch).ok).toBe(true);
+  });
+
+  it("rejects legacy deliver=false + 脏 channel + to (mode=none 路径,Medium 2 交叉)", () => {
+    // service-layer 升格为 { mode: "none", channel: "bogus", to: "..." } 后,Medium 2
+    // 修复让 validateCronDeliveryChannel 一旦看到 channel 就跑白名单 -> 拦下脏数据。
+    const patch = {
+      payload: {
+        kind: "agentTurn",
+        message: "x",
+        deliver: false,
+        channel: "webchat-control-ui",
+        to: "main",
+      },
+    };
+    const result = validateCronJobPatchDelivery(patch);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.message).toContain("webchat-control-ui");
+    }
   });
 
   it("accepts legacy payload.channel 'line' (合法 deliverable channel)", () => {

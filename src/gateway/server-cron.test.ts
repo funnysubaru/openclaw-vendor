@@ -9,6 +9,7 @@ const enqueueSystemEventMock = vi.fn();
 const requestHeartbeatNowMock = vi.fn();
 const loadConfigMock = vi.fn();
 const fetchWithSsrFGuardMock = vi.fn();
+const runCronIsolatedAgentTurnMock = vi.fn();
 
 vi.mock("../infra/system-events.js", () => ({
   enqueueSystemEvent: (...args: unknown[]) => enqueueSystemEventMock(...args),
@@ -30,6 +31,12 @@ vi.mock("../infra/net/fetch-guard.js", () => ({
   fetchWithSsrFGuard: (...args: unknown[]) => fetchWithSsrFGuardMock(...args),
 }));
 
+// Mock runCronIsolatedAgentTurn 让 isolated job 路径在测试里不真的拉 agent runtime,
+// 仅断言传入的 agentId / sessionKey 与 divergence 行为 (PR #40 follow-up review Medium 3)。
+vi.mock("../cron/isolated-agent.js", () => ({
+  runCronIsolatedAgentTurn: (...args: unknown[]) => runCronIsolatedAgentTurnMock(...args),
+}));
+
 import { buildGatewayCronService } from "./server-cron.js";
 
 describe("buildGatewayCronService", () => {
@@ -38,6 +45,8 @@ describe("buildGatewayCronService", () => {
     requestHeartbeatNowMock.mockClear();
     loadConfigMock.mockClear();
     fetchWithSsrFGuardMock.mockClear();
+    runCronIsolatedAgentTurnMock.mockClear();
+    runCronIsolatedAgentTurnMock.mockResolvedValue({ ok: true });
   });
 
   it("routes main-target jobs to the scoped session for enqueue + wake", async () => {
@@ -166,6 +175,87 @@ describe("buildGatewayCronService", () => {
     } finally {
       state.cron.stop();
     }
+  });
+
+  // PR #40 follow-up review Medium 3 —— handler 集成测：isolated agent turn 用
+  // sessionKey 嵌入的 agentId 跑、divergence 时 log warning。
+  describe("runIsolatedAgentJob agentId / sessionKey divergence", () => {
+    it("uses sessionKey-embedded agentId when job.agentId differs (sessionKey 是真相之源)", async () => {
+      const tmpDir = path.join(os.tmpdir(), `server-cron-divergence-${Date.now()}`);
+      const cfg = {
+        session: { mainKey: "main" },
+        cron: { store: path.join(tmpDir, "cron.json") },
+      } as OpenClawConfig;
+      loadConfigMock.mockReturnValue(cfg);
+
+      const state = buildGatewayCronService({
+        cfg,
+        deps: {} as CliDeps,
+        broadcast: () => {},
+      });
+      try {
+        // job.agentId = "main" 但 sessionKey 指向 custom-cbd0fe4a → divergence。
+        // 修复后 runCronIsolatedAgentTurn 应收到 agentId="custom-cbd0fe4a"（sessionKey 嵌入），
+        // 而不是 "main"。
+        const job = await state.cron.add({
+          name: "divergence-job",
+          enabled: true,
+          schedule: { kind: "at", at: new Date(1).toISOString() },
+          agentId: "main",
+          sessionTarget: "isolated",
+          wakeMode: "next-heartbeat",
+          sessionKey: "agent:custom-cbd0fe4a:user:abc:panel-xyz",
+          payload: { kind: "agentTurn", message: "ping" },
+        });
+
+        await state.cron.run(job.id, "force");
+
+        expect(runCronIsolatedAgentTurnMock).toHaveBeenCalledOnce();
+        const [callArgs] = runCronIsolatedAgentTurnMock.mock.calls[0];
+        // sessionKey 嵌入的 agentId（custom-cbd0fe4a）压倒 job.agentId（main）
+        expect(callArgs.agentId).toBe("custom-cbd0fe4a");
+        // sessionKey 透传给运行,canonical lowercase
+        expect(callArgs.sessionKey).toBe("agent:custom-cbd0fe4a:user:abc:panel-xyz");
+      } finally {
+        state.cron.stop();
+      }
+    });
+
+    it("uses job.agentId verbatim when sessionKey is not canonical agent: prefix", async () => {
+      const tmpDir = path.join(os.tmpdir(), `server-cron-no-divergence-${Date.now()}`);
+      const cfg = {
+        session: { mainKey: "main" },
+        cron: { store: path.join(tmpDir, "cron.json") },
+      } as OpenClawConfig;
+      loadConfigMock.mockReturnValue(cfg);
+
+      const state = buildGatewayCronService({
+        cfg,
+        deps: {} as CliDeps,
+        broadcast: () => {},
+      });
+      try {
+        const job = await state.cron.add({
+          name: "no-divergence-job",
+          enabled: true,
+          schedule: { kind: "at", at: new Date(1).toISOString() },
+          agentId: "custom-cbd0fe4a",
+          sessionTarget: "isolated",
+          wakeMode: "next-heartbeat",
+          // 不设 sessionKey,vendor 会用 cron:<jobId> 派生
+          payload: { kind: "agentTurn", message: "ping" },
+        });
+
+        await state.cron.run(job.id, "force");
+
+        expect(runCronIsolatedAgentTurnMock).toHaveBeenCalledOnce();
+        const [callArgs] = runCronIsolatedAgentTurnMock.mock.calls[0];
+        expect(callArgs.agentId).toBe("custom-cbd0fe4a");
+        expect(callArgs.sessionKey).toBe(`cron:${job.id}`);
+      } finally {
+        state.cron.stop();
+      }
+    });
   });
 
   it("blocks private webhook URLs via SSRF-guarded fetch", async () => {

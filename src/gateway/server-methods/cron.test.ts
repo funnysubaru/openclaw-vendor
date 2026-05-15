@@ -80,6 +80,46 @@ describe("cronHandlers delivery validation short-circuit", () => {
     });
   });
 
+  it("cron.update: invalid legacy payload.channel (no patch.delivery) → INVALID_REQUEST + does NOT call context.cron.update", async () => {
+    // PR #40 follow-up review Low 5: 与 PR #39 "校验先于落库" 纪律对齐,锁住 legacy 路径
+    // 的 handler 短路。复现 P1.2 修复前的核心 attack:
+    //   patch: { payload: { kind:"agentTurn", channel:"webchat-control-ui", to:"..." } }
+    // 之前会绕过 validateCronJobPatchDelivery (delivery=undefined → ok),被 service-layer
+    // legacy 升格写脏 channel 落库;现在 validate 模拟同一升格预览,立即拦下。
+    const { context, cronUpdate } = buildContextStub();
+    const respond = vi.fn();
+
+    const params = {
+      id: "job-xyz",
+      patch: {
+        payload: {
+          kind: "agentTurn" as const,
+          message: "x",
+          channel: "webchat-control-ui",
+          to: "main",
+        },
+      },
+    };
+
+    await cronHandlers["cron.update"]({
+      req: {} as never,
+      params: params as unknown as Record<string, unknown>,
+      client: null,
+      isWebchatConnect: () => false,
+      respond,
+      context,
+    });
+
+    expect(cronUpdate).not.toHaveBeenCalled();
+    expect(respond).toHaveBeenCalledOnce();
+    const [ok, , err] = respond.mock.calls[0];
+    expect(ok).toBe(false);
+    expect(err).toMatchObject({
+      code: ErrorCodes.INVALID_REQUEST,
+      message: expect.stringContaining("webchat-control-ui"),
+    });
+  });
+
   it("cron.update: invalid patch.delivery.channel → INVALID_REQUEST + does NOT call context.cron.update", async () => {
     const { context, cronUpdate } = buildContextStub();
     const respond = vi.fn();

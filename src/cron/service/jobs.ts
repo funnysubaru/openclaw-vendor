@@ -21,6 +21,7 @@ import type {
   CronPayload,
   CronPayloadPatch,
 } from "../types.js";
+import { buildLegacyDeliveryPatchForServiceUpdate } from "../legacy-delivery.js";
 import { normalizeHttpWebhookUrl } from "../webhook-url.js";
 import { resolveInitialCronDelivery } from "./initial-delivery.js";
 import {
@@ -605,7 +606,11 @@ export function applyJobPatch(
   }
   if (!patch.delivery && patch.payload?.kind === "agentTurn") {
     // Back-compat: legacy clients still update delivery via payload fields.
-    const legacyDeliveryPatch = buildLegacyDeliveryPatch(patch.payload);
+    // 共享单一源 (PR #40 follow-up review Medium 1)：与 validateCronJobPatchDelivery
+    // 用同一个 legacy 升格函数,避免 gateway 校验和 service 落库分别用两份 legacy 逻辑漂移。
+    const legacyDeliveryPatch = buildLegacyDeliveryPatchForServiceUpdate(
+      patch.payload as unknown as Record<string, unknown>,
+    ) as CronDeliveryPatch | null;
     if (
       legacyDeliveryPatch &&
       job.sessionTarget === "isolated" &&
@@ -698,46 +703,9 @@ function mergeCronPayload(existing: CronPayload, patch: CronPayloadPatch): CronP
   return next;
 }
 
-function buildLegacyDeliveryPatch(
-  payload: Extract<CronPayloadPatch, { kind: "agentTurn" }>,
-): CronDeliveryPatch | null {
-  const deliver = payload.deliver;
-  const toRaw = typeof payload.to === "string" ? payload.to.trim() : "";
-  const hasLegacyHints =
-    typeof deliver === "boolean" ||
-    typeof payload.bestEffortDeliver === "boolean" ||
-    Boolean(toRaw);
-  if (!hasLegacyHints) {
-    return null;
-  }
-
-  const patch: CronDeliveryPatch = {};
-  let hasPatch = false;
-
-  if (deliver === false) {
-    patch.mode = "none";
-    hasPatch = true;
-  } else if (deliver === true || toRaw) {
-    patch.mode = "announce";
-    hasPatch = true;
-  }
-
-  if (typeof payload.channel === "string") {
-    const channel = payload.channel.trim().toLowerCase();
-    patch.channel = channel ? channel : undefined;
-    hasPatch = true;
-  }
-  if (typeof payload.to === "string") {
-    patch.to = payload.to.trim();
-    hasPatch = true;
-  }
-  if (typeof payload.bestEffortDeliver === "boolean") {
-    patch.bestEffort = payload.bestEffortDeliver;
-    hasPatch = true;
-  }
-
-  return hasPatch ? patch : null;
-}
+// 业务意图（PR #40 follow-up review Medium 1）：原私有 buildLegacyDeliveryPatch 已提到
+// legacy-delivery.ts 作为 `buildLegacyDeliveryPatchForServiceUpdate` 导出，让 gateway
+// 校验和 service 落库共享同一升格逻辑（避免漂移）。
 
 function buildPayloadFromPatch(patch: CronPayloadPatch): CronPayload {
   if (patch.kind === "systemEvent") {

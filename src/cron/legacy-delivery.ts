@@ -42,6 +42,63 @@ export function buildDeliveryFromLegacyPayload(
   return next;
 }
 
+/**
+ * Service-layer 用的 legacy → delivery patch 升格（用于 cron.update 的 patch.payload
+ * 路径）。与 `buildDeliveryPatchFromLegacyPayload` 的差别：
+ *   - **hasLegacyHints** 仅看 deliver / bestEffortDeliver / to，**不含 channel**：
+ *     即只有 `payload.channel` 时不触发（service-layer 不会把孤立的 channel 作为
+ *     升格信号）；与 `hasLegacyDeliveryHints` 的"channel 也算"宽口径**不同**。
+ *   - **不读 `payload.provider`**：service-layer 只识别 `payload.channel`。
+ *
+ * **统一入口（PR #40 follow-up review Medium 1 修复）**：
+ * 之前 `validateCronJobPatchDelivery` 走 `buildDeliveryPatchFromLegacyPayload`，
+ * service-layer `updateJob` 走另一份 `buildLegacyDeliveryPatch`（曾私有在
+ * jobs.ts:701）。两者触发条件不同，长期可能漂移再次造出"校验拦住 / 服务层另一条
+ * 路写进去"的洞。本函数提到这里成为**共享单一源**：
+ *   - service-layer `updateJob` import 这个函数（替代私有版本）
+ *   - validate 也 import 这个函数（确保两边判断一致）
+ */
+export function buildLegacyDeliveryPatchForServiceUpdate(
+  payload: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const deliver = payload.deliver;
+  const toRaw = typeof payload.to === "string" ? payload.to.trim() : "";
+  const hasLegacyHints =
+    typeof deliver === "boolean" ||
+    typeof payload.bestEffortDeliver === "boolean" ||
+    Boolean(toRaw);
+  if (!hasLegacyHints) {
+    return null;
+  }
+
+  const patch: Record<string, unknown> = {};
+  let hasPatch = false;
+
+  if (deliver === false) {
+    patch.mode = "none";
+    hasPatch = true;
+  } else if (deliver === true || toRaw) {
+    patch.mode = "announce";
+    hasPatch = true;
+  }
+
+  if (typeof payload.channel === "string") {
+    const channel = payload.channel.trim().toLowerCase();
+    patch.channel = channel ? channel : undefined;
+    hasPatch = true;
+  }
+  if (typeof payload.to === "string") {
+    patch.to = payload.to.trim();
+    hasPatch = true;
+  }
+  if (typeof payload.bestEffortDeliver === "boolean") {
+    patch.bestEffort = payload.bestEffortDeliver;
+    hasPatch = true;
+  }
+
+  return hasPatch ? patch : null;
+}
+
 export function buildDeliveryPatchFromLegacyPayload(payload: Record<string, unknown>) {
   const deliver = payload.deliver;
   const channelRaw =

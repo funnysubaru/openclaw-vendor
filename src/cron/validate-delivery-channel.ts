@@ -38,7 +38,7 @@
 
 import { listDeliverableMessageChannels } from "../utils/message-channel.js";
 import type { CronJobCreate, CronJobPatch } from "./types.js";
-import { buildDeliveryPatchFromLegacyPayload } from "./legacy-delivery.js";
+import { buildLegacyDeliveryPatchForServiceUpdate } from "./legacy-delivery.js";
 
 /**
  * 计算当前合法的 cron delivery.channel 白名单 = runtime 真正可投递的 channels。
@@ -67,10 +67,14 @@ export function validateCronDeliveryChannel(
 ): CronDeliveryChannelValidation {
   if (!delivery || typeof delivery !== "object") return { ok: true };
   const d = delivery as { mode?: unknown; channel?: unknown };
-  // announce 之外的 mode 不需要 channel（none / webhook 已在别处校验）
-  if (d.mode !== "announce") return { ok: true };
-  // announce 模式但 channel 字段缺失/非 string 走旧逻辑兜底（vendor 自己会按 fallback
-  // 解析 last channel 或抛 "Channel is required..."），这里只拦"非法字面量"的场景
+
+  // **Channel 字段一旦写入就跑白名单（PR #40 follow-up review Medium 2 修复）**：
+  // 之前只在 mode === "announce" 时校验 channel，导致 legacy `deliver: false + channel: "bogus"`
+  // 升格为 `{ mode: "none", channel: "bogus" }` 时绕过 channel 白名单 → DB 留脏 channel 字段。
+  // 运行时 announce 路径可能忽略 mode=none 的 channel，但下游若有人读 `delivery.channel`
+  // 做 UI 路由会踩坑。现在策略：
+  //   - 没写 channel（或非 string / 空白）→ ok: true（不强制要求 channel 字段）
+  //   - 写了 channel 字面量 → 一律跑白名单，与 mode 无关
   if (typeof d.channel !== "string" || !d.channel.trim()) return { ok: true };
   const channel = d.channel.trim();
   const allowed = listValidCronDeliveryChannels();
@@ -122,22 +126,21 @@ export function validateCronJobPatchDelivery(
   if (directDelivery !== undefined) {
     return validateCronDeliveryChannel(directDelivery);
   }
-  // patch.delivery 缺省时，模拟 service-layer 的 legacy 升格路径做校验
+  // patch.delivery 缺省时，**用 service-layer 实际使用的同一升格函数**
+  // (`buildLegacyDeliveryPatchForServiceUpdate`) 做预览，对升格出的 delivery
+  // 也跑白名单。这样确保 gateway 校验和 service 落库走同一逻辑（PR #40
+  // follow-up review Medium 1）。
   const payload = (patch as { payload?: unknown }).payload;
   if (
     payload &&
     typeof payload === "object" &&
     (payload as { kind?: unknown }).kind === "agentTurn"
   ) {
-    const legacy = buildDeliveryPatchFromLegacyPayload(payload as Record<string, unknown>);
-    if (legacy && typeof legacy.channel === "string") {
-      // service-layer mergeCronDelivery 会用 patch.mode || existing.mode。这里为了
-      // 跑白名单校验，按 mode = "announce" 评估（legacy 升格逻辑里 channelRaw 非空就
-      // 默认 announce，详见 legacy-delivery.ts:55-67）
-      return validateCronDeliveryChannel({
-        mode: legacy.mode ?? "announce",
-        channel: legacy.channel,
-      });
+    const legacy = buildLegacyDeliveryPatchForServiceUpdate(payload as Record<string, unknown>);
+    if (legacy) {
+      // 直接 validate 升格结果，让 Medium 2 修复后的"channel 字段一旦写入就跑白名单"
+      // 逻辑同时覆盖 mode=none 的脏 channel 场景
+      return validateCronDeliveryChannel(legacy);
     }
   }
   return { ok: true };

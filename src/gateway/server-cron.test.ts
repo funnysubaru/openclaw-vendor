@@ -10,6 +10,16 @@ const requestHeartbeatNowMock = vi.fn();
 const loadConfigMock = vi.fn();
 const fetchWithSsrFGuardMock = vi.fn();
 const runCronIsolatedAgentTurnMock = vi.fn();
+// PR #41 follow-up review (#3)：捕获 cronLogger.warn 让 divergence 测试能断言
+// "warn 日志被打出"（之前测试只看传参,删掉 warn 块也照样绿）。
+// 用 vi.hoisted 让 vi.mock 的工厂能引用到这些 mock（vi.mock 在文件顶部被提升，
+// 早于 const 初始化）。
+const { cronWarnMock, cronInfoMock, cronErrorMock, cronDebugMock } = vi.hoisted(() => ({
+  cronWarnMock: vi.fn(),
+  cronInfoMock: vi.fn(),
+  cronErrorMock: vi.fn(),
+  cronDebugMock: vi.fn(),
+}));
 
 vi.mock("../infra/system-events.js", () => ({
   enqueueSystemEvent: (...args: unknown[]) => enqueueSystemEventMock(...args),
@@ -37,6 +47,21 @@ vi.mock("../cron/isolated-agent.js", () => ({
   runCronIsolatedAgentTurn: (...args: unknown[]) => runCronIsolatedAgentTurnMock(...args),
 }));
 
+// PR #41 follow-up review (#3)：mock getChildLogger 返回 vi.fn(),让 divergence 测试能
+// 断言 warn 真的被调用 (不只是断言传给 runCronIsolatedAgentTurn 的参数)。
+vi.mock("../logging.js", async () => {
+  const actual = await vi.importActual<typeof import("../logging.js")>("../logging.js");
+  return {
+    ...actual,
+    getChildLogger: () => ({
+      warn: cronWarnMock,
+      info: cronInfoMock,
+      error: cronErrorMock,
+      debug: cronDebugMock,
+    }),
+  };
+});
+
 import { buildGatewayCronService } from "./server-cron.js";
 
 describe("buildGatewayCronService", () => {
@@ -47,6 +72,10 @@ describe("buildGatewayCronService", () => {
     fetchWithSsrFGuardMock.mockClear();
     runCronIsolatedAgentTurnMock.mockClear();
     runCronIsolatedAgentTurnMock.mockResolvedValue({ ok: true });
+    cronWarnMock.mockClear();
+    cronInfoMock.mockClear();
+    cronErrorMock.mockClear();
+    cronDebugMock.mockClear();
   });
 
   it("routes main-target jobs to the scoped session for enqueue + wake", async () => {
@@ -216,6 +245,17 @@ describe("buildGatewayCronService", () => {
         expect(callArgs.agentId).toBe("custom-cbd0fe4a");
         // sessionKey 透传给运行,canonical lowercase
         expect(callArgs.sessionKey).toBe("agent:custom-cbd0fe4a:user:abc:panel-xyz");
+
+        // PR #41 follow-up review (#3): warn 必须打出,让有人删掉 warn 块时测试会红
+        expect(cronWarnMock).toHaveBeenCalledOnce();
+        const [warnMessage, warnContext] = cronWarnMock.mock.calls[0];
+        expect(warnMessage).toContain("differs from sessionKey-embedded agentId");
+        expect(warnContext).toMatchObject({
+          jobId: job.id,
+          jobAgentId: "main",
+          sessionKeyAgentId: "custom-cbd0fe4a",
+          sessionKey: "agent:custom-cbd0fe4a:user:abc:panel-xyz",
+        });
       } finally {
         state.cron.stop();
       }
@@ -252,6 +292,10 @@ describe("buildGatewayCronService", () => {
         const [callArgs] = runCronIsolatedAgentTurnMock.mock.calls[0];
         expect(callArgs.agentId).toBe("custom-cbd0fe4a");
         expect(callArgs.sessionKey).toBe(`cron:${job.id}`);
+
+        // 非 canonical sessionKey 走 cron:<jobId> 派生 —— **不** 应该 log warning
+        // (没有 divergence)。PR #41 follow-up review (#3)。
+        expect(cronWarnMock).not.toHaveBeenCalled();
       } finally {
         state.cron.stop();
       }

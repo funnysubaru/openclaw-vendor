@@ -115,9 +115,13 @@ export const cronHandlers: GatewayRequestHandlers = {
       );
       return;
     }
-    // 业务白名单校验：delivery.channel 必须是 deliverable channel 或 "webchat"
-    // (拦下 AI/CLI 误灌的 `webchat-control-ui` 等杜撰 channel id；详见
-    // validate-delivery-channel.ts 文件头)
+    // 业务白名单校验：delivery.channel 必须是 deliverable channel
+    // (line / telegram / slack / signal / discord 等)。
+    // PR #40 P1.1 后 webchat 不在白名单 —— vendor runtime delivery path
+    // (src/infra/outbound/targets.ts:179) 仍拒 webchat 投递。Yuiclaw (Y) 方案
+    // 投到 panel session 走 job.sessionKey 复用，不走 delivery.channel。
+    // 拦下 AI/CLI 误灌的 `webchat-control-ui` 等杜撰 channel id；详见
+    // validate-delivery-channel.ts 文件头注释。
     const deliveryValidation = validateCronJobCreateDelivery(jobCreate);
     if (!deliveryValidation.ok) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, deliveryValidation.message));

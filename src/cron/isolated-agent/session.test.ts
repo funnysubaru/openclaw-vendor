@@ -262,4 +262,97 @@ describe("resolveCronSession", () => {
       expect(result.sessionEntry.modelOverride).toBe("some-model");
     });
   });
+
+  // PR-B (2026-05-16 实战修复): panel-* sessionKey 是 host UI 用户对话的 stable
+  // 标识,cron 写入必须 append 到当前 jsonl 而非 roll 新 sessionId。否则 cron 的
+  // reply 落到孤儿 jsonl,panel UI 看不到 → 违背 (Y) 方案承诺。
+  //
+  // 匹配模式: `^agent:[a-z0-9_-]+:user:[a-f0-9-]+:panel-` (canonical panel UI 派生
+  // 形态)。其它 cron:<jobId> / line / direct 等保持原有 freshness + forceNew 语义。
+  describe("panel-* sessionKey reuse override (PR-B)", () => {
+    const PANEL_KEY = "agent:custom-cbd0fe4a:user:06148fa3-9aa3-4b28-b1b1-3513ada1dc9e:panel-d1e7fc49";
+
+    it("reuses existing sessionId for panel-* key even when forceNew=true", () => {
+      // Cron with sessionTarget=isolated 调用 resolveCronSession 时 forceNew=true。
+      // 之前: 无条件 randomUUID → 滚走 user 的 panel sessionId。
+      // 现在: panel-* key 强制 reuse,cron 写到 user 的 panel jsonl。
+      const result = resolveWithStoredEntry({
+        sessionKey: PANEL_KEY,
+        entry: {
+          sessionId: "user-panel-stable-id",
+          updatedAt: NOW_MS - 1000,
+          systemSent: true,
+        },
+        forceNew: true,
+        fresh: true,
+      });
+
+      expect(result.sessionEntry.sessionId).toBe("user-panel-stable-id");
+      expect(result.isNewSession).toBe(false);
+      expect(clearBootstrapSnapshot).not.toHaveBeenCalled();
+    });
+
+    it("reuses existing sessionId for panel-* key even when freshness=stale", () => {
+      // 之前: 1 天没动的 panel session 会被判 stale → roll。
+      // 现在: panel-* key 不走 freshness eviction,永远 reuse。
+      const result = resolveWithStoredEntry({
+        sessionKey: PANEL_KEY,
+        entry: {
+          sessionId: "user-panel-old-but-valid",
+          updatedAt: NOW_MS - 7 * 86_400_000, // 7 days ago
+          systemSent: true,
+        },
+        fresh: false,
+      });
+
+      expect(result.sessionEntry.sessionId).toBe("user-panel-old-but-valid");
+      expect(result.isNewSession).toBe(false);
+      expect(clearBootstrapSnapshot).not.toHaveBeenCalled();
+    });
+
+    it("creates new sessionId for panel-* key when no entry exists (first cron run)", () => {
+      // 边界: 首次 cron run, panel-* sessionKey 没在 sessions.json — 此时确实需要
+      // 创建 sessionId。后续 panel UI / cron 都复用之。
+      const result = resolveWithStoredEntry({
+        sessionKey: PANEL_KEY,
+        forceNew: true,
+      });
+
+      expect(result.sessionEntry.sessionId).toBeDefined();
+      expect(result.isNewSession).toBe(true);
+    });
+
+    it("still rolls sessionId for non-panel cron sessionKey when forceNew=true (no regression)", () => {
+      // 对照: cron:<jobId> 派生 key 保持原行为, isolated cron 每次起新 session。
+      const result = resolveWithStoredEntry({
+        sessionKey: "agent:main:cron:job-abc",
+        entry: {
+          sessionId: "old-cron-session",
+          updatedAt: NOW_MS - 1000,
+          systemSent: true,
+        },
+        forceNew: true,
+        fresh: true,
+      });
+
+      expect(result.sessionEntry.sessionId).not.toBe("old-cron-session");
+      expect(result.isNewSession).toBe(true);
+    });
+
+    it("still rolls sessionId for non-panel cron sessionKey on freshness=stale (no regression)", () => {
+      // 对照: 非 panel key 的 stale-eviction 保持原行为。
+      const result = resolveWithStoredEntry({
+        sessionKey: "agent:main:cron:job-abc",
+        entry: {
+          sessionId: "old-stale",
+          updatedAt: NOW_MS - 86_400_000,
+          systemSent: true,
+        },
+        fresh: false,
+      });
+
+      expect(result.sessionEntry.sessionId).not.toBe("old-stale");
+      expect(result.isNewSession).toBe(true);
+    });
+  });
 });

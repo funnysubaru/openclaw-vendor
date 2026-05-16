@@ -212,15 +212,87 @@ describe("cron tool", () => {
     expect(sessionKey).toBe(callerSessionKey);
   });
 
-  it("preserves explicit job.sessionKey on add", async () => {
+  it("forces caller sessionKey on cron.add, overriding AI-supplied job.sessionKey", async () => {
+    // 业务意图（PR-A，回应用户实战 2026-05-16）:
+    // 之前: AI 显式写 job.sessionKey 时 cron-tool 保留它 → AI 幻觉值
+    //   (e.g. "webchat-control-ui" / 编造的 panel-xxxxxxxx) 落库 → cron 运行时报错 /
+    //   投到不存在的 session。
+    // 现在: opts.agentSessionKey (caller 当前 session) 永远是真相之源,
+    //   AI 提供的任何 job.sessionKey 都被覆盖。这剥夺了 "agent 跨 session 设 cron"
+    //   能力,但实战中没有合法用例,反而幻觉是反复发生的问题。
     callGatewayMock.mockResolvedValueOnce({ ok: true });
 
+    const callerSessionKey = "agent:main:user:abc:panel-real123";
     const sessionKey = await executeAddAndReadSessionKey({
-      callId: "call-explicit-session-key",
-      agentSessionKey: "agent:main:discord:channel:ops",
-      jobSessionKey: "agent:main:telegram:group:-100123:topic:99",
+      callId: "call-force-override",
+      agentSessionKey: callerSessionKey,
+      jobSessionKey: "agent:main:fabricated-by-ai-hallucination",
     });
-    expect(sessionKey).toBe("agent:main:telegram:group:-100123:topic:99");
+    expect(sessionKey).toBe(callerSessionKey);
+  });
+
+  it("forces caller sessionKey on cron.update patch, overriding AI-supplied patch.sessionKey", async () => {
+    // 业务意图（PR-A force-override 应用到 cron.update path）:
+    // cron.add 已强制覆盖, cron.update 也必须 — 否则 AI 可以通过 update 把幻觉
+    // sessionKey 灌进既存 job, 绕过 add path 的保护。
+    callGatewayMock.mockResolvedValueOnce({ ok: true });
+
+    const callerSessionKey = "agent:main:user:abc:panel-real999";
+    const tool = createCronTool({ agentSessionKey: callerSessionKey });
+    await tool.execute("call-update-force", {
+      action: "update",
+      jobId: "job-xyz",
+      patch: {
+        sessionKey: "agent:main:fabricated-on-update",
+        agentId: "fabricated-agent-id",
+        name: "renamed",
+      },
+    });
+    const call = readGatewayCall();
+    const patch = (call.params as { patch?: { sessionKey?: string; agentId?: string; name?: string } })?.patch;
+    expect(patch?.sessionKey).toBe(callerSessionKey);
+    // agentId 同样被 caller sessionKey 派生覆盖 (test mock resolveSessionAgentId → "agent-123")
+    expect(patch?.agentId).toBe("agent-123");
+    // 其他字段不受影响
+    expect(patch?.name).toBe("renamed");
+  });
+
+  it("preserves explicit patch.agentId=null on cron.update (intentional unbind)", async () => {
+    callGatewayMock.mockResolvedValueOnce({ ok: true });
+
+    const tool = createCronTool({ agentSessionKey: "agent:main:user:abc:panel-real" });
+    await tool.execute("call-update-null", {
+      action: "update",
+      jobId: "job-xyz",
+      patch: {
+        agentId: null,
+        sessionKey: null,
+      },
+    });
+    const call = readGatewayCall();
+    const patch = (call.params as { patch?: { agentId?: unknown; sessionKey?: unknown } })?.patch;
+    expect(patch?.agentId).toBeNull();
+    expect(patch?.sessionKey).toBeNull();
+  });
+
+  it("does not stamp sessionKey when caller has no agentSessionKey (CLI / external client)", async () => {
+    // 边界: 没有 caller session 的场景 (e.g. CLI 直接调 cron.add) — 不覆盖,沿用 AI/调用方
+    // 提供的 job.sessionKey (或 vendor schema 校验后 fallback)。
+    callGatewayMock.mockResolvedValueOnce({ ok: true });
+
+    const tool = createCronTool({ agentSessionKey: undefined });
+    await tool.execute("call-no-caller", {
+      action: "add",
+      job: {
+        name: "wake-up",
+        schedule: { at: new Date(123).toISOString() },
+        sessionKey: "agent:main:caller-provided-key",
+        payload: { kind: "systemEvent", text: "hello" },
+      },
+    });
+    const call = readGatewayCall();
+    const payload = call.params as { sessionKey?: string } | undefined;
+    expect(payload?.sessionKey).toBe("agent:main:caller-provided-key");
   });
 
   it("adds recent context for systemEvent reminders when contextMessages > 0", async () => {

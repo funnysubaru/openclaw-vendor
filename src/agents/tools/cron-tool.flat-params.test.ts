@@ -16,14 +16,19 @@ describe("cron tool flat-params", () => {
     callGatewayToolMock.mockResolvedValue({ ok: true });
   });
 
-  it("preserves explicit top-level sessionKey during flat-params recovery", async () => {
+  it("forces caller sessionKey during flat-params recovery, overriding AI-supplied top-level sessionKey (PR-A)", async () => {
+    // PR-A force-override 应用到 flat-params recovery 路径:
+    // 之前: 显式 top-level sessionKey 在 synthetic job 构造里被原样带入 → AI 幻觉
+    //   sessionKey 仍能落库。
+    // 现在: 同 nested job.sessionKey 一致, caller agentSessionKey 总是覆盖。
+    const callerSessionKey = "agent:main:discord:channel:ops";
     const tool = createCronTool(
-      { agentSessionKey: "agent:main:discord:channel:ops" },
+      { agentSessionKey: callerSessionKey },
       { callGatewayTool: callGatewayToolMock },
     );
     await tool.execute("call-flat-session-key", {
       action: "add",
-      sessionKey: "agent:main:telegram:group:-100123:topic:99",
+      sessionKey: "agent:main:fabricated-telegram-via-flat",
       schedule: { kind: "at", at: new Date(123).toISOString() },
       message: "do stuff",
     });
@@ -34,6 +39,6 @@ describe("cron tool flat-params", () => {
       { sessionKey?: string },
     ];
     expect(method).toBe("cron.add");
-    expect(params.sessionKey).toBe("agent:main:telegram:group:-100123:topic:99");
+    expect(params.sessionKey).toBe(callerSessionKey);
   });
 });

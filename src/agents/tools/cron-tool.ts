@@ -353,15 +353,27 @@ Use jobId as the canonical identifier; id is accepted for compatibility. Use con
             const resolvedSessionKey = opts?.agentSessionKey
               ? resolveInternalSessionKey({ key: opts.agentSessionKey, alias, mainKey })
               : undefined;
-            if (!("agentId" in job)) {
-              const agentId = opts?.agentSessionKey
-                ? resolveSessionAgentId({ sessionKey: opts.agentSessionKey, config: cfg })
-                : undefined;
-              if (agentId) {
-                (job as { agentId?: string }).agentId = agentId;
-              }
+            const resolvedAgentId = opts?.agentSessionKey
+              ? resolveSessionAgentId({ sessionKey: opts.agentSessionKey, config: cfg })
+              : undefined;
+            // 业务意图（PR-A force-override，2026-05-16 实战修复）:
+            // 之前: 仅在 job 缺这两个字段时填充 → AI 显式提供 job.sessionKey/agentId 时
+            //   保留 AI 的值。但实战发现 AI 会幻觉编造 sessionKey
+            //   (e.g. "webchat-control-ui", "panel-d1e7fc49" — 见 Yuiclaw 实战 §2)
+            //   导致 cron 落库脏数据 → 运行时报错 / 投到不存在的 session。
+            // 现在: 只要 caller 有 agentSessionKey (即调用方是真实 host agent runtime,
+            //   而非外部 CLI),用其派生的 sessionKey/agentId **强制覆盖** AI 提供的值。
+            //   AI 无法跨 session 设 cron — 合理限制(没有合法跨 session 用例),换来
+            //   消除幻觉风险。
+            // 仍允许的场景: 外部 CLI 直接调 cron tool 时 opts.agentSessionKey 缺省,
+            //   不覆盖 caller 显式提供的 sessionKey/agentId (兼容现有 CLI 工作流)。
+            // null sentinel 例外: 显式 `agentId: null` 表示 "故意不绑定 agent"
+            //   (现有合约,被 schema 接受),保留不覆盖。`sessionKey: null` 同理。
+            const jobRecord = job as { agentId?: unknown; sessionKey?: unknown };
+            if (resolvedAgentId && jobRecord.agentId !== null) {
+              (job as { agentId?: string }).agentId = resolvedAgentId;
             }
-            if (!("sessionKey" in job) && resolvedSessionKey) {
+            if (resolvedSessionKey && jobRecord.sessionKey !== null) {
               (job as { sessionKey?: string }).sessionKey = resolvedSessionKey;
             }
           }
@@ -478,6 +490,29 @@ Use jobId as the canonical identifier; id is accepted for compatibility. Use con
             throw new Error("patch required");
           }
           const patch = normalizeCronJobPatch(params.patch) ?? params.patch;
+          // PR-A force-override 应用到 cron.update path: 防止 AI 通过 update 绕过 add 的
+          // sessionKey/agentId 保护。逻辑与 add path 镜像 —— null sentinel 保留,其他一律
+          // 用 caller agentSessionKey 派生值覆盖。详见 add path 头部注释。
+          if (patch && typeof patch === "object" && opts?.agentSessionKey) {
+            const cfg = loadConfig();
+            const { mainKey, alias } = resolveMainSessionAlias(cfg);
+            const resolvedSessionKey = resolveInternalSessionKey({
+              key: opts.agentSessionKey,
+              alias,
+              mainKey,
+            });
+            const resolvedAgentId = resolveSessionAgentId({
+              sessionKey: opts.agentSessionKey,
+              config: cfg,
+            });
+            const patchRecord = patch as { agentId?: unknown; sessionKey?: unknown };
+            if (resolvedAgentId && patchRecord.agentId !== null && "agentId" in patchRecord) {
+              (patch as { agentId?: string }).agentId = resolvedAgentId;
+            }
+            if (resolvedSessionKey && patchRecord.sessionKey !== null && "sessionKey" in patchRecord) {
+              (patch as { sessionKey?: string }).sessionKey = resolvedSessionKey;
+            }
+          }
           return jsonResult(
             await callGateway("cron.update", gatewayOpts, {
               id,

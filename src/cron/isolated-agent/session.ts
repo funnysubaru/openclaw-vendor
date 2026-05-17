@@ -110,5 +110,35 @@ export function resolveCronSession(params: {
       deliveryContext: undefined,
     }),
   };
+  // PR-B follow-up (Y) plan B1 fix (Yuiclaw 2026-05-16 Ralph Lauren cron tab blank incident):
+  //
+  // When PR-B's panel-* reuse branch carries an existing entry (which may have a stale
+  // `sessionFile` left over from prior cron rollover paths or other write callers like
+  // `resolveAndPersistSessionFile`), the `...entry` spread above preserves that stale
+  // value. The persisted `sessions.json` then ends up with `sessionId=<new reuse>` +
+  // `sessionFile=<old path>` — a self-contradictory state. Downstream
+  // `readSessionMessages(sessionId, storePath, sessionFile)` in
+  // `gateway/session-utils.fs.ts` constructs candidate paths via
+  // `resolveSessionTranscriptCandidates()` which prefers `sessionFile` over the
+  // sessionsDir + sessionId standard fallback. When the stale jsonl still exists
+  // on disk, chat.history serves the OLD transcript and panel UI never sees the
+  // cron-just-written content.
+  //
+  // The fix: for panel-* sessionKey, strip the `sessionFile` own property from the
+  // constructed sessionEntry. We mutate sessionEntry (NOT the upstream `entry`
+  // reference loaded from store) so other code holding `entry` is unaffected.
+  // `delete sessionEntry.sessionFile` guarantees the own property is gone (not just
+  // `undefined`), so `"sessionFile" in sessionEntry === false` and JSON.stringify
+  // omits the field entirely. Persisted sessions.json then has no sessionFile field
+  // for this panel entry, and the next readSessionMessages call falls back to the
+  // standard sessionsDir + sessionId path — which is where the new cron transcript
+  // actually lives.
+  //
+  // Narrow scope: only triggers for panel-* sessionKey (matched by isPanelSessionKey).
+  // LINE / Telegram / Discord / Slack / cron / direct / main-agent entries flow
+  // through the `else if`/`else` branches above and never reach this delete.
+  if (isPanelSessionKey(params.sessionKey)) {
+    delete sessionEntry.sessionFile;
+  }
   return { storePath, store, sessionEntry, systemSent, isNewSession };
 }

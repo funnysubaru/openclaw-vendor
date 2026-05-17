@@ -270,7 +270,8 @@ describe("resolveCronSession", () => {
   // 匹配模式: `^agent:[a-z0-9_-]+:user:[a-f0-9-]+:panel-` (canonical panel UI 派生
   // 形态)。其它 cron:<jobId> / line / direct 等保持原有 freshness + forceNew 语义。
   describe("panel-* sessionKey reuse override (PR-B)", () => {
-    const PANEL_KEY = "agent:custom-cbd0fe4a:user:06148fa3-9aa3-4b28-b1b1-3513ada1dc9e:panel-d1e7fc49";
+    const PANEL_KEY =
+      "agent:custom-cbd0fe4a:user:06148fa3-9aa3-4b28-b1b1-3513ada1dc9e:panel-d1e7fc49";
 
     it("reuses existing sessionId for panel-* key even when forceNew=true", () => {
       // Cron with sessionTarget=isolated 调用 resolveCronSession 时 forceNew=true。
@@ -353,6 +354,75 @@ describe("resolveCronSession", () => {
 
       expect(result.sessionEntry.sessionId).not.toBe("old-stale");
       expect(result.isNewSession).toBe(true);
+    });
+  });
+
+  // 1.15.244 B1 修复 (Yuiclaw Ralph Lauren cron tab 空白事故 follow-up):
+  // PR-B 让 panel-* sessionKey 复用 entry.sessionId 不滚走,但 sessionEntry 构造时
+  // 通过 `...entry` 把 stale `sessionFile` (历史 rollover / 其它写入路径留下) 也带回去,
+  // 写回 sessions.json 后下次 chat.history 读路径 (优先 sessionFile 候选) 命中旧 jsonl,
+  // panel UI 看不到 cron 新写入的 transcript。B1 修复: 在 panel-* 分支后
+  // delete sessionEntry.sessionFile,强制下次 readSessionMessages 走 sessionsDir +
+  // sessionId 标准 fallback,自动指向当前 cron 写入的 jsonl。
+  describe("panel-* sessionKey: clear stale sessionFile (PR-B follow-up B1)", () => {
+    const PANEL_KEY =
+      "agent:custom-cbd0fe4a:user:06148fa3-9aa3-4b28-b1b1-3513ada1dc9e:panel-d1e7fc49";
+
+    it("omits sessionFile from sessionEntry (own property gone) when reusing panel-* sessionId", () => {
+      // setup: store 里 panel-* entry 有 stale sessionFile (绝对路径,模拟 Ralph Lauren
+      // 事故的真实数据形态)
+      const result = resolveWithStoredEntry({
+        sessionKey: PANEL_KEY,
+        entry: {
+          sessionId: "27031159-490d-442e-94a6-eb70275cca6f",
+          sessionFile:
+            "/Users/foo/.yuiclaw/openclaw/agents/custom-cbd0fe4a/sessions/53258a3e-9cd2-4fb0-ac63-464db5d24d4f.jsonl",
+          updatedAt: NOW_MS - 1000,
+          systemSent: true,
+        },
+        forceNew: true,
+        fresh: true,
+      });
+
+      // 复用 sessionId 验证 PR-B 行为不退化
+      expect(result.sessionEntry.sessionId).toBe("27031159-490d-442e-94a6-eb70275cca6f");
+
+      // B1 核心断言: 4 层证明 sessionFile 字段真正从 sessionEntry 消失
+      // 1) 值层
+      expect(result.sessionEntry.sessionFile).toBeUndefined();
+      // 2) own-property 层 (区分 "字段被 omit" vs "字段存在但值是 undefined")
+      expect("sessionFile" in result.sessionEntry).toBe(false);
+      // 3) Object.keys 层 (与上同义,不同表述更明确)
+      expect(Object.keys(result.sessionEntry)).not.toContain("sessionFile");
+      // 4) 持久化形态层 (JSON.stringify 后字段不应出现,用 own-property 语义而非
+      //    === undefined,避免对"字段存在但 undefined / null"产生歧义)
+      const persisted = JSON.parse(JSON.stringify({ [PANEL_KEY]: result.sessionEntry })) as Record<
+        string,
+        Record<string, unknown>
+      >;
+      expect("sessionFile" in persisted[PANEL_KEY]).toBe(false);
+    });
+
+    it("preserves sessionFile for non-panel reuse (regression: B1 narrow scope)", () => {
+      // 对照: 非 panel key (LINE 群形态) 走 freshness reuse 分支, sessionFile 必须保留
+      // 显式 fresh:true 不依赖默认 policy,避免未来 policy 改动让测试变脆
+      const result = resolveWithStoredEntry({
+        sessionKey: "agent:main:line:group:c9f9d4061d0f23d41282c711726f6e560",
+        entry: {
+          sessionId: "line-existing-id",
+          sessionFile: "/some/path/line-existing-id.jsonl",
+          updatedAt: NOW_MS - 1000,
+          systemSent: true,
+        },
+        forceNew: false,
+        fresh: true,
+      });
+
+      // reuse 分支命中,sessionId 保留
+      expect(result.sessionEntry.sessionId).toBe("line-existing-id");
+      // B1 不影响 line / 其它 channel: sessionFile 完整保留
+      expect(result.sessionEntry.sessionFile).toBe("/some/path/line-existing-id.jsonl");
+      expect("sessionFile" in result.sessionEntry).toBe(true);
     });
   });
 });

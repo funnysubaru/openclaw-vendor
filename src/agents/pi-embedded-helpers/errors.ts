@@ -842,10 +842,22 @@ export function parseRateLimitTokens(raw: string): {
   }
 
   // OpenAI form — "(TPM): Limit 30000, Requested 52748" or
-  //               "Limit 30,000, Requested 52,748"
+  //               "Limit 30,000, Requested 52,748" or
+  //               "Limit: 30000, Requested: 52748" (colon variant used by some
+  //               proxy/error-formatter layers)
   // We require both numbers to be present in a single match so that we do not
   // emit a partial OpenAI result (the Anthropic branch handles limit-only).
-  const openAiMatch = raw.match(/\bLimit\s+([\d,]+)\s*,\s*Requested\s+([\d,]+)/i);
+  //
+  // Accepted trade-off — theoretical over-match:
+  //   The regex matches any comma-paired "Limit N, Requested M" shape, so a
+  //   contrived string like "Credit Limit 30000, Requested 52748" would also
+  //   parse successfully.  Tightening the pattern to require a "TPM" / "tokens
+  //   per minute" context marker would break the colon-variant tolerance that
+  //   the variant tests intentionally exercise (e.g. bare "Limit: 30000,
+  //   Requested: 52748" without any TPM prefix).  In practice the comma-paired
+  //   Limit/Requested shape only appears in real TPM 429 messages, so the rare
+  //   theoretical over-match is harmless and accepted.
+  const openAiMatch = raw.match(/\bLimit:?\s+([\d,]+)\s*,\s*Requested:?\s+([\d,]+)/i);
   if (openAiMatch?.[1] && openAiMatch[2]) {
     const limit = Number(openAiMatch[1].replaceAll(",", ""));
     const requested = Number(openAiMatch[2].replaceAll(",", ""));

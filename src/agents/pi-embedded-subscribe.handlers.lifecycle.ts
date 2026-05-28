@@ -5,7 +5,11 @@ import {
   buildTextObservationFields,
   sanitizeForConsole,
 } from "./pi-embedded-error-observation.js";
-import { classifyFailoverReason, formatAssistantErrorText } from "./pi-embedded-helpers.js";
+import {
+  classifyFailoverReason,
+  formatAssistantErrorText,
+  parseRateLimitTokens,
+} from "./pi-embedded-helpers.js";
 import type { EmbeddedPiSubscribeContext } from "./pi-embedded-subscribe.handlers.types.js";
 import { isAssistantMessage } from "./pi-embedded-utils.js";
 
@@ -50,6 +54,10 @@ export function handleAgentEnd(ctx: EmbeddedPiSubscribeContext) {
     const safeRunId = sanitizeForConsole(ctx.params.runId) ?? "-";
     const safeModel = sanitizeForConsole(lastAssistant.model) ?? "unknown";
     const safeProvider = sanitizeForConsole(lastAssistant.provider) ?? "unknown";
+    // Parse verbatim token numbers from the raw provider error message.
+    // These are non-sensitive display numbers (plan limit / prompt size) and
+    // are intentionally kept separate from the redacted observedError fields.
+    const rateLimitTokens = parseRateLimitTokens(rawError ?? "");
     ctx.log.warn("embedded run agent end", {
       event: "embedded_run_agent_end",
       tags: ["error_handling", "lifecycle", "agent_end", "assistant_error"],
@@ -62,21 +70,32 @@ export function handleAgentEnd(ctx: EmbeddedPiSubscribeContext) {
       ...observedError,
       consoleMessage: `embedded run agent end: runId=${safeRunId} isError=true model=${safeModel} provider=${safeProvider} error=${safeErrorText}`,
     });
+    // Structured error fields forwarded into both the agent event bus and the
+    // onAgentEvent callback so downstream consumers (server-chat.ts) can
+    // thread them into the chat payload for the panel to render.
+    // Only defined fields are included — spread of {} is a no-op when no
+    // rate-limit numbers were found.
+    // errorEventData is extracted as a shared const so both the emitAgentEvent
+    // and onAgentEvent paths stay in lockstep; endedAt is added only to the
+    // emitAgentEvent path (it's an infra timestamp, not needed on the callback).
+    const errorEventData = {
+      phase: "error" as const,
+      error: safeErrorText,
+      ...(failoverReason !== null && { failoverReason }),
+      ...(observedError.httpCode !== undefined && { httpCode: observedError.httpCode }),
+      ...(observedError.providerErrorType !== undefined && {
+        providerErrorType: observedError.providerErrorType,
+      }),
+      ...rateLimitTokens,
+    };
     emitAgentEvent({
       runId: ctx.params.runId,
       stream: "lifecycle",
-      data: {
-        phase: "error",
-        error: safeErrorText,
-        endedAt: Date.now(),
-      },
+      data: { ...errorEventData, endedAt: Date.now() },
     });
     void ctx.params.onAgentEvent?.({
       stream: "lifecycle",
-      data: {
-        phase: "error",
-        error: safeErrorText,
-      },
+      data: errorEventData,
     });
   } else {
     ctx.log.debug(`embedded run agent end: runId=${ctx.params.runId} isError=${isError}`);

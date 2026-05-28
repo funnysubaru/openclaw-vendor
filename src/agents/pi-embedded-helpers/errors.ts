@@ -815,6 +815,59 @@ export function sanitizeUserFacingText(text: string, opts?: { errorContext?: boo
   return collapseConsecutiveDuplicateBlocks(withoutLeadingEmptyLines);
 }
 
+/**
+ * Extract the verbatim token-count numbers from a rate-limit error message so
+ * the frontend can render an actionable message like
+ * "Limit 30,000 TPM — you sent 52,748 tokens."
+ *
+ * Two provider shapes are recognised:
+ *   OpenAI  — "Limit 30000, Requested 52748" (with or without thousands separators)
+ *   Anthropic — "rate limit of 30,000 input tokens per minute" (no "requested" number)
+ *
+ * Returns only the numbers that are present in the raw text.  When neither
+ * pattern matches the function returns {} so callers can safely spread the
+ * result into an optional-fields object.
+ *
+ * These numbers are non-sensitive (they describe the API plan tier and the
+ * prompt size, not credentials) and are intentionally kept out of
+ * buildApiErrorObservationFields / redaction pipelines so the frontend can
+ * display them verbatim.
+ */
+export function parseRateLimitTokens(raw: string): {
+  limitTokensPerMinute?: number;
+  requestedTokens?: number;
+} {
+  if (!raw) {
+    return {};
+  }
+
+  // OpenAI form — "(TPM): Limit 30000, Requested 52748" or
+  //               "Limit 30,000, Requested 52,748"
+  // We require both numbers to be present in a single match so that we do not
+  // emit a partial OpenAI result (the Anthropic branch handles limit-only).
+  const openAiMatch = raw.match(/\bLimit\s+([\d,]+)\s*,\s*Requested\s+([\d,]+)/i);
+  if (openAiMatch?.[1] && openAiMatch[2]) {
+    const limit = Number(openAiMatch[1].replaceAll(",", ""));
+    const requested = Number(openAiMatch[2].replaceAll(",", ""));
+    if (Number.isFinite(limit) && limit > 0 && Number.isFinite(requested) && requested > 0) {
+      return { limitTokensPerMinute: limit, requestedTokens: requested };
+    }
+  }
+
+  // Anthropic form — "rate limit of 30,000 input tokens per minute"
+  // No "requested" number is present in Anthropic 429 bodies; do NOT try to
+  // infer it.
+  const anthropicMatch = raw.match(/rate limit of\s+([\d,]+)\s+input tokens per minute/i);
+  if (anthropicMatch?.[1]) {
+    const limit = Number(anthropicMatch[1].replaceAll(",", ""));
+    if (Number.isFinite(limit) && limit > 0) {
+      return { limitTokensPerMinute: limit };
+    }
+  }
+
+  return {};
+}
+
 export function isRateLimitAssistantError(msg: AssistantMessage | undefined): boolean {
   if (!msg || msg.stopReason !== "error") {
     return false;

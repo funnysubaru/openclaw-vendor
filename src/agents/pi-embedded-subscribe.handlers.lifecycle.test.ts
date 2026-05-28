@@ -157,4 +157,70 @@ describe("handleAgentEnd", () => {
     expect(ctx.log.warn).not.toHaveBeenCalled();
     expect(ctx.log.debug).toHaveBeenCalledWith("embedded run agent end: runId=run-1 isError=false");
   });
+
+  // Producer-side tests: verify that handleAgentEnd correctly forwards
+  // structured rate-limit fields into the onAgentEvent callback so downstream
+  // consumers (server-chat.ts) can surface them in the chat error payload.
+
+  it("forwards limitTokensPerMinute and requestedTokens for OpenAI TPM rate-limit error", () => {
+    // Real OpenAI error form: "Limit <N>, Requested <M>" in the message.
+    const onAgentEvent = vi.fn();
+    const ctx = createContext(
+      {
+        role: "assistant",
+        stopReason: "error",
+        errorMessage:
+          "Request too large for gpt-4o-mini on tokens per min (TPM): Limit 30000, Requested 52748. " +
+          "The input or output tokens must be reduced in order to run the models.",
+        content: [{ type: "text", text: "" }],
+      },
+      { onAgentEvent },
+    );
+
+    handleAgentEnd(ctx);
+
+    // The friendly error text must still be present.
+    expect(onAgentEvent).toHaveBeenCalledTimes(1);
+    const callData = onAgentEvent.mock.calls[0]?.[0].data as Record<string, unknown>;
+    expect(callData).toMatchObject({
+      phase: "error",
+      // error is present (exact text is handled by formatAssistantErrorText; just
+      // assert it is a non-empty string, not the raw provider message).
+      error: expect.any(String),
+      limitTokensPerMinute: 30000,
+      requestedTokens: 52748,
+    });
+    expect(callData.error).toBeTruthy();
+  });
+
+  it("forwards limitTokensPerMinute without requestedTokens for Anthropic rate-limit form", () => {
+    // Anthropic's form only includes the limit, not the requested amount.
+    const onAgentEvent = vi.fn();
+    const ctx = createContext(
+      {
+        role: "assistant",
+        stopReason: "error",
+        provider: "anthropic",
+        model: "claude-3-5-sonnet-20241022",
+        errorMessage:
+          "This request would exceed your organization's rate limit of 30,000 input tokens per minute " +
+          "(model: claude-3-5-sonnet-20241022). Your current rate limit is 30,000 input tokens per minute.",
+        content: [{ type: "text", text: "" }],
+      },
+      { onAgentEvent },
+    );
+
+    handleAgentEnd(ctx);
+
+    expect(onAgentEvent).toHaveBeenCalledTimes(1);
+    const callData = onAgentEvent.mock.calls[0]?.[0].data as Record<string, unknown>;
+    expect(callData).toMatchObject({
+      phase: "error",
+      error: expect.any(String),
+      limitTokensPerMinute: 30000,
+    });
+    // Anthropic does not provide the requested token count — must be absent.
+    expect("requestedTokens" in callData).toBe(false);
+    expect(callData.error).toBeTruthy();
+  });
 });

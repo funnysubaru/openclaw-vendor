@@ -444,6 +444,21 @@ export function createAgentEventHandler({
     chatRunState.deltaSentAt.set(clientRunId, now);
   };
 
+  /**
+   * Optional structured fields extracted from the provider error payload.
+   * Forwarded verbatim into the chat error payload so the panel can render an
+   * actionable rate-limit message with the real numbers instead of a vague
+   * "rate limit reached" string.  All fields are optional so existing "done"
+   * callers and non-rate-limit error paths are unaffected.
+   */
+  type ChatErrorFields = {
+    httpCode?: string;
+    providerErrorType?: string;
+    failoverReason?: string | null;
+    limitTokensPerMinute?: number;
+    requestedTokens?: number;
+  };
+
   const emitChatFinal = (
     sessionKey: string,
     clientRunId: string,
@@ -452,6 +467,7 @@ export function createAgentEventHandler({
     jobState: "done" | "error",
     error?: unknown,
     stopReason?: string,
+    errorFields?: ChatErrorFields,
   ) => {
     const bufferedText = stripInlineDirectiveTagsForDisplay(
       chatRunState.buffers.get(clientRunId) ?? "",
@@ -492,12 +508,34 @@ export function createAgentEventHandler({
       nodeSendToSession(sessionKey, "chat", payload);
       return;
     }
+    // Spread only defined fields from errorFields into the error payload so
+    // callers that pass nothing (or pass undefined for individual fields) do
+    // not pollute the payload with explicit `undefined` keys.
+    const definedErrorFields: Record<string, string | number> = {};
+    if (errorFields) {
+      if (errorFields.httpCode !== undefined) {
+        definedErrorFields.httpCode = errorFields.httpCode;
+      }
+      if (errorFields.providerErrorType !== undefined) {
+        definedErrorFields.providerErrorType = errorFields.providerErrorType;
+      }
+      if (errorFields.failoverReason != null) {
+        definedErrorFields.failoverReason = errorFields.failoverReason;
+      }
+      if (errorFields.limitTokensPerMinute !== undefined) {
+        definedErrorFields.limitTokensPerMinute = errorFields.limitTokensPerMinute;
+      }
+      if (errorFields.requestedTokens !== undefined) {
+        definedErrorFields.requestedTokens = errorFields.requestedTokens;
+      }
+    }
     const payload = {
       runId: clientRunId,
       sessionKey,
       seq,
       state: "error" as const,
       errorMessage: error ? formatForLog(error) : undefined,
+      ...definedErrorFields,
     };
     broadcast("chat", payload);
     nodeSendToSession(sessionKey, "chat", payload);
@@ -601,6 +639,28 @@ export function createAgentEventHandler({
       } else if (!isAborted && (lifecyclePhase === "end" || lifecyclePhase === "error")) {
         const evtStopReason =
           typeof evt.data?.stopReason === "string" ? evt.data.stopReason : undefined;
+        // Extract structured error fields forwarded by handleAgentEnd.
+        // Only present on lifecycle "error" events; ignored for "done" paths.
+        const evtErrorFields: ChatErrorFields | undefined =
+          lifecyclePhase === "error"
+            ? {
+                httpCode: typeof evt.data?.httpCode === "string" ? evt.data.httpCode : undefined,
+                providerErrorType:
+                  typeof evt.data?.providerErrorType === "string"
+                    ? evt.data.providerErrorType
+                    : undefined,
+                failoverReason:
+                  typeof evt.data?.failoverReason === "string" ? evt.data.failoverReason : null,
+                limitTokensPerMinute:
+                  typeof evt.data?.limitTokensPerMinute === "number"
+                    ? evt.data.limitTokensPerMinute
+                    : undefined,
+                requestedTokens:
+                  typeof evt.data?.requestedTokens === "number"
+                    ? evt.data.requestedTokens
+                    : undefined,
+              }
+            : undefined;
         if (chatLink) {
           const finished = chatRunState.registry.shift(evt.runId);
           if (!finished) {
@@ -615,6 +675,7 @@ export function createAgentEventHandler({
             lifecyclePhase === "error" ? "error" : "done",
             evt.data?.error,
             evtStopReason,
+            evtErrorFields,
           );
         } else {
           emitChatFinal(
@@ -625,6 +686,7 @@ export function createAgentEventHandler({
             lifecyclePhase === "error" ? "error" : "done",
             evt.data?.error,
             evtStopReason,
+            evtErrorFields,
           );
         }
       } else if (isAborted && (lifecyclePhase === "end" || lifecyclePhase === "error")) {

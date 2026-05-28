@@ -821,4 +821,141 @@ describe("agent event handler", () => {
       "Disk usage crossed 95 percent on /data and needs cleanup now.",
     );
   });
+
+  // ---------------------------------------------------------------------------
+  // Structured LLM rate-limit error fields threading (ADR-0026 / Yuiclaw)
+  // ---------------------------------------------------------------------------
+
+  it("threads structured rate-limit fields from lifecycle error event into chat error payload", () => {
+    const { broadcast, nodeSendToSession, chatRunState, handler } = createHarness();
+    chatRunState.registry.add("run-ratelimit", {
+      sessionKey: "session-ratelimit",
+      clientRunId: "client-ratelimit",
+    });
+
+    // Simulate what handleAgentEnd now emits on a rate-limit error:
+    // error text + structured fields (failoverReason, httpCode, token counts).
+    handler({
+      runId: "run-ratelimit",
+      seq: 1,
+      stream: "lifecycle",
+      ts: Date.now(),
+      data: {
+        phase: "error",
+        error: "⚠️ API rate limit reached. Please try again later.",
+        failoverReason: "rate_limit",
+        httpCode: "429",
+        providerErrorType: "rate_limit_exceeded",
+        limitTokensPerMinute: 30000,
+        requestedTokens: 52748,
+      },
+    });
+
+    const chatCalls = chatBroadcastCalls(broadcast);
+    expect(chatCalls).toHaveLength(1);
+    const payload = chatCalls[0]?.[1] as Record<string, unknown>;
+    expect(payload.state).toBe("error");
+    expect(payload.errorMessage).toBe("⚠️ API rate limit reached. Please try again later.");
+    expect(payload.failoverReason).toBe("rate_limit");
+    expect(payload.httpCode).toBe("429");
+    expect(payload.providerErrorType).toBe("rate_limit_exceeded");
+    expect(payload.limitTokensPerMinute).toBe(30000);
+    expect(payload.requestedTokens).toBe(52748);
+    // Verify nodeSendToSession also got the same payload
+    const sessionCalls = sessionChatCalls(nodeSendToSession);
+    expect(sessionCalls).toHaveLength(1);
+    const sessionPayload = sessionCalls[0]?.[2] as Record<string, unknown>;
+    expect(sessionPayload.limitTokensPerMinute).toBe(30000);
+    expect(sessionPayload.requestedTokens).toBe(52748);
+  });
+
+  it("threads structured rate-limit fields via chatLink path into chat error payload", () => {
+    // Exercises the chatLink branch (chatRunState.registry.shift) as opposed to
+    // the direct-sessionKey branch above.
+    const { broadcast, chatRunState, handler } = createHarness({
+      resolveSessionKeyForRun: () => "session-ratelimit-link",
+    });
+    chatRunState.registry.add("run-ratelimit-link", {
+      sessionKey: "session-ratelimit-link",
+      clientRunId: "client-ratelimit-link",
+    });
+
+    handler({
+      runId: "run-ratelimit-link",
+      seq: 1,
+      stream: "lifecycle",
+      ts: Date.now(),
+      data: {
+        phase: "error",
+        error: "⚠️ API rate limit reached. Please try again later.",
+        failoverReason: "rate_limit",
+        limitTokensPerMinute: 30000,
+        requestedTokens: 52748,
+      },
+    });
+
+    const chatCalls = chatBroadcastCalls(broadcast);
+    expect(chatCalls).toHaveLength(1);
+    const payload = chatCalls[0]?.[1] as Record<string, unknown>;
+    expect(payload.state).toBe("error");
+    expect(payload.limitTokensPerMinute).toBe(30000);
+    expect(payload.requestedTokens).toBe(52748);
+  });
+
+  it("omits structured fields from chat error payload when not present on lifecycle event", () => {
+    const { broadcast, chatRunState, handler } = createHarness();
+    chatRunState.registry.add("run-generic-error", {
+      sessionKey: "session-generic-error",
+      clientRunId: "client-generic-error",
+    });
+
+    handler({
+      runId: "run-generic-error",
+      seq: 1,
+      stream: "lifecycle",
+      ts: Date.now(),
+      data: {
+        phase: "error",
+        error: "connection refused",
+      },
+    });
+
+    const chatCalls = chatBroadcastCalls(broadcast);
+    expect(chatCalls).toHaveLength(1);
+    const payload = chatCalls[0]?.[1] as Record<string, unknown>;
+    expect(payload.state).toBe("error");
+    expect(payload.errorMessage).toBe("connection refused");
+    // Structured fields must not appear when the event did not carry them
+    expect("limitTokensPerMinute" in payload).toBe(false);
+    expect("requestedTokens" in payload).toBe(false);
+    expect("failoverReason" in payload).toBe(false);
+  });
+
+  it("includes only limitTokensPerMinute in chat error payload when requestedTokens is absent (Anthropic form)", () => {
+    const { broadcast, chatRunState, handler } = createHarness();
+    chatRunState.registry.add("run-anthropic-ratelimit", {
+      sessionKey: "session-anthropic-ratelimit",
+      clientRunId: "client-anthropic-ratelimit",
+    });
+
+    handler({
+      runId: "run-anthropic-ratelimit",
+      seq: 1,
+      stream: "lifecycle",
+      ts: Date.now(),
+      data: {
+        phase: "error",
+        error: "⚠️ API rate limit reached. Please try again later.",
+        failoverReason: "rate_limit",
+        limitTokensPerMinute: 30000,
+        // requestedTokens deliberately absent (Anthropic does not provide it)
+      },
+    });
+
+    const chatCalls = chatBroadcastCalls(broadcast);
+    const payload = chatCalls[0]?.[1] as Record<string, unknown>;
+    expect(payload.state).toBe("error");
+    expect(payload.limitTokensPerMinute).toBe(30000);
+    expect("requestedTokens" in payload).toBe(false);
+  });
 });

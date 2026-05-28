@@ -6,6 +6,10 @@ import { normalizeUsage } from "../agents/usage.js";
 import { stripInboundMetadata } from "../auto-reply/reply/strip-inbound-meta.js";
 import type { OpenClawConfig } from "../config/config.js";
 import {
+  isPrimarySessionTranscriptFileName,
+  parseSessionArchiveTimestamp,
+} from "../config/sessions/artifacts.js";
+import {
   resolveSessionFilePath,
   resolveSessionTranscriptsDirForAgent,
 } from "../config/sessions/paths.js";
@@ -215,29 +219,31 @@ const applyCostTotal = (totals: CostUsageTotals, costTotal: number | undefined) 
 };
 
 /**
- * 归档文件名匹配模式（用于 includeArchived 模式）。
+ * 判断给定文件名是否为会话转录文件（用于枚举会话目录时的过滤）。
  *
- * Yuiclaw 的「重置会话」和「删除会话」操作不会真正删除 .jsonl 文件，而是将其重命名为：
- *   <sessionId>.jsonl.reset.<UTC-timestamp>   ← reset 操作
- *   <sessionId>.jsonl.deleted.<UTC-timestamp> ← delete 操作
- * 这样数据保留在磁盘上便于恢复，但普通的 .endsWith(".jsonl") 过滤条件会漏掉它们，
- * 导致面板用量统计偏低（Anthropic 仍按实际 token 计费）。
- * 本正则用于 includeArchived=true 时识别这类归档文件。
- */
-const ARCHIVED_TRANSCRIPT_RE = /\.jsonl\.(reset|deleted)\./;
-
-/**
- * 判断给定文件名是否为会话转录文件。
+ * 背景：Yuiclaw 的「重置会话」「删除会话」不会真正删除 .jsonl，而是把它重命名为
+ *   <sessionId>.jsonl.reset.<UTC-timestamp>   ← reset
+ *   <sessionId>.jsonl.deleted.<UTC-timestamp> ← delete
+ * 数据仍在盘上，但普通的 .endsWith(".jsonl") 会漏掉它们，导致面板用量偏低
+ * （Anthropic 仍按实际 token 计费）。
  *
- * @param name - 文件名（不含目录路径）
- * @param includeArchived - true 时同时接受归档文件（.jsonl.reset.* / .jsonl.deleted.*）；
- *                          false（默认）时仅接受普通 .jsonl 文件，与改动前行为完全一致。
+ * 复用 vendor canonical 归档命名规则（config/sessions/artifacts.ts），不再自建正则：
+ * - includeArchived=false（默认）→ isPrimarySessionTranscriptFileName(name)，即普通 .jsonl，
+ *   与改动前 .endsWith(".jsonl") 行为完全一致（向后兼容）。
+ * - includeArchived=true → 额外纳入 reset / deleted 归档。这里用 parseSessionArchiveTimestamp
+ *   做严格校验：只有 `.jsonl.reset.<合法UTC时间戳>` / `.jsonl.deleted.<…>` 才算，
+ *   像 `a.jsonl.reset.foo` 这种时间戳非法的不会被误纳入（省掉无谓 readdir/读盘）。
+ * - 故意不含 `.bak`（ADR-0027 范围 = reset + deleted；bak 可能是拷贝、有双算风险）。
  */
 export function isSessionTranscriptFile(name: string, includeArchived: boolean): boolean {
-  if (name.endsWith(".jsonl")) {
+  if (isPrimarySessionTranscriptFileName(name)) {
     return true;
   }
-  if (includeArchived && ARCHIVED_TRANSCRIPT_RE.test(name)) {
+  if (
+    includeArchived &&
+    (parseSessionArchiveTimestamp(name, "reset") !== null ||
+      parseSessionArchiveTimestamp(name, "deleted") !== null)
+  ) {
     return true;
   }
   return false;

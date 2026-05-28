@@ -842,10 +842,12 @@ export function parseRateLimitTokens(raw: string): {
   }
 
   // OpenAI form — "(TPM): Limit 30000, Requested 52748" or
-  //               "Limit 30,000, Requested 52,748"
+  //               "Limit 30,000, Requested 52,748" or
+  //               "Limit: 30000, Requested: 52748" (colon variant used by some
+  //               proxy/error-formatter layers)
   // We require both numbers to be present in a single match so that we do not
   // emit a partial OpenAI result (the Anthropic branch handles limit-only).
-  const openAiMatch = raw.match(/\bLimit\s+([\d,]+)\s*,\s*Requested\s+([\d,]+)/i);
+  const openAiMatch = raw.match(/\bLimit:?\s+([\d,]+)\s*,\s*Requested:?\s+([\d,]+)/i);
   if (openAiMatch?.[1] && openAiMatch[2]) {
     const limit = Number(openAiMatch[1].replaceAll(",", ""));
     const requested = Number(openAiMatch[2].replaceAll(",", ""));

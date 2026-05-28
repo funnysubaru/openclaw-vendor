@@ -206,6 +206,31 @@ describe("parseRateLimitTokens", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Accepted over-match behavior — documented, not a desired feature
+  // ---------------------------------------------------------------------------
+
+  describe("accepted theoretical over-match", () => {
+    // The OpenAI regex matches any comma-paired "Limit N, Requested M" shape
+    // regardless of surrounding context.  A contrived string like
+    // "Credit Limit 30000, Requested 52748" (no TPM / rate-limit context) also
+    // parses successfully.
+    //
+    // This is an accepted trade-off: tightening the pattern to require a "TPM"
+    // or "tokens per minute" context marker would regress the colon-variant
+    // tolerance tested above (e.g. bare "Limit: 30000, Requested: 52748").
+    // In real error payloads the shape only appears in TPM 429 responses, so
+    // the false-positive is harmless.  This test documents the behavior so
+    // future readers know it is intentional, not a bug.
+    it("parses a contrived non-TPM string that matches the Limit/Requested shape (accepted over-match)", () => {
+      const raw = "Credit Limit 30000, Requested 52748";
+      expect(parseRateLimitTokens(raw)).toEqual({
+        limitTokensPerMinute: 30000,
+        requestedTokens: 52748,
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // Negative / guard cases — text that mentions rates but has no parseable nums
   // ---------------------------------------------------------------------------
 

@@ -12,6 +12,26 @@
  *   本测试的目的：静态断言该不变量始终成立——别名映射只存在于函数体内，
  *   不出现在模块顶层——以便在有人将其"优化回"模块顶层 const 时立即报错。
  *   (运行时 smoke 无法可靠复现此 bug，因为它依赖 bundle 初始化顺序。)
+ *
+ * ── 守卫的有效范围（刻意的、有限的作用域）────────────────────────────────
+ *
+ *   本守卫仅能检测以下具体情形：
+ *     ✓ 别名映射被放回 model-selection.ts **同一文件**的模块顶层 `const`
+ *
+ *   以下情形本守卫 **无法** 检测：
+ *     ✗ 别名表被提取到另一个模块的顶层 `const`（例如新建 `anthropic-aliases.ts`）——
+ *       `extractFunctionBody` 只读取 model-selection.ts 一个文件
+ *     ✗ 模块级 lazy getter / singleton 持有别名映射——TDZ 不变量在技术上仍满足，
+ *       但守卫不关心这一点
+ *     ✗ `normalizeAnthropicModelId` 被改写为箭头函数（`const normalizeAnthropicModelId = ...`）——
+ *       `extractFunctionBody` 靠 `function <name>` 定位，箭头函数形式找不到，
+ *       会返回 null 并让 "contains the function" 测试直接失败（相当于早期警报），
+ *       但 "not at module scope" 测试的断言将在 null 路径上被跳过
+ *
+ *   这些限制是刻意接受的：本守卫只为最常见的"把 const 移回顶层"的手滑情形提供防护，
+ *   不试图覆盖所有重构路径。如果 normalizeAnthropicModelId 将来被大幅重写，
+ *   应同步更新本守卫的实现。
+ * ────────────────────────────────────────────────────────────────────────────
  */
 
 import { readFileSync } from "node:fs";
@@ -28,6 +48,15 @@ const sourceFile = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "m
  * 足够精确地覆盖这个简单的非嵌套函数。
  *
  * 返回函数体文本（含首尾大括号），若未找到则返回 null。
+ *
+ * ── 脆弱性说明（已知限制，刻意接受）────────────────────────────────────
+ *   括号计数法是朴素实现：它**不会跳过**字符串字面量或注释中的 `{` / `}` 字符。
+ *   对于当前 `normalizeAnthropicModelId` 这个简单函数体（无复杂嵌套、无含括号的
+ *   字符串字面量）来说精度足够。
+ *   若将来函数体变复杂（深层嵌套对象、模板字面量中含括号等），括号计数可能提前
+ *   或延迟结束，导致提取范围出错。届时应考虑换用 AST（如 TypeScript Compiler API
+ *   或 tree-sitter）以获得更可靠的函数体定位。
+ * ────────────────────────────────────────────────────────────────────────────
  */
 function extractFunctionBody(source: string, fnName: string): string | null {
   const fnStart = source.indexOf(`function ${fnName}`);

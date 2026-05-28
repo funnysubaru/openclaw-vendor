@@ -193,6 +193,37 @@ describe("handleAgentEnd", () => {
     expect(callData.error).toBeTruthy();
   });
 
+  it("forwards limitTokensPerMinute and requestedTokens for OpenAI colon-variant TPM error", () => {
+    // Proves that the colon-variant message form (Limit: N, Requested: M) flows
+    // end-to-end through handleAgentEnd → parseRateLimitTokens → forwarded event
+    // fields.  Some proxy/error-formatter layers emit this shape instead of the
+    // no-colon canonical form.
+    const onAgentEvent = vi.fn();
+    const ctx = createContext(
+      {
+        role: "assistant",
+        stopReason: "error",
+        errorMessage:
+          "429 Too Many Requests on tokens per min (TPM): Limit: 30000, Requested: 52748. " +
+          "Please reduce your request frequency.",
+        content: [{ type: "text", text: "" }],
+      },
+      { onAgentEvent },
+    );
+
+    handleAgentEnd(ctx);
+
+    expect(onAgentEvent).toHaveBeenCalledTimes(1);
+    const callData = onAgentEvent.mock.calls[0]?.[0].data as Record<string, unknown>;
+    expect(callData).toMatchObject({
+      phase: "error",
+      error: expect.any(String),
+      limitTokensPerMinute: 30000,
+      requestedTokens: 52748,
+    });
+    expect(callData.error).toBeTruthy();
+  });
+
   it("forwards limitTokensPerMinute without requestedTokens for Anthropic rate-limit form", () => {
     // Anthropic's form only includes the limit, not the requested amount.
     const onAgentEvent = vi.fn();

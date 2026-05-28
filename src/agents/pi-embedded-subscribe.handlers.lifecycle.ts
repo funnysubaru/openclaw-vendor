@@ -75,33 +75,27 @@ export function handleAgentEnd(ctx: EmbeddedPiSubscribeContext) {
     // thread them into the chat payload for the panel to render.
     // Only defined fields are included — spread of {} is a no-op when no
     // rate-limit numbers were found.
+    // errorEventData is extracted as a shared const so both the emitAgentEvent
+    // and onAgentEvent paths stay in lockstep; endedAt is added only to the
+    // emitAgentEvent path (it's an infra timestamp, not needed on the callback).
+    const errorEventData = {
+      phase: "error" as const,
+      error: safeErrorText,
+      ...(failoverReason !== null && { failoverReason }),
+      ...(observedError.httpCode !== undefined && { httpCode: observedError.httpCode }),
+      ...(observedError.providerErrorType !== undefined && {
+        providerErrorType: observedError.providerErrorType,
+      }),
+      ...rateLimitTokens,
+    };
     emitAgentEvent({
       runId: ctx.params.runId,
       stream: "lifecycle",
-      data: {
-        phase: "error",
-        error: safeErrorText,
-        endedAt: Date.now(),
-        ...(failoverReason !== null && { failoverReason }),
-        ...(observedError.httpCode !== undefined && { httpCode: observedError.httpCode }),
-        ...(observedError.providerErrorType !== undefined && {
-          providerErrorType: observedError.providerErrorType,
-        }),
-        ...rateLimitTokens,
-      },
+      data: { ...errorEventData, endedAt: Date.now() },
     });
     void ctx.params.onAgentEvent?.({
       stream: "lifecycle",
-      data: {
-        phase: "error",
-        error: safeErrorText,
-        ...(failoverReason !== null && { failoverReason }),
-        ...(observedError.httpCode !== undefined && { httpCode: observedError.httpCode }),
-        ...(observedError.providerErrorType !== undefined && {
-          providerErrorType: observedError.providerErrorType,
-        }),
-        ...rateLimitTokens,
-      },
+      data: errorEventData,
     });
   } else {
     ctx.log.debug(`embedded run agent end: runId=${ctx.params.runId} isError=${isError}`);

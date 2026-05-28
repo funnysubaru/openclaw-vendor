@@ -454,7 +454,7 @@ export function createAgentEventHandler({
   type ChatErrorFields = {
     httpCode?: string;
     providerErrorType?: string;
-    failoverReason?: string | null;
+    failoverReason?: string;
     limitTokensPerMinute?: number;
     requestedTokens?: number;
   };
@@ -519,7 +519,7 @@ export function createAgentEventHandler({
       if (errorFields.providerErrorType !== undefined) {
         definedErrorFields.providerErrorType = errorFields.providerErrorType;
       }
-      if (errorFields.failoverReason != null) {
+      if (errorFields.failoverReason !== undefined) {
         definedErrorFields.failoverReason = errorFields.failoverReason;
       }
       if (errorFields.limitTokensPerMinute !== undefined) {
@@ -650,7 +650,9 @@ export function createAgentEventHandler({
                     ? evt.data.providerErrorType
                     : undefined,
                 failoverReason:
-                  typeof evt.data?.failoverReason === "string" ? evt.data.failoverReason : null,
+                  typeof evt.data?.failoverReason === "string"
+                    ? evt.data.failoverReason
+                    : undefined,
                 limitTokensPerMinute:
                   typeof evt.data?.limitTokensPerMinute === "number"
                     ? evt.data.limitTokensPerMinute

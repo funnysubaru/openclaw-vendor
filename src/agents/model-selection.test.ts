@@ -5,6 +5,7 @@ import {
   buildAllowedModelSet,
   inferUniqueProviderFromConfiguredModels,
   parseModelRef,
+  normalizeModelRef,
   buildModelAliasIndex,
   normalizeModelSelection,
   normalizeProviderId,
@@ -205,6 +206,50 @@ describe("model-selection", () => {
       expect(parseModelRef("/", "anthropic")).toBeNull();
       expect(parseModelRef("anthropic/", "anthropic")).toBeNull();
       expect(parseModelRef("/model", "anthropic")).toBeNull();
+    });
+  });
+
+  describe("normalizeModelRef - Anthropic alias resolution", () => {
+    it('expands "sonnet-4.6" alias to canonical claude-sonnet-4-6', () => {
+      expect(normalizeModelRef("anthropic", "sonnet-4.6")).toEqual({
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+      });
+    });
+
+    it('expands "opus-4.5" alias to canonical claude-opus-4-5', () => {
+      expect(normalizeModelRef("anthropic", "opus-4.5")).toEqual({
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+      });
+    });
+
+    it('expands "sonnet-4.5" alias to canonical claude-sonnet-4-5', () => {
+      expect(normalizeModelRef("anthropic", "sonnet-4.5")).toEqual({
+        provider: "anthropic",
+        model: "claude-sonnet-4-5",
+      });
+    });
+
+    it('expands "opus-4.6" alias to canonical claude-opus-4-6', () => {
+      expect(normalizeModelRef("anthropic", "opus-4.6")).toEqual({
+        provider: "anthropic",
+        model: "claude-opus-4-6",
+      });
+    });
+
+    it("passes through an already-canonical model id unchanged", () => {
+      expect(normalizeModelRef("anthropic", "claude-sonnet-4-6")).toEqual({
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+      });
+    });
+
+    it("passes through an unknown/arbitrary model id unchanged", () => {
+      expect(normalizeModelRef("anthropic", "claude-opus-4-future")).toEqual({
+        provider: "anthropic",
+        model: "claude-opus-4-future",
+      });
     });
   });
 

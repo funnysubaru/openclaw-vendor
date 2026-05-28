@@ -209,7 +209,7 @@ describe("model-selection", () => {
     });
   });
 
-  describe("normalizeModelRef - Anthropic alias resolution", () => {
+  describe("normalizeModelRef - Anthropic short-alias expansion", () => {
     it('expands "sonnet-4.6" alias to canonical claude-sonnet-4-6', () => {
       expect(normalizeModelRef("anthropic", "sonnet-4.6")).toEqual({
         provider: "anthropic",

@@ -214,6 +214,53 @@ const applyCostTotal = (totals: CostUsageTotals, costTotal: number | undefined) 
   totals.totalCost += costTotal;
 };
 
+/**
+ * 归档文件名匹配模式（用于 includeArchived 模式）。
+ *
+ * Yuiclaw 的「重置会话」和「删除会话」操作不会真正删除 .jsonl 文件，而是将其重命名为：
+ *   <sessionId>.jsonl.reset.<UTC-timestamp>   ← reset 操作
+ *   <sessionId>.jsonl.deleted.<UTC-timestamp> ← delete 操作
+ * 这样数据保留在磁盘上便于恢复，但普通的 .endsWith(".jsonl") 过滤条件会漏掉它们，
+ * 导致面板用量统计偏低（Anthropic 仍按实际 token 计费）。
+ * 本正则用于 includeArchived=true 时识别这类归档文件。
+ */
+const ARCHIVED_TRANSCRIPT_RE = /\.jsonl\.(reset|deleted)\./;
+
+/**
+ * 判断给定文件名是否为会话转录文件。
+ *
+ * @param name - 文件名（不含目录路径）
+ * @param includeArchived - true 时同时接受归档文件（.jsonl.reset.* / .jsonl.deleted.*）；
+ *                          false（默认）时仅接受普通 .jsonl 文件，与改动前行为完全一致。
+ */
+export function isSessionTranscriptFile(name: string, includeArchived: boolean): boolean {
+  if (name.endsWith(".jsonl")) {
+    return true;
+  }
+  if (includeArchived && ARCHIVED_TRANSCRIPT_RE.test(name)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 从文件名提取 sessionId。
+ *
+ * 普通文件：a.jsonl → "a"
+ * 归档文件：a.jsonl.reset.2026-05-28T07-34-44.508Z → "a"
+ *           a.jsonl.deleted.2026-05-28T07-34-44.508Z → "a"
+ *
+ * 实현 방법：.jsonl が見つかる最初のインデックスでスライスする。
+ * .jsonl がない場合はファイル名全体を返す（フォールバック）。
+ */
+export function extractSessionId(name: string): string {
+  const idx = name.indexOf(".jsonl");
+  if (idx === -1) {
+    return name;
+  }
+  return name.slice(0, idx);
+}
+
 async function* readJsonlRecords(filePath: string): AsyncGenerator<Record<string, unknown>> {
   const fileStream = fs.createReadStream(filePath, { encoding: "utf-8" });
   const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
@@ -293,6 +340,12 @@ export async function loadCostUsageSummary(params?: {
   days?: number; // Deprecated, for backwards compatibility
   config?: OpenClawConfig;
   agentId?: string;
+  /**
+   * true にすると、reset / deleted で归档されたセッションファイルも集計対象に含める。
+   * Yuiclaw 用量面板が「resetした会話も含めて正確な費用を表示する」ために追加。
+   * デフォルト false で既存の動作（通常の .jsonl のみ）を維持する。
+   */
+  includeArchived?: boolean;
 }): Promise<CostUsageSummary> {
   const now = new Date();
   let sinceTime: number;
@@ -318,7 +371,11 @@ export async function loadCostUsageSummary(params?: {
   const files = (
     await Promise.all(
       entries
-        .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+        .filter(
+          (entry) =>
+            entry.isFile() &&
+            isSessionTranscriptFile(entry.name, params?.includeArchived ?? false),
+        )
         .map(async (entry) => {
           const filePath = path.join(sessionsDir, entry.name);
           const stats = await fs.promises.stat(filePath).catch(() => null);
@@ -386,6 +443,12 @@ export async function discoverAllSessions(params?: {
   agentId?: string;
   startMs?: number;
   endMs?: number;
+  /**
+   * true にすると、reset / deleted で帰档されたセッションファイルも探索対象に含める。
+   * Yuiclaw が帰档済み会話を用量面板に含める際に使用する。
+   * デフォルト false で既存の動作（通常の .jsonl のみ）を維持する。
+   */
+  includeArchived?: boolean;
 }): Promise<DiscoveredSession[]> {
   const sessionsDir = resolveSessionTranscriptsDirForAgent(params?.agentId);
   const entries = await fs.promises.readdir(sessionsDir, { withFileTypes: true }).catch(() => []);
@@ -393,7 +456,7 @@ export async function discoverAllSessions(params?: {
   const discovered: DiscoveredSession[] = [];
 
   for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith(".jsonl")) {
+    if (!entry.isFile() || !isSessionTranscriptFile(entry.name, params?.includeArchived ?? false)) {
       continue;
     }
 
@@ -409,8 +472,8 @@ export async function discoverAllSessions(params?: {
     }
     // Do not exclude by endMs: a session can have activity in range even if it continued later.
 
-    // Extract session ID from filename (remove .jsonl)
-    const sessionId = entry.name.slice(0, -6);
+    // ファイル名から sessionId を抽出（帰档ファイルにも対応）
+    const sessionId = extractSessionId(entry.name);
 
     // Try to read first user message for label extraction
     let firstUserMessage: string | undefined;

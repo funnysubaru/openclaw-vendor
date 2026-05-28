@@ -6,6 +6,8 @@ import type { OpenClawConfig } from "../config/config.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import {
   discoverAllSessions,
+  extractSessionId,
+  isSessionTranscriptFile,
   loadCostUsageSummary,
   loadSessionCostSummary,
   loadSessionLogs,
@@ -388,6 +390,165 @@ example
     expect(logs).toHaveLength(1);
     expect(logs?.[0]?.role).toBe("user");
     expect(logs?.[0]?.content).toBe("hello there");
+  });
+
+  // ── includeArchived tests ─────────────────────────────────────────────────
+
+  describe("isSessionTranscriptFile", () => {
+    it("accepts plain .jsonl in both modes", () => {
+      expect(isSessionTranscriptFile("a.jsonl", false)).toBe(true);
+      expect(isSessionTranscriptFile("a.jsonl", true)).toBe(true);
+    });
+
+    it("rejects .jsonl.reset.<ts> when includeArchived=false, accepts when true", () => {
+      const name = "a.jsonl.reset.2026-05-28T07-34-44.508Z";
+      expect(isSessionTranscriptFile(name, false)).toBe(false);
+      expect(isSessionTranscriptFile(name, true)).toBe(true);
+    });
+
+    it("rejects .jsonl.deleted.<ts> when includeArchived=false, accepts when true", () => {
+      const name = "a.jsonl.deleted.2026-05-28T07-34-44.508Z";
+      expect(isSessionTranscriptFile(name, false)).toBe(false);
+      expect(isSessionTranscriptFile(name, true)).toBe(true);
+    });
+
+    it("rejects non-transcript files in both modes", () => {
+      expect(isSessionTranscriptFile("sessions.json", false)).toBe(false);
+      expect(isSessionTranscriptFile("sessions.json", true)).toBe(false);
+      expect(isSessionTranscriptFile("foo.txt", false)).toBe(false);
+      expect(isSessionTranscriptFile("foo.txt", true)).toBe(false);
+    });
+  });
+
+  describe("extractSessionId", () => {
+    it("extracts id from plain .jsonl", () => {
+      expect(extractSessionId("a.jsonl")).toBe("a");
+    });
+
+    it("extracts id from .jsonl.reset.<ts>", () => {
+      expect(extractSessionId("a.jsonl.reset.2026-05-28T07-34-44.508Z")).toBe("a");
+    });
+
+    it("extracts id from .jsonl.deleted.<ts>", () => {
+      expect(extractSessionId("a.jsonl.deleted.2026-05-28T07-34-44.508Z")).toBe("a");
+    });
+  });
+
+  it("discoverAllSessions default excludes archived, includeArchived includes all", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-discover-archived-"));
+    const sessionsDir = path.join(root, "agents", "main", "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+
+    // 세 종류의 파일 생성: 일반 / reset / deleted
+    await fs.writeFile(path.join(sessionsDir, "sess-live.jsonl"), "", "utf-8");
+    await fs.writeFile(
+      path.join(sessionsDir, "sess-reset.jsonl.reset.2026-05-28T07-34-44.508Z"),
+      "",
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(sessionsDir, "sess-deleted.jsonl.deleted.2026-05-28T07-34-44.508Z"),
+      "",
+      "utf-8",
+    );
+
+    await withStateDir(root, async () => {
+      // includeArchived 미설정(기본값) → 일반 .jsonl 파일만 반환
+      const defaultSessions = await discoverAllSessions();
+      expect(defaultSessions.length).toBe(1);
+      expect(defaultSessions[0]?.sessionId).toBe("sess-live");
+
+      // includeArchived: true → 세 파일 모두 반환
+      const allSessions = await discoverAllSessions({ includeArchived: true });
+      expect(allSessions.length).toBe(3);
+      const ids = allSessions.map((s) => s.sessionId).sort();
+      expect(ids).toEqual(["sess-deleted", "sess-live", "sess-reset"]);
+    });
+  });
+
+  it("loadCostUsageSummary default excludes archived, includeArchived includes both", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cost-archived-"));
+    const sessionsDir = path.join(root, "agents", "main", "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+
+    const now = new Date();
+    const liveEntry = JSON.stringify({
+      type: "message",
+      timestamp: now.toISOString(),
+      message: {
+        role: "assistant",
+        usage: { input: 10, output: 10, cost: { total: 0.05 } },
+      },
+    });
+    const archivedEntry = JSON.stringify({
+      type: "message",
+      timestamp: now.toISOString(),
+      message: {
+        role: "assistant",
+        usage: { input: 5, output: 5, cost: { total: 0.02 } },
+      },
+    });
+
+    await fs.writeFile(path.join(sessionsDir, "sess-live.jsonl"), liveEntry, "utf-8");
+    await fs.writeFile(
+      path.join(sessionsDir, `sess-reset.jsonl.reset.${now.toISOString().replace(/:/g, "-")}`),
+      archivedEntry,
+      "utf-8",
+    );
+
+    await withStateDir(root, async () => {
+      // 기본(includeArchived 미설정) → live 파일 비용만 집계
+      const defaultSummary = await loadCostUsageSummary({ startMs: now.getTime() - 1000, endMs: now.getTime() + 1000 });
+      expect(defaultSummary.totals.totalCost).toBeCloseTo(0.05, 5);
+
+      // includeArchived: true → live + archived 합산
+      const allSummary = await loadCostUsageSummary({
+        startMs: now.getTime() - 1000,
+        endMs: now.getTime() + 1000,
+        includeArchived: true,
+      });
+      expect(allSummary.totals.totalCost).toBeCloseTo(0.07, 5);
+    });
+  });
+
+  it("cross-day window filtering still works for archived files (regression)", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cost-archived-crossday-"));
+    const sessionsDir = path.join(root, "agents", "main", "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+
+    // 이틀에 걸친 archived 파일: day1 메시지(비용 0.10) + day2 메시지(비용 0.20)
+    const day1 = new Date("2026-05-27T12:00:00.000Z");
+    const day2 = new Date("2026-05-28T12:00:00.000Z");
+
+    const entries = [
+      JSON.stringify({
+        type: "message",
+        timestamp: day1.toISOString(),
+        message: { role: "assistant", usage: { input: 10, output: 10, cost: { total: 0.1 } } },
+      }),
+      JSON.stringify({
+        type: "message",
+        timestamp: day2.toISOString(),
+        message: { role: "assistant", usage: { input: 20, output: 20, cost: { total: 0.2 } } },
+      }),
+    ].join("\n");
+
+    await fs.writeFile(
+      path.join(sessionsDir, "sess-twoday.jsonl.reset.2026-05-28T13-00-00.000Z"),
+      entries,
+      "utf-8",
+    );
+
+    await withStateDir(root, async () => {
+      // day2 시간 범위만 조회 → day2의 비용(0.20)만 집계되어야 함
+      const summary = await loadCostUsageSummary({
+        startMs: day2.getTime() - 1000,
+        endMs: day2.getTime() + 1000,
+        includeArchived: true,
+      });
+      expect(summary.totals.totalCost).toBeCloseTo(0.2, 5);
+      expect(summary.daily.length).toBe(1);
+    });
   });
 
   it("preserves totals and cumulative values when downsampling timeseries", async () => {

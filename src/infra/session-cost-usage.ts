@@ -250,8 +250,8 @@ export function isSessionTranscriptFile(name: string, includeArchived: boolean):
  * 归档文件：a.jsonl.reset.2026-05-28T07-34-44.508Z → "a"
  *           a.jsonl.deleted.2026-05-28T07-34-44.508Z → "a"
  *
- * 实현 방법：.jsonl が見つかる最初のインデックスでスライスする。
- * .jsonl がない場合はファイル名全体を返す（フォールバック）。
+ * 实现方式：定位文件名中第一个 ".jsonl" 的位置，截取它之前的部分。
+ * 文件名中没有 ".jsonl" 时返回整个文件名（兜底，不应出现）。
  */
 export function extractSessionId(name: string): string {
   const idx = name.indexOf(".jsonl");
@@ -341,9 +341,9 @@ export async function loadCostUsageSummary(params?: {
   config?: OpenClawConfig;
   agentId?: string;
   /**
-   * true にすると、reset / deleted で归档されたセッションファイルも集計対象に含める。
-   * Yuiclaw 用量面板が「resetした会話も含めて正確な費用を表示する」ために追加。
-   * デフォルト false で既存の動作（通常の .jsonl のみ）を維持する。
+   * 为 true 时，把被 reset / deleted 归档的会话文件也纳入统计。
+   * 用于 Yuiclaw 用量面板「连同已重置/删除的会话一起显示真实花费」。
+   * 默认 false，保持原有行为（仅普通 .jsonl），向后兼容。
    */
   includeArchived?: boolean;
 }): Promise<CostUsageSummary> {
@@ -444,9 +444,9 @@ export async function discoverAllSessions(params?: {
   startMs?: number;
   endMs?: number;
   /**
-   * true にすると、reset / deleted で帰档されたセッションファイルも探索対象に含める。
-   * Yuiclaw が帰档済み会話を用量面板に含める際に使用する。
-   * デフォルト false で既存の動作（通常の .jsonl のみ）を維持する。
+   * 为 true 时，把被 reset / deleted 归档的会话文件也纳入枚举。
+   * 用于 Yuiclaw 把已归档会话纳入用量面板统计。
+   * 默认 false，保持原有行为（仅普通 .jsonl），向后兼容。
    */
   includeArchived?: boolean;
 }): Promise<DiscoveredSession[]> {
@@ -472,7 +472,7 @@ export async function discoverAllSessions(params?: {
     }
     // Do not exclude by endMs: a session can have activity in range even if it continued later.
 
-    // ファイル名から sessionId を抽出（帰档ファイルにも対応）
+    // 从文件名提取 sessionId（兼容 .reset / .deleted 归档文件名）
     const sessionId = extractSessionId(entry.name);
 
     // Try to read first user message for label extraction

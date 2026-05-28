@@ -439,7 +439,7 @@ example
     const sessionsDir = path.join(root, "agents", "main", "sessions");
     await fs.mkdir(sessionsDir, { recursive: true });
 
-    // 세 종류의 파일 생성: 일반 / reset / deleted
+    // 创建三种文件：普通 .jsonl / reset 归档 / deleted 归档
     await fs.writeFile(path.join(sessionsDir, "sess-live.jsonl"), "", "utf-8");
     await fs.writeFile(
       path.join(sessionsDir, "sess-reset.jsonl.reset.2026-05-28T07-34-44.508Z"),
@@ -453,12 +453,12 @@ example
     );
 
     await withStateDir(root, async () => {
-      // includeArchived 미설정(기본값) → 일반 .jsonl 파일만 반환
+      // includeArchived 未设置（默认）→ 只返回普通 .jsonl 文件
       const defaultSessions = await discoverAllSessions();
       expect(defaultSessions.length).toBe(1);
       expect(defaultSessions[0]?.sessionId).toBe("sess-live");
 
-      // includeArchived: true → 세 파일 모두 반환
+      // includeArchived: true → 三个文件都返回
       const allSessions = await discoverAllSessions({ includeArchived: true });
       expect(allSessions.length).toBe(3);
       const ids = allSessions.map((s) => s.sessionId).sort();
@@ -497,11 +497,11 @@ example
     );
 
     await withStateDir(root, async () => {
-      // 기본(includeArchived 미설정) → live 파일 비용만 집계
+      // 默认（includeArchived 未设置）→ 只统计 live 文件的费用
       const defaultSummary = await loadCostUsageSummary({ startMs: now.getTime() - 1000, endMs: now.getTime() + 1000 });
       expect(defaultSummary.totals.totalCost).toBeCloseTo(0.05, 5);
 
-      // includeArchived: true → live + archived 합산
+      // includeArchived: true → live + 归档 合并统计
       const allSummary = await loadCostUsageSummary({
         startMs: now.getTime() - 1000,
         endMs: now.getTime() + 1000,
@@ -516,7 +516,7 @@ example
     const sessionsDir = path.join(root, "agents", "main", "sessions");
     await fs.mkdir(sessionsDir, { recursive: true });
 
-    // 이틀에 걸친 archived 파일: day1 메시지(비용 0.10) + day2 메시지(비용 0.20)
+    // 跨两天的归档文件：day1 消息（费用 0.10）+ day2 消息（费用 0.20）
     const day1 = new Date("2026-05-27T12:00:00.000Z");
     const day2 = new Date("2026-05-28T12:00:00.000Z");
 
@@ -540,7 +540,7 @@ example
     );
 
     await withStateDir(root, async () => {
-      // day2 시간 범위만 조회 → day2의 비용(0.20)만 집계되어야 함
+      // 只查询 day2 时间范围 → 应只统计到 day2 的费用（0.20）
       const summary = await loadCostUsageSummary({
         startMs: day2.getTime() - 1000,
         endMs: day2.getTime() + 1000,

@@ -31,13 +31,6 @@ export type ModelAliasIndex = {
   byKey: Map<string, string[]>;
 };
 
-const ANTHROPIC_MODEL_ALIASES: Record<string, string> = {
-  "opus-4.6": "claude-opus-4-6",
-  "opus-4.5": "claude-opus-4-5",
-  "sonnet-4.6": "claude-sonnet-4-6",
-  "sonnet-4.5": "claude-sonnet-4-5",
-};
-
 function normalizeAliasKey(value: string): string {
   return value.trim().toLowerCase();
 }
@@ -150,8 +143,18 @@ function normalizeAnthropicModelId(model: string): string {
   if (!trimmed) {
     return trimmed;
   }
+  // Alias map is function-local (not module-top-level) to avoid a TDZ
+  // ReferenceError that occurs when context.ts runs an eager warmup at import
+  // time: the warmup calls this function before the module-top-level const
+  // initializer has executed in the bundled output.
+  const aliases: Record<string, string> = {
+    "opus-4.6": "claude-opus-4-6",
+    "opus-4.5": "claude-opus-4-5",
+    "sonnet-4.6": "claude-sonnet-4-6",
+    "sonnet-4.5": "claude-sonnet-4-5",
+  };
   const lower = trimmed.toLowerCase();
-  return ANTHROPIC_MODEL_ALIASES[lower] ?? trimmed;
+  return aliases[lower] ?? trimmed;
 }
 
 function normalizeProviderModelId(provider: string, model: string): string {

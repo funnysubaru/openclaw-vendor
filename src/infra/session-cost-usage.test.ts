@@ -6,6 +6,8 @@ import type { OpenClawConfig } from "../config/config.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import {
   discoverAllSessions,
+  extractSessionId,
+  isSessionTranscriptFile,
   loadCostUsageSummary,
   loadSessionCostSummary,
   loadSessionLogs,
@@ -388,6 +390,230 @@ example
     expect(logs).toHaveLength(1);
     expect(logs?.[0]?.role).toBe("user");
     expect(logs?.[0]?.content).toBe("hello there");
+  });
+
+  // ── includeArchived tests ─────────────────────────────────────────────────
+
+  describe("isSessionTranscriptFile", () => {
+    it("accepts plain .jsonl in both modes", () => {
+      expect(isSessionTranscriptFile("a.jsonl", false)).toBe(true);
+      expect(isSessionTranscriptFile("a.jsonl", true)).toBe(true);
+    });
+
+    it("rejects .jsonl.reset.<ts> when includeArchived=false, accepts when true", () => {
+      const name = "a.jsonl.reset.2026-05-28T07-34-44.508Z";
+      expect(isSessionTranscriptFile(name, false)).toBe(false);
+      expect(isSessionTranscriptFile(name, true)).toBe(true);
+    });
+
+    it("rejects .jsonl.deleted.<ts> when includeArchived=false, accepts when true", () => {
+      const name = "a.jsonl.deleted.2026-05-28T07-34-44.508Z";
+      expect(isSessionTranscriptFile(name, false)).toBe(false);
+      expect(isSessionTranscriptFile(name, true)).toBe(true);
+    });
+
+    it("rejects non-transcript files in both modes", () => {
+      expect(isSessionTranscriptFile("sessions.json", false)).toBe(false);
+      expect(isSessionTranscriptFile("sessions.json", true)).toBe(false);
+      expect(isSessionTranscriptFile("foo.txt", false)).toBe(false);
+      expect(isSessionTranscriptFile("foo.txt", true)).toBe(false);
+    });
+
+    it("rejects archive names with invalid timestamp even when includeArchived=true", () => {
+      // 复用 artifacts.ts 的时间戳严格校验后：marker 后非合法 UTC 时间戳的不算归档转录，
+      // 避免把 a.jsonl.reset.foo 这种误纳入枚举（省掉无谓读盘）。
+      expect(isSessionTranscriptFile("a.jsonl.reset.foo", true)).toBe(false);
+      expect(isSessionTranscriptFile("a.jsonl.deleted.not-a-ts", true)).toBe(false);
+      // .bak 不在 ADR-0027 范围内（reset + deleted only），即使 includeArchived=true 也不纳入
+      expect(isSessionTranscriptFile("a.jsonl.bak.2026-05-28T07-34-44.508Z", true)).toBe(false);
+    });
+  });
+
+  describe("extractSessionId", () => {
+    it("extracts id from plain .jsonl", () => {
+      expect(extractSessionId("a.jsonl")).toBe("a");
+    });
+
+    it("extracts id from .jsonl.reset.<ts>", () => {
+      expect(extractSessionId("a.jsonl.reset.2026-05-28T07-34-44.508Z")).toBe("a");
+    });
+
+    it("extracts id from .jsonl.deleted.<ts>", () => {
+      expect(extractSessionId("a.jsonl.deleted.2026-05-28T07-34-44.508Z")).toBe("a");
+    });
+  });
+
+  it("discoverAllSessions default excludes archived, includeArchived includes all", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-discover-archived-"));
+    const sessionsDir = path.join(root, "agents", "main", "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+
+    // 创建三种文件：普通 .jsonl / reset 归档 / deleted 归档
+    await fs.writeFile(path.join(sessionsDir, "sess-live.jsonl"), "", "utf-8");
+    await fs.writeFile(
+      path.join(sessionsDir, "sess-reset.jsonl.reset.2026-05-28T07-34-44.508Z"),
+      "",
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(sessionsDir, "sess-deleted.jsonl.deleted.2026-05-28T07-34-44.508Z"),
+      "",
+      "utf-8",
+    );
+
+    await withStateDir(root, async () => {
+      // includeArchived 未设置（默认）→ 只返回普通 .jsonl 文件
+      const defaultSessions = await discoverAllSessions();
+      expect(defaultSessions.length).toBe(1);
+      expect(defaultSessions[0]?.sessionId).toBe("sess-live");
+
+      // includeArchived: true → 三个文件都返回
+      const allSessions = await discoverAllSessions({ includeArchived: true });
+      expect(allSessions.length).toBe(3);
+      const ids = allSessions.map((s) => s.sessionId).sort();
+      expect(ids).toEqual(["sess-deleted", "sess-live", "sess-reset"]);
+    });
+  });
+
+  it("discoverAllSessions mtime pre-filter still excludes archived files older than startMs", async () => {
+    // ADR-0027 / Plan 1.6b：POSIX rename 不刷新 mtime，归档文件 mtime ≈ 最后一条 message 时间。
+    // discoverAllSessions 的 `stats.mtimeMs < startMs` 预过滤对归档文件依然安全：
+    // mtime 早于 startMs 的归档（其全部 message 必早于 startMs）应被排除，即使 includeArchived=true。
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-discover-mtime-"));
+    const sessionsDir = path.join(root, "agents", "main", "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+
+    const oldFile = path.join(sessionsDir, "sess-old.jsonl.reset.2026-05-20T00-00-00.000Z");
+    await fs.writeFile(oldFile, "", "utf-8");
+    // 把归档文件 mtime 设到很早（10 天前）
+    const oldMs = Date.now() - 10 * 24 * 60 * 60 * 1000;
+    await fs.utimes(oldFile, new Date(oldMs), new Date(oldMs));
+
+    await withStateDir(root, async () => {
+      // startMs 设在归档 mtime 之后（1 天前）→ 即便 includeArchived，也应被预过滤排除
+      const startMs = Date.now() - 1 * 24 * 60 * 60 * 1000;
+      const sessions = await discoverAllSessions({ startMs, includeArchived: true });
+      expect(sessions.length).toBe(0);
+
+      // startMs 设在归档 mtime 之前（20 天前）→ 应被包含
+      const earlierStart = Date.now() - 20 * 24 * 60 * 60 * 1000;
+      const included = await discoverAllSessions({ startMs: earlierStart, includeArchived: true });
+      expect(included.map((s) => s.sessionId)).toEqual(["sess-old"]);
+    });
+  });
+
+  it("loadSessionCostSummary reads an archived .jsonl.reset.* path directly", async () => {
+    // Plan 1.6：Yuiclaw aggregator 走 discoverAllSessions → loadSessionCostSummary({ sessionFile })。
+    // loadSessionCostSummary 接显式路径、不校验扩展名，对归档路径应能正常解析出 modelUsage / cost。
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-archived-explicit-"));
+    const sessionsDir = path.join(root, "agents", "main", "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+
+    const now = new Date();
+    const entry = JSON.stringify({
+      type: "message",
+      timestamp: now.toISOString(),
+      message: {
+        role: "assistant",
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+        usage: { input: 5, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } },
+      },
+    });
+    const archivedFile = path.join(
+      sessionsDir,
+      "sess-reset.jsonl.reset.2026-05-28T07-34-44.508Z",
+    );
+    await fs.writeFile(archivedFile, entry, "utf-8");
+
+    const summary = await loadSessionCostSummary({ sessionFile: archivedFile });
+    expect(summary?.totalCost).toBeCloseTo(0.02, 5);
+    expect(summary?.modelUsage?.[0]?.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("loadCostUsageSummary default excludes archived, includeArchived includes both", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cost-archived-"));
+    const sessionsDir = path.join(root, "agents", "main", "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+
+    const now = new Date();
+    const liveEntry = JSON.stringify({
+      type: "message",
+      timestamp: now.toISOString(),
+      message: {
+        role: "assistant",
+        usage: { input: 10, output: 10, cost: { total: 0.05 } },
+      },
+    });
+    const archivedEntry = JSON.stringify({
+      type: "message",
+      timestamp: now.toISOString(),
+      message: {
+        role: "assistant",
+        usage: { input: 5, output: 5, cost: { total: 0.02 } },
+      },
+    });
+
+    await fs.writeFile(path.join(sessionsDir, "sess-live.jsonl"), liveEntry, "utf-8");
+    await fs.writeFile(
+      path.join(sessionsDir, `sess-reset.jsonl.reset.${now.toISOString().replace(/:/g, "-")}`),
+      archivedEntry,
+      "utf-8",
+    );
+
+    await withStateDir(root, async () => {
+      // 默认（includeArchived 未设置）→ 只统计 live 文件的费用
+      const defaultSummary = await loadCostUsageSummary({ startMs: now.getTime() - 1000, endMs: now.getTime() + 1000 });
+      expect(defaultSummary.totals.totalCost).toBeCloseTo(0.05, 5);
+
+      // includeArchived: true → live + 归档 合并统计
+      const allSummary = await loadCostUsageSummary({
+        startMs: now.getTime() - 1000,
+        endMs: now.getTime() + 1000,
+        includeArchived: true,
+      });
+      expect(allSummary.totals.totalCost).toBeCloseTo(0.07, 5);
+    });
+  });
+
+  it("cross-day window filtering still works for archived files (regression)", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cost-archived-crossday-"));
+    const sessionsDir = path.join(root, "agents", "main", "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+
+    // 跨两天的归档文件：day1 消息（费用 0.10）+ day2 消息（费用 0.20）
+    const day1 = new Date("2026-05-27T12:00:00.000Z");
+    const day2 = new Date("2026-05-28T12:00:00.000Z");
+
+    const entries = [
+      JSON.stringify({
+        type: "message",
+        timestamp: day1.toISOString(),
+        message: { role: "assistant", usage: { input: 10, output: 10, cost: { total: 0.1 } } },
+      }),
+      JSON.stringify({
+        type: "message",
+        timestamp: day2.toISOString(),
+        message: { role: "assistant", usage: { input: 20, output: 20, cost: { total: 0.2 } } },
+      }),
+    ].join("\n");
+
+    await fs.writeFile(
+      path.join(sessionsDir, "sess-twoday.jsonl.reset.2026-05-28T13-00-00.000Z"),
+      entries,
+      "utf-8",
+    );
+
+    await withStateDir(root, async () => {
+      // 只查询 day2 时间范围 → 应只统计到 day2 的费用（0.20）
+      const summary = await loadCostUsageSummary({
+        startMs: day2.getTime() - 1000,
+        endMs: day2.getTime() + 1000,
+        includeArchived: true,
+      });
+      expect(summary.totals.totalCost).toBeCloseTo(0.2, 5);
+      expect(summary.daily.length).toBe(1);
+    });
   });
 
   it("preserves totals and cumulative values when downsampling timeseries", async () => {

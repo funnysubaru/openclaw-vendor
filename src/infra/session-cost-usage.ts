@@ -6,6 +6,10 @@ import { normalizeUsage } from "../agents/usage.js";
 import { stripInboundMetadata } from "../auto-reply/reply/strip-inbound-meta.js";
 import type { OpenClawConfig } from "../config/config.js";
 import {
+  isPrimarySessionTranscriptFileName,
+  parseSessionArchiveTimestamp,
+} from "../config/sessions/artifacts.js";
+import {
   resolveSessionFilePath,
   resolveSessionTranscriptsDirForAgent,
 } from "../config/sessions/paths.js";
@@ -214,6 +218,55 @@ const applyCostTotal = (totals: CostUsageTotals, costTotal: number | undefined) 
   totals.totalCost += costTotal;
 };
 
+/**
+ * 判断给定文件名是否为会话转录文件（用于枚举会话目录时的过滤）。
+ *
+ * 背景：Yuiclaw 的「重置会话」「删除会话」不会真正删除 .jsonl，而是把它重命名为
+ *   <sessionId>.jsonl.reset.<UTC-timestamp>   ← reset
+ *   <sessionId>.jsonl.deleted.<UTC-timestamp> ← delete
+ * 数据仍在盘上，但普通的 .endsWith(".jsonl") 会漏掉它们，导致面板用量偏低
+ * （Anthropic 仍按实际 token 计费）。
+ *
+ * 复用 vendor canonical 归档命名规则（config/sessions/artifacts.ts），不再自建正则：
+ * - includeArchived=false（默认）→ isPrimarySessionTranscriptFileName(name)，即普通 .jsonl，
+ *   与改动前 .endsWith(".jsonl") 行为完全一致（向后兼容）。
+ * - includeArchived=true → 额外纳入 reset / deleted 归档。这里用 parseSessionArchiveTimestamp
+ *   做严格校验：只有 `.jsonl.reset.<合法UTC时间戳>` / `.jsonl.deleted.<…>` 才算，
+ *   像 `a.jsonl.reset.foo` 这种时间戳非法的不会被误纳入（省掉无谓 readdir/读盘）。
+ * - 故意不含 `.bak`（ADR-0027 范围 = reset + deleted；bak 可能是拷贝、有双算风险）。
+ */
+export function isSessionTranscriptFile(name: string, includeArchived: boolean): boolean {
+  if (isPrimarySessionTranscriptFileName(name)) {
+    return true;
+  }
+  if (
+    includeArchived &&
+    (parseSessionArchiveTimestamp(name, "reset") !== null ||
+      parseSessionArchiveTimestamp(name, "deleted") !== null)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 从文件名提取 sessionId。
+ *
+ * 普通文件：a.jsonl → "a"
+ * 归档文件：a.jsonl.reset.2026-05-28T07-34-44.508Z → "a"
+ *           a.jsonl.deleted.2026-05-28T07-34-44.508Z → "a"
+ *
+ * 实现方式：定位文件名中第一个 ".jsonl" 的位置，截取它之前的部分。
+ * 文件名中没有 ".jsonl" 时返回整个文件名（兜底，不应出现）。
+ */
+export function extractSessionId(name: string): string {
+  const idx = name.indexOf(".jsonl");
+  if (idx === -1) {
+    return name;
+  }
+  return name.slice(0, idx);
+}
+
 async function* readJsonlRecords(filePath: string): AsyncGenerator<Record<string, unknown>> {
   const fileStream = fs.createReadStream(filePath, { encoding: "utf-8" });
   const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
@@ -293,6 +346,12 @@ export async function loadCostUsageSummary(params?: {
   days?: number; // Deprecated, for backwards compatibility
   config?: OpenClawConfig;
   agentId?: string;
+  /**
+   * 为 true 时，把被 reset / deleted 归档的会话文件也纳入统计。
+   * 用于 Yuiclaw 用量面板「连同已重置/删除的会话一起显示真实花费」。
+   * 默认 false，保持原有行为（仅普通 .jsonl），向后兼容。
+   */
+  includeArchived?: boolean;
 }): Promise<CostUsageSummary> {
   const now = new Date();
   let sinceTime: number;
@@ -318,7 +377,11 @@ export async function loadCostUsageSummary(params?: {
   const files = (
     await Promise.all(
       entries
-        .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+        .filter(
+          (entry) =>
+            entry.isFile() &&
+            isSessionTranscriptFile(entry.name, params?.includeArchived ?? false),
+        )
         .map(async (entry) => {
           const filePath = path.join(sessionsDir, entry.name);
           const stats = await fs.promises.stat(filePath).catch(() => null);
@@ -386,6 +449,12 @@ export async function discoverAllSessions(params?: {
   agentId?: string;
   startMs?: number;
   endMs?: number;
+  /**
+   * 为 true 时，把被 reset / deleted 归档的会话文件也纳入枚举。
+   * 用于 Yuiclaw 把已归档会话纳入用量面板统计。
+   * 默认 false，保持原有行为（仅普通 .jsonl），向后兼容。
+   */
+  includeArchived?: boolean;
 }): Promise<DiscoveredSession[]> {
   const sessionsDir = resolveSessionTranscriptsDirForAgent(params?.agentId);
   const entries = await fs.promises.readdir(sessionsDir, { withFileTypes: true }).catch(() => []);
@@ -393,7 +462,7 @@ export async function discoverAllSessions(params?: {
   const discovered: DiscoveredSession[] = [];
 
   for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith(".jsonl")) {
+    if (!entry.isFile() || !isSessionTranscriptFile(entry.name, params?.includeArchived ?? false)) {
       continue;
     }
 
@@ -409,8 +478,8 @@ export async function discoverAllSessions(params?: {
     }
     // Do not exclude by endMs: a session can have activity in range even if it continued later.
 
-    // Extract session ID from filename (remove .jsonl)
-    const sessionId = entry.name.slice(0, -6);
+    // 从文件名提取 sessionId（兼容 .reset / .deleted 归档文件名）
+    const sessionId = extractSessionId(entry.name);
 
     // Try to read first user message for label extraction
     let firstUserMessage: string | undefined;

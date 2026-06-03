@@ -4,6 +4,7 @@ import { formatThinkingLevels, normalizeThinkLevel } from "../auto-reply/thinkin
 import { DEFAULT_SUBAGENT_MAX_SPAWN_DEPTH } from "../config/agent-limits.js";
 import { loadConfig } from "../config/config.js";
 import { callGateway } from "../gateway/call.js";
+import { isSessionAborted } from "./session-abort-guard.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import {
   isValidAgentId,
@@ -301,6 +302,22 @@ export async function spawnSubagentDirect(
   });
   const hookRunner = getGlobalHookRunner();
   const cfg = loadConfig();
+
+  // 拦截②（防御）：发起 spawn 的 controller（父）会话处于 abort 态 → 不建子，返回 no-op 成功壳。
+  // 拦截①已在 announce 层切断 orchestrator 唤醒路径；此处兜住「orchestrator 仍在跑并尝试 spawn」
+  // 的残留路径，避免自我再生循环继续扩散。
+  //
+  // no-op 壳形态说明：
+  //   - status:"accepted" → 不报 error，orchestrator 不会进入错误处理或重试逻辑
+  //   - 不带 childSessionKey → orchestrator 没有 expected 子可追踪，不会傻等永不完成的子
+  //     （SUBAGENT_SPAWN_ACCEPTED_NOTE 的等待语义是按 childSessionKey 追踪的）
+  //   - note 含 "abort" → 可观察性，日志/调试可识别这是 abort 路径静默跳过
+  if (ctx.agentSessionKey && isSessionAborted(cfg, ctx.agentSessionKey)) {
+    return {
+      status: "accepted",
+      note: "controller session is aborting; spawn skipped (no child started, do not wait for its completion)",
+    };
+  }
 
   // When agent omits runTimeoutSeconds, use the config default.
   // Falls back to 0 (no timeout) if config key is also unset,

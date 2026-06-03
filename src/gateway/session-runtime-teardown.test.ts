@@ -12,12 +12,24 @@ const {
   resolveGatewaySessionStoreTarget,
   loadSessionStore,
   listSubagentRunsForController,
+  logInfo,
+  createSubsystemLogger,
 } = vi.hoisted(() => {
   const CTRL = "agent:main:user:u1:panel";
   const CHILD = "agent:main:user:u1:panel:subagent:stock-analyst";
   const GRANDCHILD = "agent:main:user:u1:panel:subagent:stock-analyst:subagent:news";
 
+  const logInfo = vi.fn();
   return {
+    logInfo,
+    createSubsystemLogger: vi.fn(() => ({
+      info: logInfo,
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+      trace: vi.fn(),
+      fatal: vi.fn(),
+    })),
     stopSubagentsForRequester: vi.fn(() => ({ stopped: 2 })),
     abortEmbeddedPiRun: vi.fn(() => true),
     waitForEmbeddedPiRunEnd: vi.fn(async () => true),
@@ -51,6 +63,7 @@ vi.mock("../browser/session-tab-registry.js", () => ({ closeTrackedBrowserTabsFo
 vi.mock("../config/config.js", () => ({ loadConfig }));
 vi.mock("./session-utils.js", () => ({ resolveGatewaySessionStoreTarget }));
 vi.mock("../config/sessions.js", () => ({ loadSessionStore }));
+vi.mock("../logging/subsystem.js", () => ({ createSubsystemLogger }));
 
 import { tearDownSessionRuntimeForAbort } from "./session-runtime-teardown.js";
 
@@ -92,6 +105,12 @@ describe("tearDownSessionRuntimeForAbort", () => {
         sessionKeys: expect.arrayContaining([CTRL, "sess-123", CHILD, GRANDCHILD]),
       }),
     );
+    // Observability: a single info-level summary line with the cascade counts.
+    expect(logInfo).toHaveBeenCalledTimes(1);
+    expect(logInfo).toHaveBeenCalledWith(
+      expect.stringContaining("stoppedSubagents=2"),
+    );
+    expect(logInfo).toHaveBeenCalledWith(expect.stringContaining("activeDescendants=2"));
   });
 
   it("P2-a: still closes tabs even if an earlier primitive throws", async () => {

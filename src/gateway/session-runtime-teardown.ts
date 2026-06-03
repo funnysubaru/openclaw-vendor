@@ -17,7 +17,14 @@ import { closeTrackedBrowserTabsForSessions } from "../browser/session-tab-regis
 import { loadConfig } from "../config/config.js";
 import { loadSessionStore } from "../config/sessions.js";
 import { logVerbose } from "../globals.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import { resolveGatewaySessionStoreTarget } from "./session-utils.js";
+
+// Always-on (info-level) logger so a Stop-triggered cascade is observable in
+// production logs. logVerbose alone is silent unless verbose mode is enabled, which
+// makes it impossible to confirm in the field whether chat.abort actually tore down
+// the subagent subtree.
+const log = createSubsystemLogger("gateway");
 
 /**
  * Recursively collect descendant subagent session keys under `controllerKey`,
@@ -132,9 +139,11 @@ export async function tearDownSessionRuntimeForAbort(params: {
   const tabKeys = [target.canonicalKey, ...target.storeKeys, sessionId, ...descendantKeys];
 
   // 1. Stop all spawned subagents (recursive, engine-native kill).
-  await safeStep("stopSubagents", sessionKey, () =>
-    stopSubagentsForRequester({ cfg, requesterSessionKey: target.canonicalKey }),
-  );
+  let stoppedSubagents = 0;
+  await safeStep("stopSubagents", sessionKey, () => {
+    const result = stopSubagentsForRequester({ cfg, requesterSessionKey: target.canonicalKey });
+    stoppedSubagents = result?.stopped ?? 0;
+  });
 
   // 2. Abort the controller's own embedded Pi run (if one is active).
   if (sessionId) {
@@ -154,10 +163,19 @@ export async function tearDownSessionRuntimeForAbort(params: {
 
   // 5. Close all tracked browser tabs for the controller and active descendants.
   // This must always run regardless of what happened above (P2-a requirement).
-  await safeStep("closeTabs", sessionKey, () =>
-    closeTrackedBrowserTabsForSessions({
-      sessionKeys: tabKeys,
-      onWarn: (message) => logVerbose(message),
-    }),
+  let tabsClosed = 0;
+  await safeStep("closeTabs", sessionKey, async () => {
+    tabsClosed =
+      (await closeTrackedBrowserTabsForSessions({
+        sessionKeys: tabKeys,
+        onWarn: (message) => logVerbose(message),
+      })) ?? 0;
+  });
+
+  // Observability: one always-on summary line so a Stop cascade is auditable in logs.
+  // Example: [chat.abort] cascade teardown sessionKey=... stoppedSubagents=2 activeDescendants=3 tabsClosed=2
+  log.info(
+    `[chat.abort] cascade teardown sessionKey=${sessionKey} ` +
+      `stoppedSubagents=${stoppedSubagents} activeDescendants=${descendantKeys.length} tabsClosed=${tabsClosed}`,
   );
 }

@@ -127,6 +127,8 @@ export async function tearDownSessionRuntimeForAbort(params: {
   // Build the full set of keys for tab close: controller + sessionId + all active descendants.
   // Undefined/empty sessionId is intentionally included; closeTrackedBrowserTabsForSessions
   // filters invalid keys internally.
+  // Note: unlike session-reset-service's ensureSessionRuntimeCleanup, we do NOT inject the
+  // raw incoming `sessionKey` separately — it is covered transitively via target.storeKeys.
   const tabKeys = [target.canonicalKey, ...target.storeKeys, sessionId, ...descendantKeys];
 
   // 1. Stop all spawned subagents (recursive, engine-native kill).
@@ -140,9 +142,9 @@ export async function tearDownSessionRuntimeForAbort(params: {
   }
 
   // 3. Clear any pending message queues for the controller and all related keys.
-  await safeStep("clearQueues", sessionKey, () =>
-    clearSessionQueues(tabKeys.filter(Boolean) as string[]),
-  );
+  // Pass raw tabKeys — clearSessionQueues accepts Array<string | undefined> and skips
+  // falsy keys internally, same as closeTrackedBrowserTabsForSessions below.
+  await safeStep("clearQueues", sessionKey, () => clearSessionQueues(tabKeys));
 
   // 4. Wait for the embedded run to fully stop before releasing browser resources.
   // Cap at 15 s to match session-reset-service's timeout constant.

@@ -155,4 +155,27 @@ describe("tearDownSessionRuntimeForAbort", () => {
     expect(arg.sessionKeys).not.toContain(ENDED);
     expect(arg.sessionKeys).toContain(GC);
   });
+
+  it("P1: closes an active sibling's tab but NOT an ended sibling's (per-run filter)", async () => {
+    // 同一 controller 的 run 列表里同时有「活跃 sibling」和「已结束 sibling」，
+    // 验证 per-run 的 !endedAt 过滤——活跃 sibling 的 tab 要关、已结束 sibling 的不关。
+    // 这跟 recurse-through-ended（已结束 parent → 活跃 grandchild）是两条不同的路径：
+    // 这里两个 run 是平级 sibling，纯靠 collectActive... 内部 `if (!run.endedAt)` 那一关来区分。
+    const ENDED = `${CTRL}:subagent:done`;
+    (listSubagentRunsForController as ReturnType<typeof vi.fn>).mockImplementation((key: string) =>
+      key === CTRL
+        ? [
+            { runId: "r-active", childSessionKey: CHILD, endedAt: undefined },
+            { runId: "r-done", childSessionKey: ENDED, endedAt: Date.now() },
+          ]
+        : [],
+    );
+    await tearDownSessionRuntimeForAbort({ sessionKey: CTRL });
+    const calls = closeTrackedBrowserTabsForSessions.mock.calls as unknown as Array<
+      [{ sessionKeys: string[] }]
+    >;
+    const arg = calls.at(-1)?.[0] ?? { sessionKeys: [] };
+    expect(arg.sessionKeys).toContain(CHILD);
+    expect(arg.sessionKeys).not.toContain(ENDED);
+  });
 });

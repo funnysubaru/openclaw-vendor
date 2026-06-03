@@ -34,6 +34,7 @@ import {
 import { type ChatImageContent, parseMessageWithAttachments } from "../chat-attachments.js";
 import { stripEnvelopeFromMessage, stripEnvelopeFromMessages } from "../chat-sanitize.js";
 import { ADMIN_SCOPE } from "../method-scopes.js";
+import { tearDownSessionRuntimeForAbort } from "../session-runtime-teardown.js";
 import {
   GATEWAY_CLIENT_CAPS,
   GATEWAY_CLIENT_MODES,
@@ -1017,6 +1018,15 @@ export const chatHandlers: GatewayRequestHandlers = {
         respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"));
         return;
       }
+      // Cascade: tear down the engine-native subagent subtree for this session.
+      // Session-wide blast radius (the engine has no run-scoped subagent kill). Gated on
+      // isAdmin as a forward-looking restriction point for any future non-admin client;
+      // the panel always connects with operator.admin, so this has no effect on current
+      // behavior and still covers the yield case (main chat run already ended →
+      // res.aborted === false). Fire-and-forget so the abort response is not blocked.
+      if (requester.isAdmin) {
+        void tearDownSessionRuntimeForAbort({ sessionKey: rawSessionKey });
+      }
       respond(true, { ok: true, aborted: res.aborted, runIds: res.runIds });
       return;
     }
@@ -1058,6 +1068,10 @@ export const chatHandlers: GatewayRequestHandlers = {
           },
         ],
       });
+    }
+    // Same admin-only gate as the no-runId branch (session-wide teardown).
+    if (requester.isAdmin) {
+      void tearDownSessionRuntimeForAbort({ sessionKey: rawSessionKey });
     }
     respond(true, {
       ok: true,

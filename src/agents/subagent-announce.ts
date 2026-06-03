@@ -2,6 +2,8 @@ import { resolveQueueSettings } from "../auto-reply/reply/queue.js";
 import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
 import { DEFAULT_SUBAGENT_MAX_SPAWN_DEPTH } from "../config/agent-limits.js";
 import { loadConfig } from "../config/config.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+import { isSessionAborted, noteDroppedAnnounce } from "./session-abort-guard.js";
 import {
   loadSessionStore,
   resolveAgentIdFromSessionKey,
@@ -48,6 +50,9 @@ import type { SpawnSubagentMode } from "./subagent-spawn.js";
 import { readLatestAssistantReply } from "./tools/agent-step.js";
 import { sanitizeTextContent, extractAssistantText } from "./tools/sessions-helpers.js";
 import { isAnnounceSkip } from "./tools/sessions-send-helpers.js";
+
+// 模块级 logger：用于 abort-guard 丢弃日志与后续调试
+const log = createSubsystemLogger("gateway");
 
 const FAST_TEST_MODE = process.env.OPENCLAW_TEST_FAST === "1";
 const FAST_TEST_RETRY_INTERVAL_MS = 8;
@@ -840,7 +845,7 @@ async function sendSubagentAnnounceDirectly(params: {
   }
 }
 
-async function deliverSubagentAnnouncement(params: {
+export async function deliverSubagentAnnouncement(params: {
   requesterSessionKey: string;
   announceId?: string;
   triggerMessage: string;
@@ -860,6 +865,19 @@ async function deliverSubagentAnnouncement(params: {
   directIdempotencyKey: string;
   signal?: AbortSignal;
 }): Promise<SubagentAnnounceDeliveryResult> {
+  // 拦截①(主刀)：目标 orchestrator 会话处于 abort 态 → 丢弃 announce，不唤醒、不 resume。
+  // 切断「子 agent announce → 唤醒 orchestrator → 再 spawn」的自我再生循环。
+  // 用 targetRequesterSessionKey（= 要送达的 orchestrator 会话 key）查闸；
+  // loadConfig() 在此模块顶部已有 import，不额外引入依赖。
+  const guardCfg = loadConfig();
+  if (isSessionAborted(guardCfg, params.targetRequesterSessionKey)) {
+    const dropped = noteDroppedAnnounce(guardCfg, params.targetRequesterSessionKey);
+    log.info(
+      `[abort-guard] dropped subagent announce target=${params.targetRequesterSessionKey} totalDropped=${dropped}`,
+    );
+    return { delivered: false, path: "none" };
+  }
+
   return await runSubagentAnnounceDispatch({
     expectsCompletionMessage: params.expectsCompletionMessage,
     signal: params.signal,

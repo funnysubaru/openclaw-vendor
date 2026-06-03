@@ -14,14 +14,19 @@ const {
   listSubagentRunsForController,
   logInfo,
   createSubsystemLogger,
+  // Task 5: session-abort-guard 打标函数 mock
+  markSessionAborted,
 } = vi.hoisted(() => {
   const CTRL = "agent:main:user:u1:panel";
   const CHILD = "agent:main:user:u1:panel:subagent:stock-analyst";
   const GRANDCHILD = "agent:main:user:u1:panel:subagent:stock-analyst:subagent:news";
 
   const logInfo = vi.fn();
+  // Task 5: markSessionAborted mock，用于验证 teardown 流程确实打了 abort 标
+  const markSessionAborted = vi.fn();
   return {
     logInfo,
+    markSessionAborted,
     createSubsystemLogger: vi.fn(() => ({
       info: logInfo,
       warn: vi.fn(),
@@ -64,6 +69,8 @@ vi.mock("../config/config.js", () => ({ loadConfig }));
 vi.mock("./session-utils.js", () => ({ resolveGatewaySessionStoreTarget }));
 vi.mock("../config/sessions.js", () => ({ loadSessionStore }));
 vi.mock("../logging/subsystem.js", () => ({ createSubsystemLogger }));
+// Task 5: mock session-abort-guard 以验证 teardown 调用了 markSessionAborted
+vi.mock("../agents/session-abort-guard.js", () => ({ markSessionAborted }));
 
 import { tearDownSessionRuntimeForAbort } from "./session-runtime-teardown.js";
 
@@ -111,6 +118,9 @@ describe("tearDownSessionRuntimeForAbort", () => {
       expect.stringContaining("stoppedSubagents=2"),
     );
     expect(logInfo).toHaveBeenCalledWith(expect.stringContaining("activeDescendants=2"));
+    // Task 5: 验证 teardown 向 abort-guard 打了标，以便 announce/spawn 闸生效。
+    // key 用 target.canonicalKey（CTRL），cfg 是任意对象（loadConfig() 返回值）。
+    expect(markSessionAborted).toHaveBeenCalledWith(expect.anything(), CTRL);
   });
 
   it("P2-a: still closes tabs even if an earlier primitive throws", async () => {

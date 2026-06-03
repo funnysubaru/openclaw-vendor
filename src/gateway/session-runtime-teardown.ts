@@ -10,6 +10,7 @@
 // this teardown they keep running after the user hits Stop.
 
 import { abortEmbeddedPiRun, waitForEmbeddedPiRunEnd } from "../agents/pi-embedded.js";
+import { markSessionAborted } from "../agents/session-abort-guard.js";
 import { listSubagentRunsForController } from "../agents/subagent-registry.js";
 import { stopSubagentsForRequester } from "../auto-reply/reply/abort.js";
 import { clearSessionQueues } from "../auto-reply/reply/queue.js";
@@ -137,6 +138,11 @@ export async function tearDownSessionRuntimeForAbort(params: {
   // Note: unlike session-reset-service's ensureSessionRuntimeCleanup, we do NOT inject the
   // raw incoming `sessionKey` separately — it is covered transitively via target.storeKeys.
   const tabKeys = [target.canonicalKey, ...target.storeKeys, sessionId, ...descendantKeys];
+
+  // 打标：本会话进入 abort 态，阻断后续 announce 唤醒 / spawn（session-abort-guard）。
+  // 在第一个 teardown 动作（stop subagents）之前打标，保证闸在 abort 流程开始时即生效，
+  // 不给 announce 趁虚而入的窗口。key 用 target.canonicalKey（已归一），cfg 同一份 loadConfig。
+  markSessionAborted(cfg, target.canonicalKey);
 
   // 1. Stop all spawned subagents (recursive, engine-native kill).
   let stoppedSubagents = 0;

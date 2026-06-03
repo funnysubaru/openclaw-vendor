@@ -3,6 +3,7 @@ import { getAcpSessionManager } from "../acp/control-plane/manager.js";
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { clearBootstrapSnapshot } from "../agents/bootstrap-cache.js";
 import { abortEmbeddedPiRun, waitForEmbeddedPiRunEnd } from "../agents/pi-embedded.js";
+import { markSessionAborted } from "../agents/session-abort-guard.js";
 import { stopSubagentsForRequester } from "../auto-reply/reply/abort.js";
 import { clearSessionQueues } from "../auto-reply/reply/queue.js";
 import { closeTrackedBrowserTabsForSessions } from "../browser/session-tab-registry.js";
@@ -149,6 +150,10 @@ async function ensureSessionRuntimeCleanup(params: {
     queueKeys.add(params.sessionId);
   }
   clearSessionQueues([...queueKeys]);
+  // 打标：session-reset 清理运行时时，将该会话标为 abort 态，阻断后续 announce 唤醒 / spawn。
+  // reset 等同于中止当前运行态：子 agent 会被 stopSubagentsForRequester 杀掉，不应再被唤醒。
+  // key 用 target.canonicalKey（已归一），与 announce/spawn 查闸 key 对齐。
+  markSessionAborted(params.cfg, params.target.canonicalKey);
   stopSubagentsForRequester({ cfg: params.cfg, requesterSessionKey: params.target.canonicalKey });
   if (!params.sessionId) {
     clearBootstrapSnapshot(params.target.canonicalKey);

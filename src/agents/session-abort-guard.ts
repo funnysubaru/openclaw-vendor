@@ -47,7 +47,7 @@ const ABORTED = guardState.aborted;
  * 打标：该 controller 会话进入 abort 态。
  * 二次打标时刷新 abortedAt、但保留已有 droppedCount（避免计数丢失）。
  */
-export function markSessionAborted(cfg: OpenClawConfig, sessionKey: string): void {
+export function markSessionAborted(cfg: OpenClawConfig, sessionKey: string | undefined): void {
   const key = normalizeControllerSessionKey(cfg, sessionKey);
   // normalizeControllerSessionKey 对空/blank 返回 undefined，直接 no-op
   if (!key) return;
@@ -62,7 +62,7 @@ export function markSessionAborted(cfg: OpenClawConfig, sessionKey: string): voi
  * 查标：该 controller 会话是否处于 abort 态。
  * 供 announce/spawn 拦截点在决定是否放行前调用。
  */
-export function isSessionAborted(cfg: OpenClawConfig, sessionKey: string): boolean {
+export function isSessionAborted(cfg: OpenClawConfig, sessionKey: string | undefined): boolean {
   const key = normalizeControllerSessionKey(cfg, sessionKey);
   if (!key) return false;
   return ABORTED.has(key);
@@ -73,7 +73,7 @@ export function isSessionAborted(cfg: OpenClawConfig, sessionKey: string): boole
  * 仅在会话已打标时计数；未打标时返回 0（调用方无需提前 isSessionAborted）。
  * 返回值为当前累计丢弃数，供调用方写日志。
  */
-export function noteDroppedAnnounce(cfg: OpenClawConfig, sessionKey: string): number {
+export function noteDroppedAnnounce(cfg: OpenClawConfig, sessionKey: string | undefined): number {
   const key = normalizeControllerSessionKey(cfg, sessionKey);
   if (!key) return 0;
   const entry = ABORTED.get(key);
@@ -86,7 +86,7 @@ export function noteDroppedAnnounce(cfg: OpenClawConfig, sessionKey: string): nu
  * 清标：用户产生真实新消息时调用，解除 abort 闸。
  * 若中止期间有 announce 被丢弃，记一条汇总 info 日志方便事后审计。
  */
-export function clearSessionAbort(cfg: OpenClawConfig, sessionKey: string): void {
+export function clearSessionAbort(cfg: OpenClawConfig, sessionKey: string | undefined): void {
   const key = normalizeControllerSessionKey(cfg, sessionKey);
   if (!key) return;
   const entry = ABORTED.get(key);

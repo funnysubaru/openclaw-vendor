@@ -23,12 +23,34 @@ import {
   shouldSkipMessageByAbortCutoff,
 } from "./abort-cutoff.js";
 import { getAbortMemory, isAbortRequestText } from "./abort.js";
+import { clearSessionAbort } from "../../agents/session-abort-guard.js";
+import type { InputProvenance } from "../../sessions/input-provenance.js";
 import { buildStatusReply, handleCommands } from "./commands.js";
 import type { InlineDirectives } from "./directive-handling.js";
 import { isDirectiveOnly } from "./directive-handling.js";
 import type { createModelSelectionState } from "./model-selection.js";
 import { extractInlineSimpleCommand } from "./reply-inline.js";
 import type { TypingController } from "./typing.js";
+
+/**
+ * 判定此次入站消息是否应解除会话级 abort 闸。
+ *
+ * 业务逻辑：
+ *   - external_user：外部用户主动发消息 → 解除（用户想继续对话）
+ *   - undefined（裸入站）：没有 provenance 标注 = 来自外部渠道未被 inter_session/internal_system
+ *     打标 → 同视 external_user，解除
+ *   - inter_session：子 agent announce 注入 → 不解除，否则 controller 被自我再生循环重激活
+ *   - internal_system：系统内部注入 → 不解除，非用户主动行为
+ *
+ * 提取为纯函数便于单测（无副作用，只返回布尔）。
+ */
+export function shouldClearAbortGuardForInbound(
+  provenance: InputProvenance | undefined,
+): boolean {
+  const kind = provenance?.kind;
+  // inter_session 和 internal_system 明确拦住；其余（external_user + undefined）= 解除
+  return kind !== "inter_session" && kind !== "internal_system";
+}
 
 let builtinSlashCommands: Set<string> | null = null;
 
@@ -288,6 +310,13 @@ export async function handleInlineActions(params: {
         storePath,
       });
     }
+  }
+
+  // 真实用户消息 → 解除会话级 abort 闸，恢复 announce 唤醒 / spawn 能力。
+  // 放在 cutoff 处理之后、inlineCommand 之前，对所有真实用户入站生效（不依赖 sessionEntry）。
+  // isStopLikeInbound（abort 请求文本本身）也不解除，避免 /stop 指令本身意外清闸。
+  if (!isStopLikeInbound && shouldClearAbortGuardForInbound(ctx.InputProvenance)) {
+    clearSessionAbort(cfg, sessionKey);
   }
 
   const inlineCommand =

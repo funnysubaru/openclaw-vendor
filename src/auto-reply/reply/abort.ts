@@ -5,10 +5,7 @@ import {
   listSubagentRunsForController,
   markSubagentRunTerminated,
 } from "../../agents/subagent-registry.js";
-import {
-  resolveInternalSessionKey,
-  resolveMainSessionAlias,
-} from "../../agents/tools/sessions-helpers.js";
+import { normalizeControllerSessionKey } from "../../agents/tools/sessions-helpers.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import {
   loadSessionStore,
@@ -202,16 +199,15 @@ function resolveAbortTargetKey(ctx: MsgContext): string | undefined {
   return sessionKey || undefined;
 }
 
+/**
+ * 委托到 sessions-helpers.normalizeControllerSessionKey——单一来源保证归一正确性。
+ * 不在这里持有独立实现副本，防止后续「打标/查闸/清除」三处与本处发生 key 不一致的幽灵 bug。
+ */
 function normalizeRequesterSessionKey(
   cfg: OpenClawConfig,
   key: string | undefined,
 ): string | undefined {
-  const cleaned = key?.trim();
-  if (!cleaned) {
-    return undefined;
-  }
-  const { mainKey, alias } = resolveMainSessionAlias(cfg);
-  return resolveInternalSessionKey({ key: cleaned, alias, mainKey });
+  return normalizeControllerSessionKey(cfg, key);
 }
 
 export function stopSubagentsForRequester(params: {

@@ -27,6 +27,11 @@ export {
   shouldResolveSessionIdInput,
   shouldVerifyRequesterSpawnedSessionVisibility,
 } from "./sessions-resolution.js";
+import type { OpenClawConfig } from "../../config/config.js";
+import {
+  resolveInternalSessionKey,
+  resolveMainSessionAlias,
+} from "./sessions-resolution.js";
 import { extractTextFromChatContent } from "../../shared/chat-content.js";
 import { sanitizeUserFacingText } from "../pi-embedded-helpers.js";
 import {
@@ -171,4 +176,32 @@ export function extractAssistantText(message: unknown): string | undefined {
   const errorContext = stopReason === "error";
 
   return joined ? sanitizeUserFacingText(joined, { errorContext }) : undefined;
+}
+
+/**
+ * 会话级 abort 闸专用的 controller session key 归一化。
+ *
+ * 业务意图：这是整个 abort-cascade 特性的「头号正确性保证」——
+ * 打标（标记 controller 已 abort）、announce 查闸（子 agent 唤醒时判断）、
+ * spawn 查闸（spawn 新子 agent 时判断）、清除（abort 完成后清 flag）
+ * 四处必须使用同一个 canonical key，否则会出现「打了标但查不到、清了别的 key」的幽灵 bug。
+ *
+ * 实现与 abort.ts 历史上的 normalizeRequesterSessionKey 完全一致——
+ * 抽到这里做单一来源，abort.ts 改为委托调用，不再持有独立副本。
+ *
+ * 关键边界：
+ * - key 为空/纯空白 → undefined（后续调用方可安全做 early-return）
+ * - resolveInternalSessionKey 会把 alias/mainKey 归一成统一形式，
+ *   保证 "main" / "global" / 主 key 等多种写法都映射到同一个 canonical key
+ */
+export function normalizeControllerSessionKey(
+  cfg: OpenClawConfig,
+  key: string | undefined,
+): string | undefined {
+  const cleaned = key?.trim();
+  if (!cleaned) {
+    return undefined;
+  }
+  const { mainKey, alias } = resolveMainSessionAlias(cfg);
+  return resolveInternalSessionKey({ key: cleaned, alias, mainKey });
 }

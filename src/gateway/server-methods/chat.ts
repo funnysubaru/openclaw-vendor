@@ -3,12 +3,14 @@ import path from "node:path";
 import { CURRENT_SESSION_VERSION } from "@mariozechner/pi-coding-agent";
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { resolveThinkingDefault } from "../../agents/model-selection.js";
+import { markSessionAborted } from "../../agents/session-abort-guard.js";
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
 import { dispatchInboundMessage } from "../../auto-reply/dispatch.js";
 import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.js";
 import type { MsgContext } from "../../auto-reply/templating.js";
 import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../../auto-reply/tokens.js";
 import { createReplyPrefixOptions } from "../../channels/reply-prefix.js";
+import { loadConfig } from "../../config/config.js";
 import { resolveSessionFilePath } from "../../config/sessions.js";
 import { jsonUtf8Bytes } from "../../infra/json-utf8-bytes.js";
 import { normalizeInputProvenance, type InputProvenance } from "../../sessions/input-provenance.js";
@@ -1020,6 +1022,12 @@ export const chatHandlers: GatewayRequestHandlers = {
     // operator.admin, so this covers all panel Stop paths. Fire-and-forget so the abort
     // response is never blocked on teardown.
     if (requester.isAdmin) {
+      // review #1（belt-and-suspenders）：在这里「同步」打 abort 闸，不依赖 teardown。
+      // teardown 是 fire-and-forget，且其内部 markSessionAborted 在 resolveGatewaySessionStoreTarget
+      // 抛错早退时会被整个跳过 → 闸没打上、orchestrator 仍可能被 announce 唤醒再生。
+      // 这里用 rawSessionKey（markSessionAborted 内部走 normalizeControllerSessionKey 归一，
+      // 与 announce/spawn 查闸 key 对齐）在 handler 同步路径先把闸打上，teardown 只管 kill/cleanup。
+      markSessionAborted(loadConfig(), rawSessionKey);
       void tearDownSessionRuntimeForAbort({ sessionKey: rawSessionKey });
     }
 

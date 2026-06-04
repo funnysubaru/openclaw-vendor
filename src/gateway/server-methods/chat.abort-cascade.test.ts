@@ -8,6 +8,26 @@ const { tearDownSessionRuntimeForAbort } = vi.hoisted(() => ({
 
 vi.mock("../session-runtime-teardown.js", () => ({ tearDownSessionRuntimeForAbort }));
 
+// review #1：chat.abort handler 内对 admin 路径「同步」打 abort 闸（belt-and-suspenders），
+// 与 fire-and-forget 的 teardown 解耦——即使 teardown 的 resolveGatewaySessionStoreTarget
+// 抛错早退、mark 被跳过，handler 这层也已经把闸打上。这里 spy markSessionAborted 验证该行为。
+const { markSessionAborted } = vi.hoisted(() => ({ markSessionAborted: vi.fn() }));
+vi.mock("../../agents/session-abort-guard.js", () => ({
+  markSessionAborted,
+  isSessionAborted: vi.fn(() => false),
+  noteDroppedAnnounce: vi.fn(() => 0),
+  clearSessionAbort: vi.fn(),
+  __testing: { reset: vi.fn() },
+}));
+// handler 新增 loadConfig() 以拿 cfg 传给 markSessionAborted；mock 成最小 config 避免真读盘/env。
+vi.mock("../../config/config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../config/config.js")>();
+  return {
+    ...actual,
+    loadConfig: () => ({ session: { mainKey: "main", scope: "per-sender" } }),
+  };
+});
+
 import { chatHandlers } from "./chat.js";
 
 // ---------------------------------------------------------------------------
@@ -171,5 +191,20 @@ describe("chat.abort cascades subagent teardown", () => {
       client: USER1,
     });
     expect(tearDownSessionRuntimeForAbort).not.toHaveBeenCalled();
+  });
+
+  // --- review #1：handler 同步打 abort 闸（belt-and-suspenders，独立于 teardown） ---
+
+  it("admin abort marks the session aborted synchronously (independent of teardown)", async () => {
+    // teardown 内的 markSessionAborted 在 resolveGatewaySessionStoreTarget 抛错时会被跳过；
+    // handler 这层同步打标兜底，保证即使 teardown 早退、闸也已生效。
+    await invokeChatAbort({ context: createContext(), request: { sessionKey: SK }, client: ADMIN });
+    expect(markSessionAborted).toHaveBeenCalledWith(expect.anything(), SK);
+  });
+
+  it("non-admin abort does NOT mark the session aborted", async () => {
+    // 与 teardown 同样的 isAdmin 闸：非 admin 不触发会话级打标。
+    await invokeChatAbort({ context: createContext(), request: { sessionKey: SK }, client: USER1 });
+    expect(markSessionAborted).not.toHaveBeenCalled();
   });
 });

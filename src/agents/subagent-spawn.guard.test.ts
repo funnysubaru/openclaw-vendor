@@ -98,10 +98,13 @@ describe("spawnSubagentDirect abort guard", () => {
     // 3. runId=undefined → 同上，无 run 追踪
     // 4. error=undefined → 明确成功壳，不触发错误处理路径
     // 5. note 含 "abort" → 可观察性：日志/调试可识别这是 abort 路径返回
+    // 6. suppressed=true（review #5）→ 机器可读的结构化标记，不再仅靠 note 文本约定区分；
+    //    供未来 orchestrator/wait 逻辑或可观察性显式判别「这是被 abort 闸抑制的 no-op 壳」
     expect(res.status).toBe("accepted");
     expect(res.childSessionKey).toBeUndefined();
     expect(res.runId).toBeUndefined();
     expect(res.error).toBeUndefined();
     expect(res.note).toMatch(/abort/i);
+    expect(res.suppressed).toBe(true);
   });
 });

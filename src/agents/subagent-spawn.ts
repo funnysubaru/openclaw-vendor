@@ -91,6 +91,12 @@ export type SpawnSubagentResult = {
   runId?: string;
   mode?: SpawnSubagentMode;
   note?: string;
+  /**
+   * review #5：被会话级 abort 闸抑制的 no-op 壳标记。true 表示「父会话 abort 态 → 没真建子」。
+   * 真正阻止 orchestrator 傻等的是「不带 childSessionKey」（代码级），本字段是机器可读的
+   * 显式信号（不再仅靠 note 文本约定），供 wait 逻辑 / 可观察性判别。
+   */
+  suppressed?: boolean;
   modelApplied?: boolean;
   error?: string;
   attachments?: {
@@ -310,11 +316,14 @@ export async function spawnSubagentDirect(
   // no-op 壳形态说明：
   //   - status:"accepted" → 不报 error，orchestrator 不会进入错误处理或重试逻辑
   //   - 不带 childSessionKey → orchestrator 没有 expected 子可追踪，不会傻等永不完成的子
-  //     （SUBAGENT_SPAWN_ACCEPTED_NOTE 的等待语义是按 childSessionKey 追踪的）
+  //     （SUBAGENT_SPAWN_ACCEPTED_NOTE 的等待语义是按 childSessionKey 追踪的）——这是真正的
+  //     代码级强制，不依赖 prompt 约定
+  //   - suppressed:true（review #5）→ 机器可读的结构化标记，显式表明这是 abort 抑制的 no-op 壳
   //   - note 含 "abort" → 可观察性，日志/调试可识别这是 abort 路径静默跳过
   if (ctx.agentSessionKey && isSessionAborted(cfg, ctx.agentSessionKey)) {
     return {
       status: "accepted",
+      suppressed: true,
       note: "controller session is aborting; spawn skipped (no child started, do not wait for its completion)",
     };
   }

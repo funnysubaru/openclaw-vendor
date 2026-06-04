@@ -160,6 +160,13 @@ export async function tearDownSessionRuntimeForAbort(params: {
   //
   // best-effort：包在 safeStep 里，store 写入失败（盘满/锁竞争）不能阻断后续 stop/closeTabs，
   // 与其它 teardown 步骤一致的隔离语义。
+  //
+  // ⚠️ 已知限制（review I1，书面接受）：本 teardown 被调用方 void（fire-and-forget，见
+  // chat.ts 的 cascadeSessionTeardownForAdmin），这步 persist 是异步的。理论上若用户在 persist
+  // 落盘前的极短窗口内（毫秒级）发「继续」，闸判据 #2 可能仍读到 false → 闸不触发（退化为旧 bug，
+  // 但概率远低于「永不写盘」）。实践中人手「Stop → 看结果 → 打字继续」是秒级，远大于一次文件写，
+  // 竞态几乎不可达。不在此处改同步持久化：会把 chat.ts 那条对 mismatch 很敏感的 cascade 闭包改成
+  // 异步 + 重复 target 解析，得不偿失。若未来真观测到该竞态，再在 chat.ts cascade 路径补同步写盘。
   await safeStep("persistAbortedFlag", sessionKey, () =>
     updateSessionStoreEntry({
       storePath: target.storePath,

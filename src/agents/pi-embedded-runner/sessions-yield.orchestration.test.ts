@@ -90,7 +90,7 @@ describe("sessions_yield orchestration", () => {
   // buildEmbeddedRunBaseParams → runEmbeddedPiAgent，把 abortedLastRunBeforeReset / inputProvenance
   // 放进 RunEmbeddedPiAgentParams。但 runEmbeddedPiAgent → runEmbeddedAttempt 这一跳此前漏抄
   // abortedLastRunBeforeReset → attempt.ts 处的闸判据 #2 读到 undefined（对所有 run）→ 闸永不触发。
-  // [GATE-DIAG] 实测正是「prov 形态有值（这一跳本来就透传 inputProvenance）、abortedFlag=undefined」。
+  // 历史 live 诊断 实测正是「prov 形态有值（这一跳本来就透传 inputProvenance）、abortedFlag=undefined」。
   // 本用例锁死「两者都透传到 attempt」，防回归。
   it("forwards abortedLastRunBeforeReset + inputProvenance from runEmbeddedPiAgent into runEmbeddedAttempt", async () => {
     mockedRunEmbeddedAttempt.mockResolvedValueOnce(makeAttemptResult({ promptError: null }));

@@ -923,7 +923,7 @@ export async function runEmbeddedPiAgent(
             // 这一跳（runEmbeddedPiAgent → runEmbeddedAttempt）漏抄了这个字段 → attempt.ts 读到的
             // params.abortedLastRunBeforeReset 恒为 undefined（对所有 run，不分面板/LINE）→ 闸判据 #2
             // 恒 false → 闸永不触发。inputProvenance 同样在这一跳透传（见上一行），所以 provenance
-            // 能到、abort flag 却到不了——这正是 [GATE-DIAG] 看到的 prov 有值形态、abortedFlag=undefined。
+            // 能到、abort flag 却到不了——这正是 历史 live 诊断 看到的 prov 有值形态、abortedFlag=undefined。
             //
             // 为什么不在 attempt.ts 直接读盘代替透传：chat.send/auto-reply 路径在到达 attempt.ts 之前，
             // get-reply-run.ts:325 已先调用 applySessionHints(body.ts) 把 store 里的 abortedLastRun 清回

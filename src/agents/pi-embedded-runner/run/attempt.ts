@@ -371,7 +371,7 @@ type YieldLeafEntryLike =
 // ⚠️ 必须同时认两种 custom_message（两轮 live 复验失败的根因之一）：onYield 落盘时会写两条
 // custom_message —— 先 steer 一条 sessions_yield_interrupt（拦掉本轮剩余 tool 调用），再
 // persistSessionsYieldContextMessage 写一条 sessions_yield 上下文。strip 会从 live transcript 剥掉
-// interrupt，但在持久化 jsonl 里 interrupt 可能后于 yield 落盘成为真正的 leaf（[GATE-DIAG] 实测
+// interrupt，但在持久化 jsonl 里 interrupt 可能后于 yield 落盘成为真正的 leaf（历史 live 诊断 实测
 // leaf=openclaw.sessions_yield_interrupt）。只认 sessions_yield 会漏掉这种 leaf → 闸永不触发。
 // 故两个 customType 都视为“停在 yield 挂起态”。
 function isSessionsYieldLeafEntry(leafEntry: YieldLeafEntryLike): boolean {
@@ -415,7 +415,8 @@ type OrchestratorYieldResetDecision = {
     | "applied"
     | "not-aborted" // 上一轮没有被用户主动 abort（正常 yield→announce→resume 走这里）
     | "not-yield-leaf" // 当前 leaf 不是 sessions_yield 挂起态
-    | "inter-session-resume"; // 本轮是子 agent announce 触发的 resume（inter_session），不是用户输入
+    | "inter-session-resume" // 本轮是子 agent announce 触发的 resume（inter_session），不是用户输入
+    | "internal-system-resume"; // 本轮是 internal_system（系统/cron）注入，不是用户主动 resume（I2）
 };
 
 /**
@@ -438,7 +439,7 @@ type OrchestratorYieldResetDecision = {
  *      只有 inter_session（子 agent announce 回灌，见 subagent-announce.ts）才排除；用户触发的 resume
  *      一律放行——含 external_user（LINE 等渠道用户消息）与 undefined（面板 chat.send，普通用户无
  *      provenance、systemInputProvenance 仅 ACP 桥可设）。早先「必须 == external_user」会把面板用户
- *      的 resume（prov=undefined）误判为非用户输入而漏触发（[GATE-DIAG] 实测面板 prov=undefined）。
+ *      的 resume（prov=undefined）误判为非用户输入而漏触发（历史 live 诊断 实测面板 prov=undefined）。
  *
  * 命中后只做两件事，**不删任何历史**（保留更早成功轮次 + 本轮任务意图 + spawn 记录）：
  *   - stripSessionsYieldArtifacts：从 live transcript + jsonl 剥掉 yield 挂起工件并重设 leaf，
@@ -470,12 +471,18 @@ export async function maybeResetOrchestratorYieldContextAfterUserAbort(params: {
   if (!params.abortedLastRunBeforeReset) {
     return { applied: false, reason: "not-aborted" };
   }
-  // 判据 #3：排除子 agent announce 触发的 resume（inter_session）；用户触发的 resume 一律放行。
-  // 放宽为「!= inter_session」而非「== external_user」：面板 chat.send 普通用户 provenance 为 undefined
-  // （systemInputProvenance 仅 ACP 桥可设），若坚持 == external_user 会把面板用户 resume 误判排除。
-  // 只有 inter_session（subagent-announce.ts 回灌）需要排除，避免 announce-resume 误触发闸。
+  // 判据 #3：只放行**用户主动触发**的 resume；排除非用户来源。与清闸 shouldClearAbortGuardForInbound
+  // （get-reply-inline-actions.ts:50 `kind !== inter_session && kind !== internal_system`）严格对齐——
+  // 闸生效条件应等于「清闸条件」，避免两者不对称（review I2）。
+  //   · inter_session：子 agent announce 回灌（subagent-announce.ts），announce-resume 不该触发闸。
+  //   · internal_system：系统/cron 注入，非用户主动 resume，不该触发闸。
+  // 放行的是 external_user 与 undefined（面板 chat.send 普通用户 systemInputProvenance 仅 ACP 桥可设、
+  // 普通用户为 undefined，若坚持 == external_user 会把面板用户 resume 误排除）。
   if (params.inputProvenanceKind === "inter_session") {
     return { applied: false, reason: "inter-session-resume" };
+  }
+  if (params.inputProvenanceKind === "internal_system") {
+    return { applied: false, reason: "internal-system-resume" };
   }
 
   // 闸要把会话彻底拉出挂起态，故 includeYieldContext: true（连 sessions_yield 上下文一起剥到尽）。

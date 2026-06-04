@@ -1310,8 +1310,27 @@ describe("maybeResetOrchestratorYieldContextAfterUserAbort", () => {
     expect(injectCalls).toHaveLength(1);
   });
 
+  it("输入是 internal_system（系统/cron 注入）→ 不命中：与 shouldClearAbortGuardForInbound 对齐（I2）", async () => {
+    // I2：清闸 shouldClearAbortGuardForInbound(get-reply-inline-actions.ts:50) 对 internal_system
+    // 不解除（非用户主动行为）；闸判据 #3 必须对齐——internal_system 不该触发 strip+inject。
+    const { stripArtifacts, injectCalls, activeSession } = makeFixture();
+
+    const decision = await maybeResetOrchestratorYieldContextAfterUserAbort({
+      leafEntry: yieldLeaf,
+      abortedLastRunBeforeReset: true,
+      inputProvenanceKind: "internal_system",
+      activeSession,
+      stripArtifacts,
+    });
+
+    expect(decision.applied).toBe(false);
+    expect(decision.reason).toBe("internal-system-resume");
+    expect(stripArtifacts).not.toHaveBeenCalled();
+    expect(injectCalls).toHaveLength(0);
+  });
+
   it("leaf 是 sessions_yield_interrupt（jsonl 实测的真实 leaf 形态）→ 命中", async () => {
-    // [GATE-DIAG] 实测：yield 落盘后 interrupt 后于 context 落盘成为真正的 leaf。
+    // 历史 live 诊断 实测：yield 落盘后 interrupt 后于 context 落盘成为真正的 leaf。
     // 判据 #1 必须同时认 interrupt，否则面板场景永不命中。
     const { stripArtifacts, injectCalls, activeSession } = makeFixture();
 

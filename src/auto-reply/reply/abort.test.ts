@@ -2,6 +2,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  __testing as abortGuardTesting,
+  isSessionAborted,
+} from "../../agents/session-abort-guard.js";
 import type { SubagentRunRecord } from "../../agents/subagent-registry.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import {
@@ -669,5 +673,24 @@ describe("abort detection", () => {
     expect(subagentRegistryMocks.markSubagentRunTerminated).toHaveBeenCalledWith(
       expect.objectContaining({ runId: "run-2", childSessionKey: depth2Key }),
     );
+  });
+
+  // review #4：锁定「fast abort 即使 aborted:false 也打 abort 闸」的防御性语义。
+  // 设计意图：用户明确发了 abort 触发词（/stop 等）→ 即便此刻没有可中止的活跃 run，
+  // 也要打闸抑制任何在途子 agent 的 announce 唤醒 / 再生，直到下一条真实用户消息清闸。
+  // 这是 regression-lock：若有人日后改成「aborted:false 时不打标」，本测试会拦住。
+  it("fast abort marks the session guard even when aborted:false (locks defensive semantics)", async () => {
+    abortGuardTesting.reset();
+    const sessionKey = "telegram:lonely-no-active-run";
+    const { cfg } = await createAbortConfig({}); // 空 store → 无活跃 run → aborted:false
+    const result = await runStopCommand({
+      cfg,
+      sessionKey,
+      from: "telegram:lonely-no-active-run",
+      to: "telegram:lonely-no-active-run",
+    });
+    expect(result.aborted).toBe(false);
+    // 关键：aborted:false 但闸已打上
+    expect(isSessionAborted(cfg, sessionKey)).toBe(true);
   });
 });

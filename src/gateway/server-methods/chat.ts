@@ -3,12 +3,14 @@ import path from "node:path";
 import { CURRENT_SESSION_VERSION } from "@mariozechner/pi-coding-agent";
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { resolveThinkingDefault } from "../../agents/model-selection.js";
+import { markSessionAborted } from "../../agents/session-abort-guard.js";
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
 import { dispatchInboundMessage } from "../../auto-reply/dispatch.js";
 import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.js";
 import type { MsgContext } from "../../auto-reply/templating.js";
 import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../../auto-reply/tokens.js";
 import { createReplyPrefixOptions } from "../../channels/reply-prefix.js";
+import { loadConfig } from "../../config/config.js";
 import { resolveSessionFilePath } from "../../config/sessions.js";
 import { jsonUtf8Bytes } from "../../infra/json-utf8-bytes.js";
 import { normalizeInputProvenance, type InputProvenance } from "../../sessions/input-provenance.js";
@@ -1006,22 +1008,26 @@ export const chatHandlers: GatewayRequestHandlers = {
     const requester = resolveChatAbortRequester(client);
 
     // Cascade: tear down the engine-native subagent subtree for this session.
-    // Fired EARLY — before the runId branching — on purpose. The explicit-runId branch
-    // below early-returns when chatAbortControllers has no entry for the runId (the
-    // "yield case": the panel sends a runId for a main chat run that already ended
-    // naturally, so its controller was already removed). If teardown lived in the branch
-    // tails, that early-return would skip it entirely and lingering subagents would keep
-    // running after Stop. Firing here covers every path (no-runId, runId-found,
-    // runId-not-found, even sessionKey mismatch) with one call.
     //
-    // Session-wide blast radius — the engine has no run-scoped subagent kill, so this
-    // tears down ALL subagents under rawSessionKey. Gated on isAdmin as a forward-looking
-    // restriction point for any future non-admin client; the panel always connects with
-    // operator.admin, so this covers all panel Stop paths. Fire-and-forget so the abort
-    // response is never blocked on teardown.
-    if (requester.isAdmin) {
+    // 会话级 teardown（杀所有子 agent / 关 tab / 清队列）+ 打 abort 闸是 admin-only 操作：
+    //   - markSessionAborted 同步打标（belt-and-suspenders，review #1）：teardown 是
+    //     fire-and-forget，且其内部 markSessionAborted 在 resolveGatewaySessionStoreTarget
+    //     抛错早退时会整个跳过 → 闸没打上、orchestrator 仍可能被 announce 唤醒再生。这里在
+    //     handler 同步路径先把闸打上，teardown 只管 kill/cleanup。
+    //   - rawSessionKey 经 markSessionAborted/normalizeControllerSessionKey 归一后与
+    //     announce/spawn 查闸 key 对齐。fire-and-forget 不阻塞 abort 响应。
+    //
+    // ⚠️ review 第2轮 P2：本级联**只在「请求合法」的路径触发**——绝不在 mismatch
+    //   （runId 属于另一个 session 的畸形请求）分支触发，否则会误伤指定 session 的子树
+    //   （请求最终被拒为 "runId does not match sessionKey"，但子 agent 已被杀）。
+    //   仍覆盖 yield case（runId 已不在 controllers = 主 run 自然结束、controller 已移除）。
+    const cascadeSessionTeardownForAdmin = () => {
+      if (!requester.isAdmin) {
+        return;
+      }
+      markSessionAborted(loadConfig(), rawSessionKey);
       void tearDownSessionRuntimeForAbort({ sessionKey: rawSessionKey });
-    }
+    };
 
     if (!runId) {
       const res = abortChatRunsForSessionKeyWithPartials({
@@ -1036,17 +1042,20 @@ export const chatHandlers: GatewayRequestHandlers = {
         respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"));
         return;
       }
-      // Teardown already fired above (early, admin-gated) — covers this no-runId path.
+      cascadeSessionTeardownForAdmin();
       respond(true, { ok: true, aborted: res.aborted, runIds: res.runIds });
       return;
     }
 
     const active = context.chatAbortControllers.get(runId);
     if (!active) {
+      // yield case：runId 对应的主 run 已自然结束、controller 已移除，但子 agent 可能仍在跑 → 仍级联。
+      cascadeSessionTeardownForAdmin();
       respond(true, { ok: true, aborted: false, runIds: [] });
       return;
     }
     if (active.sessionKey !== rawSessionKey) {
+      // mismatch：畸形请求（runId 属于另一个 session），零副作用直接拒（P2）。
       respond(
         false,
         undefined,
@@ -1079,7 +1088,8 @@ export const chatHandlers: GatewayRequestHandlers = {
         ],
       });
     }
-    // Teardown already fired above (early, admin-gated) — covers this runId-found path.
+    // 合法 matched 路径（runId 找到 + 归属本 session + 授权通过）→ 级联停子 + 打闸。
+    cascadeSessionTeardownForAdmin();
     respond(true, {
       ok: true,
       aborted: res.aborted,
@@ -1194,17 +1204,26 @@ export const chatHandlers: GatewayRequestHandlers = {
     }
 
     if (stopCommand) {
+      const requester = resolveChatAbortRequester(client);
       const res = abortChatRunsForSessionKeyWithPartials({
         context,
         ops: createChatAbortOps(context),
         sessionKey: rawSessionKey,
         abortOrigin: "stop-command",
         stopReason: "stop",
-        requester: resolveChatAbortRequester(client),
+        requester,
       });
       if (res.unauthorized) {
         respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"));
         return;
+      }
+      // review 第2轮 P1：用户在 WebChat/TUI 输入 /stop 走的是 chat.send（非 chat.abort）。
+      // 原本只断主 run，缺级联 teardown → 子 agent / 队列 / 浏览器 tab 残留、orchestrator 仍
+      // 可能被 announce 唤醒再生。与 chat.abort 同款 admin-gated：同步打闸（belt-and-suspenders）
+      // + fire-and-forget teardown。cfg 复用上面 loadSessionEntry 的返回，无需再 loadConfig()。
+      if (requester.isAdmin) {
+        markSessionAborted(cfg, rawSessionKey);
+        void tearDownSessionRuntimeForAbort({ sessionKey: rawSessionKey });
       }
       respond(true, { ok: true, aborted: res.aborted, runIds: res.runIds });
       return;

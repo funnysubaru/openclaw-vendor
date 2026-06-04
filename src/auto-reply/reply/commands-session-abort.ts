@@ -177,5 +177,17 @@ export const handleAbortTrigger: CommandHandler = async (params, allowTextComman
       targetSessionKey: abortTarget.key,
     }),
   });
+
+  // 打标 + 停子：文本触发的 abort 与 /stop（handleStopCommand）走同一套语义，必须对齐
+  // （review #2）。原本只 applyAbortTarget，缺这两步 → getReplyFromConfig 直连（heartbeat 等）
+  // 绕过 tryFastAbortFromMessage 时，残留子 agent 不停、orchestrator 仍可能被 announce 唤醒再生。
+  // key 用 abortTarget.key ?? params.sessionKey，与 markSessionAborted/normalizeControllerSessionKey
+  // 归一后的查闸 key 对齐。
+  markSessionAborted(params.cfg, abortTarget.key ?? params.sessionKey ?? "");
+  stopSubagentsForRequester({
+    cfg: params.cfg,
+    requesterSessionKey: abortTarget.key ?? params.sessionKey,
+  });
+
   return { shouldContinue: false, reply: { text: "⚙️ Agent was aborted." } };
 };

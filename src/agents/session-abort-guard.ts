@@ -12,11 +12,14 @@
 //   子 agent 是 in-process embedded run，gateway 重启即清空，无可唤醒的残留。
 //   因此不需要持久化；重启后 abort 态自然消失，announce 也不可能再来。
 //
-// 使用方：
-//   - abort 路径（pi-tools.abort.ts）：abort 成功后调 markSessionAborted
-//   - announce 拦截（待实现）：唤醒前调 isSessionAborted，若已打标调 noteDroppedAnnounce
-//   - spawn 拦截（待实现）：同上，拦截再生循环
-//   - 用户新消息（待实现）：真实输入时调 clearSessionAbort 解除闸
+// 使用方（均已落地）：
+//   - 打标 markSessionAborted：chat.abort handler（gateway/server-methods/chat.ts，同步 belt-and-suspenders）
+//     + teardown（gateway/session-runtime-teardown.ts）+ fast-abort（auto-reply/reply/abort.ts）
+//     + /stop & 文本触发（auto-reply/reply/commands-session-abort.ts）+ reset（gateway/session-reset-service.ts）
+//   - announce 拦截 isSessionAborted/noteDroppedAnnounce：deliverSubagentAnnouncement
+//     （agents/subagent-announce.ts）唤醒前查标，命中则丢弃 announce 并计数（loop-breaker）
+//   - spawn 拦截 isSessionAborted：spawnSubagentDirect（agents/subagent-spawn.ts）查标，命中返回 no-op 壳
+//   - 清闸 clearSessionAbort：用户真实新消息（auto-reply/reply/get-reply-inline-actions.ts）解除闸
 
 import type { OpenClawConfig } from "../config/config.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";

@@ -1273,7 +1273,7 @@ describe("maybeResetOrchestratorYieldContextAfterUserAbort", () => {
     expect(injectCalls).toHaveLength(0);
   });
 
-  it("输入是子 agent announce（inter_session）而非真实用户 → 不命中：正常 announce resume 不受影响", async () => {
+  it("输入是子 agent announce（inter_session）而非用户 → 不命中：正常 announce resume 不受影响", async () => {
     const { stripArtifacts, injectCalls, activeSession } = makeFixture();
 
     const decision = await maybeResetOrchestratorYieldContextAfterUserAbort({
@@ -1285,9 +1285,128 @@ describe("maybeResetOrchestratorYieldContextAfterUserAbort", () => {
     });
 
     expect(decision.applied).toBe(false);
-    expect(decision.reason).toBe("not-external-user");
+    expect(decision.reason).toBe("inter-session-resume");
     expect(stripArtifacts).not.toHaveBeenCalled();
     expect(injectCalls).toHaveLength(0);
+  });
+
+  it("面板 chat.send：provenance=undefined（普通用户无 provenance）→ 命中（判据 #3 放宽为 != inter_session）", async () => {
+    // 这是两轮 live 复验失败的核心场景之一：面板用户 resume 时 systemInputProvenance 仅 ACP 桥可设，
+    // 普通用户 ctx.InputProvenance 为 undefined。早先「必须 == external_user」会把这种 resume 误排除。
+    const { stripArtifacts, injectCalls, activeSession } = makeFixture();
+
+    const decision = await maybeResetOrchestratorYieldContextAfterUserAbort({
+      leafEntry: yieldLeaf,
+      abortedLastRunBeforeReset: true,
+      inputProvenanceKind: undefined, // 面板 chat.send 普通用户：无 provenance
+      activeSession,
+      stripArtifacts,
+    });
+
+    expect(decision.applied).toBe(true);
+    expect(decision.reason).toBe("applied");
+    expect(stripArtifacts).toHaveBeenCalledTimes(1);
+    expect(injectCalls).toHaveLength(1);
+  });
+
+  it("leaf 是 sessions_yield_interrupt（jsonl 实测的真实 leaf 形态）→ 命中", async () => {
+    // [GATE-DIAG] 实测：yield 落盘后 interrupt 后于 context 落盘成为真正的 leaf。
+    // 判据 #1 必须同时认 interrupt，否则面板场景永不命中。
+    const { stripArtifacts, injectCalls, activeSession } = makeFixture();
+
+    const decision = await maybeResetOrchestratorYieldContextAfterUserAbort({
+      leafEntry: {
+        type: "custom_message" as const,
+        customType: "openclaw.sessions_yield_interrupt",
+      },
+      abortedLastRunBeforeReset: true,
+      inputProvenanceKind: "external_user",
+      activeSession,
+      stripArtifacts,
+    });
+
+    expect(decision.applied).toBe(true);
+    expect(decision.reason).toBe("applied");
+    expect(stripArtifacts).toHaveBeenCalledTimes(1);
+    expect(injectCalls).toHaveLength(1);
+  });
+
+  it("命中时真实 strip：interrupt + yield 上下文两条都剥到尽，leaf 退回 yield 之前的真实历史", async () => {
+    // 不打 strip 桩，跑真实 stripSessionsYieldArtifacts，固化「context 也必须剥」这条根因修复。
+    // 落盘顺序复刻 onYield：...真实历史末端(assistant), yield 上下文(custom_message),
+    // interrupt(custom_message，真正的 leaf)。strip 后应只剩到“真实历史末端”。
+    const liveMessages = [
+      { role: "user", content: "做个调研" },
+      { role: "assistant", content: [{ type: "text", text: "我先 spawn 子 agent" }] },
+      {
+        role: "custom",
+        customType: "openclaw.sessions_yield",
+        content: "Turn yielded.",
+      },
+      {
+        role: "custom",
+        customType: "openclaw.sessions_yield_interrupt",
+        content: "[sessions_yield interrupt]",
+      },
+    ];
+    const fileEntries = [
+      { type: "session", id: "s0", parentId: null },
+      { type: "message", id: "m1", parentId: "s0", message: { role: "user" } },
+      { type: "message", id: "m2", parentId: "m1", message: { role: "assistant" } },
+      {
+        type: "custom_message",
+        id: "c-yield",
+        parentId: "m2",
+        customType: "openclaw.sessions_yield",
+      },
+      {
+        type: "custom_message",
+        id: "c-interrupt",
+        parentId: "c-yield",
+        customType: "openclaw.sessions_yield_interrupt",
+      },
+    ];
+    const byId = new Map(fileEntries.map((e) => [e.id, { id: e.id }]));
+    const replaceMessages = vi.fn();
+    const rewriteFile = vi.fn();
+    const sendCustomMessage = vi.fn(async () => {});
+    const activeSession = {
+      messages: liveMessages as never[],
+      agent: { replaceMessages },
+      sessionManager: { fileEntries, byId, leafId: "c-interrupt", _rewriteFile: rewriteFile },
+      sendCustomMessage,
+    };
+
+    const decision = await maybeResetOrchestratorYieldContextAfterUserAbort({
+      leafEntry: {
+        type: "custom_message" as const,
+        customType: "openclaw.sessions_yield_interrupt",
+      },
+      abortedLastRunBeforeReset: true,
+      inputProvenanceKind: "external_user",
+      activeSession,
+      // 不传 stripArtifacts → 跑真实 strip。
+    });
+
+    expect(decision.applied).toBe(true);
+
+    // live transcript：两条 yield custom_message 都被剥，只剩到 assistant。
+    expect(replaceMessages).toHaveBeenCalledTimes(1);
+    const strippedLive = replaceMessages.mock.calls[0][0] as Array<{ customType?: string }>;
+    expect(strippedLive).toHaveLength(2);
+    expect(strippedLive.some((m) => m.customType?.startsWith("openclaw.sessions_yield"))).toBe(
+      false,
+    );
+
+    // fileEntries：interrupt + yield 上下文都 pop 掉，leaf 退回 m2，文件被重写。
+    expect(fileEntries.map((e) => e.id)).toEqual(["s0", "m1", "m2"]);
+    expect(activeSession.sessionManager.leafId).toBe("m2");
+    expect(byId.has("c-yield")).toBe(false);
+    expect(byId.has("c-interrupt")).toBe(false);
+    expect(rewriteFile).toHaveBeenCalledTimes(1);
+
+    // 仍注入了修正说明。
+    expect(sendCustomMessage).toHaveBeenCalledTimes(1);
   });
 
   it("leaf 不是 sessions_yield 挂起态 → 不命中", async () => {

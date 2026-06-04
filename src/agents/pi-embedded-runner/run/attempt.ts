@@ -264,7 +264,14 @@ async function persistSessionsYieldContextMessage(
   );
 }
 
-// Remove the synthetic yield interrupt + aborted assistant entry from the live transcript.
+// Remove the synthetic yield artifacts (aborted assistant + yield-interrupt + yield-context)
+// from the live transcript so the session no longer sits in the "waiting on sub-agents" state.
+//
+// ⚠️ 必须把 sessions_yield 上下文那条也剥掉（两轮 live 复验失败的根因之一）：onYield 落盘的两条
+// custom_message 里，sessions_yield_interrupt 是拦截标记、sessions_yield 才是真正把会话钉在“等结果”
+// 挂起态的上下文条目。若只剥 interrupt、保留 yield 上下文，strip 后 leaf 仍是 sessions_yield，
+// 会话依旧停在挂起态、orchestrator 续轮仍会等已死子 agent → 闸等于白触发。故两类 yield custom_message
+// 一起剥到尽，把 leaf 退回到 yield 之前的真实历史末端。
 function stripSessionsYieldArtifacts(activeSession: {
   messages: AgentMessage[];
   agent: { replaceMessages: (messages: AgentMessage[]) => void };
@@ -282,7 +289,8 @@ function stripSessionsYieldArtifacts(activeSession: {
     if (
       last?.role === "custom" &&
       "customType" in last &&
-      last.customType === SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE
+      (last.customType === SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE ||
+        last.customType === SESSIONS_YIELD_CONTEXT_CUSTOM_TYPE)
     ) {
       strippedMessages.pop();
       continue;
@@ -323,9 +331,13 @@ function stripSessionsYieldArtifacts(activeSession: {
       last.type === "message" &&
       last.message?.role === "assistant" &&
       last.message?.stopReason === "aborted";
-    const isYieldInterruptMessage =
-      last.type === "custom_message" && last.customType === SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE;
-    if (!isYieldAbortAssistant && !isYieldInterruptMessage) {
+    // 同 live-transcript 循环：interrupt 与 yield 上下文两类 custom_message 都要剥，
+    // 否则保留下来的 yield 上下文会让 leaf 仍停在挂起态（见上方函数注释）。
+    const isYieldCustomMessage =
+      last.type === "custom_message" &&
+      (last.customType === SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE ||
+        last.customType === SESSIONS_YIELD_CONTEXT_CUSTOM_TYPE);
+    if (!isYieldAbortAssistant && !isYieldCustomMessage) {
       break;
     }
     fileEntries.pop();
@@ -348,12 +360,20 @@ type YieldLeafEntryLike =
     }
   | undefined;
 
-// 当前会话末端是否是 sessions_yield 上下文自定义消息（=会话停在“等子 agent 结果”挂起态）。
+// 当前会话末端是否停在 sessions_yield 挂起态（=会话停在“等子 agent 结果”挂起态）。
 // 这是“会话级 abort 闸”的触发判据 #1。
+//
+// ⚠️ 必须同时认两种 custom_message（两轮 live 复验失败的根因之一）：onYield 落盘时会写两条
+// custom_message —— 先 steer 一条 sessions_yield_interrupt（拦掉本轮剩余 tool 调用），再
+// persistSessionsYieldContextMessage 写一条 sessions_yield 上下文。strip 会从 live transcript 剥掉
+// interrupt，但在持久化 jsonl 里 interrupt 可能后于 yield 落盘成为真正的 leaf（[GATE-DIAG] 实测
+// leaf=openclaw.sessions_yield_interrupt）。只认 sessions_yield 会漏掉这种 leaf → 闸永不触发。
+// 故两个 customType 都视为“停在 yield 挂起态”。
 function isSessionsYieldLeafEntry(leafEntry: YieldLeafEntryLike): boolean {
   return (
     leafEntry?.type === "custom_message" &&
-    leafEntry?.customType === SESSIONS_YIELD_CONTEXT_CUSTOM_TYPE
+    (leafEntry?.customType === SESSIONS_YIELD_CONTEXT_CUSTOM_TYPE ||
+      leafEntry?.customType === SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE)
   );
 }
 
@@ -390,7 +410,7 @@ type OrchestratorYieldResetDecision = {
     | "applied"
     | "not-aborted" // 上一轮没有被用户主动 abort（正常 yield→announce→resume 走这里）
     | "not-yield-leaf" // 当前 leaf 不是 sessions_yield 挂起态
-    | "not-external-user"; // 本轮新输入不是真实用户消息（子 agent announce 走这里）
+    | "inter-session-resume"; // 本轮是子 agent announce 触发的 resume（inter_session），不是用户输入
 };
 
 /**
@@ -409,7 +429,11 @@ type OrchestratorYieldResetDecision = {
  *   2. 上一轮被用户主动 abort（abortedLastRunBeforeReset）。注意：持久化的 abortCutoff /
  *      abortedLastRun 在本函数执行之前、于 inbound 处理链更早阶段就已被清除（见交付说明），
  *      故此判据的数据来源是上层在“清除发生之前”捕获并透传进来的内存 flag，而非此处读盘。
- *   3. 本轮新输入是真实用户消息（external_user provenance），不是子 agent announce（inter_session）。
+ *   3. 本轮新输入不是子 agent announce 触发的 resume。判据放宽为「provenance != inter_session」：
+ *      只有 inter_session（子 agent announce 回灌，见 subagent-announce.ts）才排除；用户触发的 resume
+ *      一律放行——含 external_user（LINE 等渠道用户消息）与 undefined（面板 chat.send，普通用户无
+ *      provenance、systemInputProvenance 仅 ACP 桥可设）。早先「必须 == external_user」会把面板用户
+ *      的 resume（prov=undefined）误判为非用户输入而漏触发（[GATE-DIAG] 实测面板 prov=undefined）。
  *
  * 命中后只做两件事，**不删任何历史**（保留更早成功轮次 + 本轮任务意图 + spawn 记录）：
  *   - stripSessionsYieldArtifacts：从 live transcript + jsonl 剥掉 yield 挂起工件并重设 leaf，
@@ -441,9 +465,12 @@ export async function maybeResetOrchestratorYieldContextAfterUserAbort(params: {
   if (!params.abortedLastRunBeforeReset) {
     return { applied: false, reason: "not-aborted" };
   }
-  // 判据 #3：本轮输入必须是真实用户消息。子 agent announce（inter_session）走正常 resume，不受影响。
-  if (params.inputProvenanceKind !== "external_user") {
-    return { applied: false, reason: "not-external-user" };
+  // 判据 #3：排除子 agent announce 触发的 resume（inter_session）；用户触发的 resume 一律放行。
+  // 放宽为「!= inter_session」而非「== external_user」：面板 chat.send 普通用户 provenance 为 undefined
+  // （systemInputProvenance 仅 ACP 桥可设），若坚持 == external_user 会把面板用户 resume 误判排除。
+  // 只有 inter_session（subagent-announce.ts 回灌）需要排除，避免 announce-resume 误触发闸。
+  if (params.inputProvenanceKind === "inter_session") {
+    return { applied: false, reason: "inter-session-resume" };
   }
 
   const strip = params.stripArtifacts ?? stripSessionsYieldArtifacts;

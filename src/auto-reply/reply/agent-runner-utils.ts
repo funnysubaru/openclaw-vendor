@@ -184,6 +184,9 @@ export function buildEmbeddedRunBaseParams(params: {
     skillsSnapshot: params.run.skillsSnapshot,
     ownerNumbers: params.run.ownerNumbers,
     inputProvenance: params.run.inputProvenance,
+    // 透传「上一轮被用户主动 abort」给嵌入式运行器，用于会话级 abort 闸
+    // （orchestrator 停在 sessions_yield 挂起态时被 /stop，下一轮起手剥挂起态 + 注入修正）。
+    abortedLastRunBeforeReset: params.run.abortedLastRunBeforeReset,
     senderIsOwner: params.run.senderIsOwner,
     enforceFinalTag: resolveEnforceFinalTag(params.run, params.provider),
     provider: params.provider,

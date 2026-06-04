@@ -915,6 +915,22 @@ export async function runEmbeddedPiAgent(
             onAgentEvent: params.onAgentEvent,
             extraSystemPrompt: params.extraSystemPrompt,
             inputProvenance: params.inputProvenance,
+            // 透传「上一轮被用户主动 abort」给本次 attempt（会话级 abort 闸的判据 #2）。
+            //
+            // ⚠️ 承重修复（两轮 live 复验失败的真正根因）：abortedLastRunBeforeReset 的值由
+            // session.ts 在 inbound 链早期从 store 读出（body.ts 把持久标记清回 false 之前的内存快照），
+            // 经 buildEmbeddedRunBaseParams → runEmbeddedPiAgent 的 params 一路传到这里。但此前
+            // 这一跳（runEmbeddedPiAgent → runEmbeddedAttempt）漏抄了这个字段 → attempt.ts 读到的
+            // params.abortedLastRunBeforeReset 恒为 undefined（对所有 run，不分面板/LINE）→ 闸判据 #2
+            // 恒 false → 闸永不触发。inputProvenance 同样在这一跳透传（见上一行），所以 provenance
+            // 能到、abort flag 却到不了——这正是 历史 live 诊断 看到的 prov 有值形态、abortedFlag=undefined。
+            //
+            // 为什么不在 attempt.ts 直接读盘代替透传：chat.send/auto-reply 路径在到达 attempt.ts 之前，
+            // get-reply-run.ts:325 已先调用 applySessionHints(body.ts) 把 store 里的 abortedLastRun 清回
+            // false（body.ts:21/31-35），此时 attempt.ts 读盘只会读到 false。唯一不丢失这次事实的来源，
+            // 就是 inbound 链早期捕获、再原样透传下来的这个内存 flag。补这一跳即对面板 chat.send 与
+            // LINE auto-reply 两条路径同时生效（二者共用本透传链）。
+            abortedLastRunBeforeReset: params.abortedLastRunBeforeReset,
             streamParams: params.streamParams,
             ownerNumbers: params.ownerNumbers,
             enforceFinalTag: params.enforceFinalTag,

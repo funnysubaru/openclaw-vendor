@@ -150,6 +150,18 @@ type PromptBuildHookRunner = {
 
 const SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE = "openclaw.sessions_yield_interrupt";
 const SESSIONS_YIELD_CONTEXT_CUSTOM_TYPE = "openclaw.sessions_yield";
+// 用户在 orchestrator 处于 sessions_yield 挂起态时 /stop 中止本轮后，下一轮真实用户输入
+// 起手处注入的「修正说明」自定义消息类型。它告诉 orchestrator：上一轮被用户中止、此前
+// 通过 sessions_spawn 派生的子 agent 已全部终止、不会再返回结果，若用户要求继续应重新 spawn，
+// 切勿继续等待先前子 agent 的结果（这正是“卡死、要发第 3 次才正常”的根因）。
+const SESSION_ABORTED_RESET_CUSTOM_TYPE = "openclaw.session_aborted_reset";
+// 注入文案做成常量，便于单测断言内容、也便于日后统一调整措辞。
+const SESSION_ABORTED_RESET_MESSAGE =
+  "Note: The previous turn was stopped by the user while this session was paused waiting (via sessions_yield) " +
+  "for results from sub-agents it had spawned with sessions_spawn. Those sub-agents have all been terminated " +
+  "and will NOT return any results. Do not wait for, or assume the existence of, any pending sub-agent results " +
+  "from before this point. If the user now asks you to continue, treat it as a request to re-plan and, if needed, " +
+  "re-spawn the work from scratch.";
 
 // Persist a hidden context reminder so the next turn knows why the runner stopped.
 function buildSessionsYieldContextMessage(message: string): string {
@@ -252,12 +264,28 @@ async function persistSessionsYieldContextMessage(
   );
 }
 
-// Remove the synthetic yield interrupt + aborted assistant entry from the live transcript.
-function stripSessionsYieldArtifacts(activeSession: {
-  messages: AgentMessage[];
-  agent: { replaceMessages: (messages: AgentMessage[]) => void };
-  sessionManager?: unknown;
-}) {
+// Remove the synthetic yield artifacts (aborted assistant + yield-interrupt + yield-context)
+// from the live transcript so the session no longer sits in the "waiting on sub-agents" state.
+//
+// ⚠️ 必须把 sessions_yield 上下文那条也剥掉（两轮 live 复验失败的根因之一）：onYield 落盘的两条
+// custom_message 里，sessions_yield_interrupt 是拦截标记、sessions_yield 才是真正把会话钉在“等结果”
+// 挂起态的上下文条目。若只剥 interrupt、保留 yield 上下文，strip 后 leaf 仍是 sessions_yield，
+// 会话依旧停在挂起态、orchestrator 续轮仍会等已死子 agent → 闸等于白触发。故两类 yield custom_message
+// 一起剥到尽，把 leaf 退回到 yield 之前的真实历史末端。
+export function stripSessionsYieldArtifacts(
+  activeSession: {
+    messages: AgentMessage[];
+    agent: { replaceMessages: (messages: AgentMessage[]) => void };
+    sessionManager?: unknown;
+  },
+  opts?: { includeYieldContext?: boolean },
+) {
+  const includeYieldContext = opts?.includeYieldContext === true;
+  // 判定一条 yield custom_message 是否该被剥：interrupt（拦截标记）永远剥；
+  // sessions_yield 上下文条目仅在 includeYieldContext=true（abort 闸调用）时才剥。
+  const isStrippableYieldCustomType = (customType?: string): boolean =>
+    customType === SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE ||
+    (includeYieldContext && customType === SESSIONS_YIELD_CONTEXT_CUSTOM_TYPE);
   const strippedMessages = activeSession.messages.slice();
   while (strippedMessages.length > 0) {
     const last = strippedMessages.at(-1) as
@@ -270,7 +298,7 @@ function stripSessionsYieldArtifacts(activeSession: {
     if (
       last?.role === "custom" &&
       "customType" in last &&
-      last.customType === SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE
+      isStrippableYieldCustomType(last.customType)
     ) {
       strippedMessages.pop();
       continue;
@@ -311,9 +339,10 @@ function stripSessionsYieldArtifacts(activeSession: {
       last.type === "message" &&
       last.message?.role === "assistant" &&
       last.message?.stopReason === "aborted";
-    const isYieldInterruptMessage =
-      last.type === "custom_message" && last.customType === SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE;
-    if (!isYieldAbortAssistant && !isYieldInterruptMessage) {
+    // 同 live-transcript 循环：interrupt 永远剥；yield 上下文仅 includeYieldContext=true（abort 闸）时剥。
+    const isYieldCustomMessage =
+      last.type === "custom_message" && isStrippableYieldCustomType(last.customType);
+    if (!isYieldAbortAssistant && !isYieldCustomMessage) {
       break;
     }
     fileEntries.pop();
@@ -326,6 +355,148 @@ function stripSessionsYieldArtifacts(activeSession: {
   if (changed) {
     sessionManager._rewriteFile?.();
   }
+}
+
+// leaf entry 的最小形态：判定当前会话末端是否停在 sessions_yield 挂起态。
+type YieldLeafEntryLike =
+  | {
+      type?: string;
+      customType?: string;
+    }
+  | undefined;
+
+// 当前会话末端是否停在 sessions_yield 挂起态（=会话停在“等子 agent 结果”挂起态）。
+// 这是“会话级 abort 闸”的触发判据 #1。
+//
+// ⚠️ 必须同时认两种 custom_message（两轮 live 复验失败的根因之一）：onYield 落盘时会写两条
+// custom_message —— 先 steer 一条 sessions_yield_interrupt（拦掉本轮剩余 tool 调用），再
+// persistSessionsYieldContextMessage 写一条 sessions_yield 上下文。strip 会从 live transcript 剥掉
+// interrupt，但在持久化 jsonl 里 interrupt 可能后于 yield 落盘成为真正的 leaf（历史 live 诊断 实测
+// leaf=openclaw.sessions_yield_interrupt）。只认 sessions_yield 会漏掉这种 leaf → 闸永不触发。
+// 故两个 customType 都视为“停在 yield 挂起态”。
+function isSessionsYieldLeafEntry(leafEntry: YieldLeafEntryLike): boolean {
+  return (
+    leafEntry?.type === "custom_message" &&
+    (leafEntry?.customType === SESSIONS_YIELD_CONTEXT_CUSTOM_TYPE ||
+      leafEntry?.customType === SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE)
+  );
+}
+
+// 注入修正说明（openclaw.session_aborted_reset）。复用与 persistSessionsYieldContextMessage 相同的
+// sendCustomMessage 机制：display:false（用户看不到）、triggerTurn:false（不额外起一轮）。
+async function persistSessionAbortedResetMessage(activeSession: {
+  sendCustomMessage: (
+    message: {
+      customType: string;
+      content: string;
+      display: boolean;
+      details?: Record<string, unknown>;
+    },
+    options?: { triggerTurn?: boolean },
+  ) => Promise<void>;
+}) {
+  await activeSession.sendCustomMessage(
+    {
+      customType: SESSION_ABORTED_RESET_CUSTOM_TYPE,
+      content: SESSION_ABORTED_RESET_MESSAGE,
+      display: false,
+      details: { source: "session_aborted_reset" },
+    },
+    { triggerTurn: false },
+  );
+}
+
+// 会话级 abort 闸的判定结果，便于调用方记日志、测试断言命中原因。
+type OrchestratorYieldResetDecision = {
+  // 三条触发判据是否全部满足、因而执行了“剥挂起态 + 注入修正”。
+  applied: boolean;
+  // 未命中时给出原因（便于诊断“为什么没生效/为什么生效”）。
+  reason:
+    | "applied"
+    | "not-aborted" // 上一轮没有被用户主动 abort（正常 yield→announce→resume 走这里）
+    | "not-yield-leaf" // 当前 leaf 不是 sessions_yield 挂起态
+    | "inter-session-resume" // 本轮是子 agent announce 触发的 resume（inter_session），不是用户输入
+    | "internal-system-resume"; // 本轮是 internal_system（系统/cron）注入，不是用户主动 resume（I2）
+};
+
+/**
+ * 会话级 abort 闸（设计 C，保留上下文、只剥挂起态 + 注入修正）。
+ *
+ * 背景：Yuiclaw 团队 orchestrator 用 sessions_spawn 派生子 agent，自身停在 sessions_yield
+ * 挂起态等子 agent 结果。用户 /stop 杀了子 agent、拦了 announce，但没重置 orchestrator 对话历史
+ * ——它仍停在“等结果”挂起态。用户下次发“继续”时，orchestrator 续在挂起上下文上、以为子 agent
+ * 还活着继续等（实际已被杀）→ 卡死，要发第 3 次才正常。
+ *
+ * 本函数在 orchestrator **下一轮 run 起手处**（新 prompt append 到 session leaf 之前）介入。
+ * 此处 live sessionManager / activeSession 一定在，绕开了 abort 同步路径够不到 live session 的障碍。
+ *
+ * 三条触发判据（缺一不做，避免误伤正常 yield→announce→resume）：
+ *   1. 当前 leaf 是 sessions_yield 挂起态（isSessionsYieldLeafEntry）。
+ *   2. 上一轮被用户主动 abort（abortedLastRunBeforeReset）。注意：持久化的 abortCutoff /
+ *      abortedLastRun 在本函数执行之前、于 inbound 处理链更早阶段就已被清除（见交付说明），
+ *      故此判据的数据来源是上层在“清除发生之前”捕获并透传进来的内存 flag，而非此处读盘。
+ *   3. 本轮新输入是**用户主动触发**的 resume。判据为「provenance 既非 inter_session 也非 internal_system」，
+ *      与清闸 shouldClearAbortGuardForInbound(get-reply-inline-actions.ts:50) 严格对齐：排除 inter_session
+ *      （子 agent announce 回灌，见 subagent-announce.ts）与 internal_system（系统/cron 注入、非用户主动）；
+ *      放行 external_user（LINE 等渠道用户消息）与 undefined（面板 chat.send，普通用户无 provenance、
+ *      systemInputProvenance 仅 ACP 桥可设）。早先「必须 == external_user」会把面板用户的 resume
+ *      （prov=undefined）误判为非用户输入而漏触发（历史 live 诊断 实测面板 prov=undefined）。
+ *
+ * 命中后只做两件事，**不删任何历史**（保留更早成功轮次 + 本轮任务意图 + spawn 记录）：
+ *   - stripSessionsYieldArtifacts：从 live transcript + jsonl 剥掉 yield 挂起工件并重设 leaf，
+ *     使会话不再处于“等结果”挂起态。
+ *   - persistSessionAbortedResetMessage：注入一条隐藏修正说明，告诉 orchestrator 子 agent 已终止、
+ *     别等结果、若要继续需重新 spawn。
+ */
+export async function maybeResetOrchestratorYieldContextAfterUserAbort(params: {
+  leafEntry: YieldLeafEntryLike;
+  // 上一轮是否被用户主动 abort（由上层在 abortCutoff/abortedLastRun 被清除之前捕获并透传）。
+  abortedLastRunBeforeReset: boolean;
+  // 本轮新输入来源（external_user / inter_session / internal_system）。
+  inputProvenanceKind?: string;
+  // 复用 stripSessionsYieldArtifacts 所需的 live session 形态。
+  activeSession: Parameters<typeof stripSessionsYieldArtifacts>[0] & {
+    sendCustomMessage: Parameters<typeof persistSessionAbortedResetMessage>[0]["sendCustomMessage"];
+  };
+  // 允许测试注入桩，默认用模块内真实实现。
+  stripArtifacts?: (session: Parameters<typeof stripSessionsYieldArtifacts>[0]) => void;
+  injectResetMessage?: (
+    session: Parameters<typeof persistSessionAbortedResetMessage>[0],
+  ) => Promise<void>;
+}): Promise<OrchestratorYieldResetDecision> {
+  // 判据 #1：必须停在 sessions_yield 挂起态。
+  if (!isSessionsYieldLeafEntry(params.leafEntry)) {
+    return { applied: false, reason: "not-yield-leaf" };
+  }
+  // 判据 #2：上一轮必须被用户主动 abort。正常 yield（等 announce）不命中。
+  if (!params.abortedLastRunBeforeReset) {
+    return { applied: false, reason: "not-aborted" };
+  }
+  // 判据 #3：只放行**用户主动触发**的 resume；排除非用户来源。与清闸 shouldClearAbortGuardForInbound
+  // （get-reply-inline-actions.ts:50 `kind !== inter_session && kind !== internal_system`）严格对齐——
+  // 闸生效条件应等于「清闸条件」，避免两者不对称（review I2）。
+  //   · inter_session：子 agent announce 回灌（subagent-announce.ts），announce-resume 不该触发闸。
+  //   · internal_system：系统/cron 注入，非用户主动 resume，不该触发闸。
+  // 放行的是 external_user 与 undefined（面板 chat.send 普通用户 systemInputProvenance 仅 ACP 桥可设、
+  // 普通用户为 undefined，若坚持 == external_user 会把面板用户 resume 误排除）。
+  if (params.inputProvenanceKind === "inter_session") {
+    return { applied: false, reason: "inter-session-resume" };
+  }
+  if (params.inputProvenanceKind === "internal_system") {
+    return { applied: false, reason: "internal-system-resume" };
+  }
+
+  // 闸要把会话彻底拉出挂起态，故 includeYieldContext: true（连 sessions_yield 上下文一起剥到尽）。
+  // 正常 yield 流程（2651）则用默认 opts，只剥 interrupt、保留上下文，互不干扰。
+  const strip =
+    params.stripArtifacts ??
+    ((session: Parameters<typeof stripSessionsYieldArtifacts>[0]) =>
+      stripSessionsYieldArtifacts(session, { includeYieldContext: true }));
+  const inject = params.injectResetMessage ?? persistSessionAbortedResetMessage;
+  // 先剥挂起工件（让会话不再是“等结果”态），再注入修正说明。
+  strip(params.activeSession);
+  await inject(params.activeSession);
+  return { applied: true, reason: "applied" };
 }
 
 export function isOllamaCompatProvider(model: {
@@ -2361,7 +2532,31 @@ export async function runEmbeddedAttempt(
         });
 
         // Repair orphaned trailing user messages so new prompts don't violate role ordering.
-        const leafEntry = sessionManager.getLeafEntry();
+        let leafEntry = sessionManager.getLeafEntry();
+
+        // 会话级 abort 闸（设计 C）：用户在 orchestrator 处于 sessions_yield 挂起态时 /stop 中止本轮，
+        // 子 agent 已被杀但会话仍停在“等结果”挂起态；此处在新 prompt append 之前剥掉挂起工件并注入
+        // 修正说明，避免 orchestrator 续在挂起上下文上继续等已死的子 agent（要发第 3 次才正常的根因）。
+        // 三条触发判据全满足才动（leaf 是 yield + 上一轮被用户 abort + 本轮是真实用户输入），缺一不做。
+        const orchestratorYieldResetDecision =
+          await maybeResetOrchestratorYieldContextAfterUserAbort({
+            leafEntry,
+            abortedLastRunBeforeReset: params.abortedLastRunBeforeReset === true,
+            inputProvenanceKind: params.inputProvenance?.kind,
+            activeSession,
+          });
+        if (orchestratorYieldResetDecision.applied) {
+          log.warn(
+            `session-abort guard: reset orchestrator sessions_yield context after user abort. ` +
+              `runId=${params.runId} sessionId=${params.sessionId} sessionKey=${params.sessionKey}`,
+          );
+          // 闸 strip 已重设 leaf（剥掉 yield 工件、leaf 退回 yield 之前的真实历史末端）。下面的
+          // orphan trailing user 修复必须基于**闸后**的最新 leaf —— 否则会拿闸前那条 yield
+          // custom_message leaf 去判（type 永远不是 "message" → 漏修闸后可能露出的 orphan user）。
+          // review 第2轮 #3。
+          leafEntry = sessionManager.getLeafEntry();
+        }
+
         if (leafEntry?.type === "message" && leafEntry.message.role === "user") {
           if (leafEntry.parentId) {
             sessionManager.branch(leafEntry.parentId);

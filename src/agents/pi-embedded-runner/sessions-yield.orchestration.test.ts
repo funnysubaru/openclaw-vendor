@@ -84,4 +84,44 @@ describe("sessions_yield orchestration", () => {
     expect(result.meta.stopReason).toBeUndefined();
     expect(result.meta.pendingToolCalls).toBeUndefined();
   });
+
+  // ⚠️ 承重转发回归（会话级 abort 闸两轮 live 复验失败的真正根因）：
+  // 面板 chat.send 与 LINE auto-reply 都经 dispatchInboundMessage → get-reply-run →
+  // buildEmbeddedRunBaseParams → runEmbeddedPiAgent，把 abortedLastRunBeforeReset / inputProvenance
+  // 放进 RunEmbeddedPiAgentParams。但 runEmbeddedPiAgent → runEmbeddedAttempt 这一跳此前漏抄
+  // abortedLastRunBeforeReset → attempt.ts 处的闸判据 #2 读到 undefined（对所有 run）→ 闸永不触发。
+  // 历史 live 诊断 实测正是「prov 形态有值（这一跳本来就透传 inputProvenance）、abortedFlag=undefined」。
+  // 本用例锁死「两者都透传到 attempt」，防回归。
+  it("forwards abortedLastRunBeforeReset + inputProvenance from runEmbeddedPiAgent into runEmbeddedAttempt", async () => {
+    mockedRunEmbeddedAttempt.mockResolvedValueOnce(makeAttemptResult({ promptError: null }));
+
+    await runEmbeddedPiAgent({
+      ...overflowBaseRunParams,
+      runId: "run-forward-abort-flag",
+      // 模拟 inbound 链早期捕获、透传下来的「上一轮被用户 abort」内存 flag。
+      abortedLastRunBeforeReset: true,
+      // 模拟面板 chat.send 普通用户：systemInputProvenance 仅 ACP 桥可设，普通用户为 undefined。
+      // 这里显式给 inter_session 之外的一种值，确认透传链本身把对象原样带到 attempt。
+      inputProvenance: { kind: "external_user" },
+    });
+
+    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(1);
+    const attemptArg = mockedRunEmbeddedAttempt.mock.calls[0][0];
+    // 修复前这里是 undefined（漏抄）→ 现在必须原样到达 attempt。
+    expect(attemptArg.abortedLastRunBeforeReset).toBe(true);
+    expect(attemptArg.inputProvenance).toEqual({ kind: "external_user" });
+  });
+
+  // 反证 / 锁死「无 abort flag 时透传 undefined，不凭空捏造 true」。
+  it("forwards undefined abortedLastRunBeforeReset when the caller did not set it", async () => {
+    mockedRunEmbeddedAttempt.mockResolvedValueOnce(makeAttemptResult({ promptError: null }));
+
+    await runEmbeddedPiAgent({
+      ...overflowBaseRunParams,
+      runId: "run-forward-abort-flag-absent",
+    });
+
+    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(1);
+    expect(mockedRunEmbeddedAttempt.mock.calls[0][0].abortedLastRunBeforeReset).toBeUndefined();
+  });
 });

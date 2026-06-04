@@ -16,6 +16,8 @@ const {
   createSubsystemLogger,
   // Task 5: session-abort-guard 打标函数 mock
   markSessionAborted,
+  // 持久化 orchestrator abortedLastRun 标记的 store 写入函数 mock（面板 Stop 对齐文本 /stop）。
+  updateSessionStoreEntry,
 } = vi.hoisted(() => {
   const CTRL = "agent:main:user:u1:panel";
   const CHILD = "agent:main:user:u1:panel:subagent:stock-analyst";
@@ -24,9 +26,21 @@ const {
   const logInfo = vi.fn();
   // Task 5: markSessionAborted mock，用于验证 teardown 流程确实打了 abort 标
   const markSessionAborted = vi.fn();
+  // 面板 Stop 持久化 orchestrator abortedLastRun 标记：默认成功返回一个非 null entry，
+  // 表示 store 里确实存在 orchestrator entry 并被打了标。返回 null 表示 entry 不存在（不创建）。
+  // 显式标注成「接 {storePath, sessionKey, update}、返回对象或 null」的函数，避免 vi.fn 把返回类型
+  // 收窄成字面量 { abortedLastRun: true } 而导致 mockResolvedValueOnce(null) / mock.calls 取值类型报错。
+  const updateSessionStoreEntry = vi.fn<
+    (params: {
+      storePath: string;
+      sessionKey: string;
+      update: (entry: Record<string, unknown>) => Promise<Record<string, unknown> | null>;
+    }) => Promise<Record<string, unknown> | null>
+  >(async () => ({ abortedLastRun: true }));
   return {
     logInfo,
     markSessionAborted,
+    updateSessionStoreEntry,
     createSubsystemLogger: vi.fn(() => ({
       info: logInfo,
       warn: vi.fn(),
@@ -67,7 +81,7 @@ vi.mock("../auto-reply/reply/queue.js", () => ({ clearSessionQueues }));
 vi.mock("../browser/session-tab-registry.js", () => ({ closeTrackedBrowserTabsForSessions }));
 vi.mock("../config/config.js", () => ({ loadConfig }));
 vi.mock("./session-utils.js", () => ({ resolveGatewaySessionStoreTarget }));
-vi.mock("../config/sessions.js", () => ({ loadSessionStore }));
+vi.mock("../config/sessions.js", () => ({ loadSessionStore, updateSessionStoreEntry }));
 vi.mock("../logging/subsystem.js", () => ({ createSubsystemLogger }));
 // Task 5: mock session-abort-guard 以验证 teardown 调用了 markSessionAborted
 vi.mock("../agents/session-abort-guard.js", () => ({ markSessionAborted }));
@@ -98,6 +112,7 @@ describe("tearDownSessionRuntimeForAbort", () => {
       canonicalKey: CTRL,
       storeKeys: [CTRL],
     }));
+    updateSessionStoreEntry.mockImplementation(async () => ({ abortedLastRun: true }));
   });
 
   it("kills subtree + controller embedded run + clears queues + waits + closes tabs for controller AND recursive descendants", async () => {
@@ -119,6 +134,44 @@ describe("tearDownSessionRuntimeForAbort", () => {
     // Task 5: 验证 teardown 向 abort-guard 打了标，以便 announce/spawn 闸生效。
     // key 用 target.canonicalKey（CTRL），cfg 是任意对象（loadConfig() 返回值）。
     expect(markSessionAborted).toHaveBeenCalledWith(expect.anything(), CTRL);
+  });
+
+  it("面板 Stop 必须把 orchestrator(target.canonicalKey) 的 abortedLastRun 持久化进 store —— 对齐文本 /stop", async () => {
+    // 根因回归测试：面板 chat.abort（teardown）此前只调 markSessionAborted（内存闸），
+    // 没有把 abortedLastRun=true 写进 store。于是下一轮 run 在 session.ts 读 entry.abortedLastRun
+    // 恒为 false → 会话级 abort 闸判据 #2 恒 false → 闸永不触发（live 验证失败的直接根因）。
+    // 这里断言 teardown 调用 updateSessionStoreEntry 对 canonicalKey 打了 abortedLastRun=true。
+    await tearDownSessionRuntimeForAbort({ sessionKey: CTRL });
+
+    expect(updateSessionStoreEntry).toHaveBeenCalledTimes(1);
+    const call = updateSessionStoreEntry.mock.calls[0]?.[0];
+    expect(call).toBeDefined();
+    if (!call) {
+      throw new Error("updateSessionStoreEntry 未被调用，前面断言应已失败");
+    }
+    // 必须打在 orchestrator 的 canonicalKey 上（不是子 agent），store 路径与 target 一致。
+    expect(call.sessionKey).toBe(CTRL);
+    expect(call.storePath).toBe("/tmp/store.json");
+    // update 回调返回的 patch 必须把 abortedLastRun 置 true（下一轮 session.ts:370 据此读出真值）。
+    const patch = await call.update({ sessionId: "sess-123" });
+    expect(patch).toMatchObject({ abortedLastRun: true });
+  });
+
+  it("orchestrator entry 不存在时 updateSessionStoreEntry 返回 null → 不抛错、不影响其余 teardown", async () => {
+    // updateSessionStoreEntry 在 entry 不存在时返回 null（不凭空创建 entry）。teardown 必须容忍。
+    updateSessionStoreEntry.mockResolvedValueOnce(null);
+    await expect(tearDownSessionRuntimeForAbort({ sessionKey: CTRL })).resolves.toBeUndefined();
+    // 其余 teardown 步骤照常执行。
+    expect(stopSubagentsForRequester).toHaveBeenCalled();
+    expect(closeTrackedBrowserTabsForSessions).toHaveBeenCalled();
+  });
+
+  it("P2-a: 持久化 abortedLastRun 抛错也不影响后续 teardown（best-effort 隔离）", async () => {
+    // store 写入失败（如盘满/锁竞争）不能阻断 stop/close tabs —— 与其它 teardown 步骤一致 best-effort。
+    updateSessionStoreEntry.mockRejectedValueOnce(new Error("disk full"));
+    await tearDownSessionRuntimeForAbort({ sessionKey: CTRL });
+    expect(stopSubagentsForRequester).toHaveBeenCalled();
+    expect(closeTrackedBrowserTabsForSessions).toHaveBeenCalled();
   });
 
   it("P2-a: still closes tabs even if an earlier primitive throws", async () => {

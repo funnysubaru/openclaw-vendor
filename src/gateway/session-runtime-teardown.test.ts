@@ -114,9 +114,7 @@ describe("tearDownSessionRuntimeForAbort", () => {
     );
     // Observability: a single info-level summary line with the cascade counts.
     expect(logInfo).toHaveBeenCalledTimes(1);
-    expect(logInfo).toHaveBeenCalledWith(
-      expect.stringContaining("stoppedSubagents=2"),
-    );
+    expect(logInfo).toHaveBeenCalledWith(expect.stringContaining("stoppedSubagents=2"));
     expect(logInfo).toHaveBeenCalledWith(expect.stringContaining("activeDescendants=2"));
     // Task 5: 验证 teardown 向 abort-guard 打了标，以便 announce/spawn 闸生效。
     // key 用 target.canonicalKey（CTRL），cfg 是任意对象（loadConfig() 返回值）。

@@ -28,10 +28,6 @@ export {
   shouldVerifyRequesterSpawnedSessionVisibility,
 } from "./sessions-resolution.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import {
-  resolveInternalSessionKey,
-  resolveMainSessionAlias,
-} from "./sessions-resolution.js";
 import { extractTextFromChatContent } from "../../shared/chat-content.js";
 import { sanitizeUserFacingText } from "../pi-embedded-helpers.js";
 import {
@@ -40,6 +36,7 @@ import {
   stripModelSpecialTokens,
   stripThinkingTagsFromText,
 } from "../pi-embedded-utils.js";
+import { resolveInternalSessionKey, resolveMainSessionAlias } from "./sessions-resolution.js";
 
 export type SessionKind = "main" | "group" | "cron" | "hook" | "node" | "other";
 

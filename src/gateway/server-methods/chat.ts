@@ -34,7 +34,6 @@ import {
 import { type ChatImageContent, parseMessageWithAttachments } from "../chat-attachments.js";
 import { stripEnvelopeFromMessage, stripEnvelopeFromMessages } from "../chat-sanitize.js";
 import { ADMIN_SCOPE } from "../method-scopes.js";
-import { tearDownSessionRuntimeForAbort } from "../session-runtime-teardown.js";
 import {
   GATEWAY_CLIENT_CAPS,
   GATEWAY_CLIENT_MODES,
@@ -52,6 +51,7 @@ import {
 } from "../protocol/index.js";
 import { CHAT_SEND_SESSION_KEY_MAX_LENGTH } from "../protocol/schema/primitives.js";
 import { getMaxChatHistoryMessagesBytes } from "../server-constants.js";
+import { tearDownSessionRuntimeForAbort } from "../session-runtime-teardown.js";
 import {
   capArrayByJsonBytes,
   loadSessionEntry,

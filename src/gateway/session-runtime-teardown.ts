@@ -153,7 +153,7 @@ export async function tearDownSessionRuntimeForAbort(params: {
 
   // 2. Abort the controller's own embedded Pi run (if one is active).
   if (sessionId) {
-    await safeStep("abortEmbedded", sessionKey, () => abortEmbeddedPiRun(sessionId!));
+    await safeStep("abortEmbedded", sessionKey, () => abortEmbeddedPiRun(sessionId));
   }
 
   // 3. Clear any pending message queues for the controller and all related keys.
@@ -164,7 +164,7 @@ export async function tearDownSessionRuntimeForAbort(params: {
   // 4. Wait for the embedded run to fully stop before releasing browser resources.
   // Cap at 15 s to match session-reset-service's timeout constant.
   if (sessionId) {
-    await safeStep("waitRunEnd", sessionKey, () => waitForEmbeddedPiRunEnd(sessionId!, 15_000));
+    await safeStep("waitRunEnd", sessionKey, () => waitForEmbeddedPiRunEnd(sessionId, 15_000));
   }
 
   // 5. Close all tracked browser tabs for the controller and active descendants.

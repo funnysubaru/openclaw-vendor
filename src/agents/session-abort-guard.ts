@@ -50,7 +50,9 @@ const ABORTED = guardState.aborted;
 export function markSessionAborted(cfg: OpenClawConfig, sessionKey: string | undefined): void {
   const key = normalizeControllerSessionKey(cfg, sessionKey);
   // normalizeControllerSessionKey 对空/blank 返回 undefined，直接 no-op
-  if (!key) return;
+  if (!key) {
+    return;
+  }
   const existing = ABORTED.get(key);
   ABORTED.set(key, {
     abortedAt: Date.now(),
@@ -64,7 +66,9 @@ export function markSessionAborted(cfg: OpenClawConfig, sessionKey: string | und
  */
 export function isSessionAborted(cfg: OpenClawConfig, sessionKey: string | undefined): boolean {
   const key = normalizeControllerSessionKey(cfg, sessionKey);
-  if (!key) return false;
+  if (!key) {
+    return false;
+  }
   return ABORTED.has(key);
 }
 
@@ -75,9 +79,13 @@ export function isSessionAborted(cfg: OpenClawConfig, sessionKey: string | undef
  */
 export function noteDroppedAnnounce(cfg: OpenClawConfig, sessionKey: string | undefined): number {
   const key = normalizeControllerSessionKey(cfg, sessionKey);
-  if (!key) return 0;
+  if (!key) {
+    return 0;
+  }
   const entry = ABORTED.get(key);
-  if (!entry) return 0;
+  if (!entry) {
+    return 0;
+  }
   entry.droppedCount += 1;
   return entry.droppedCount;
 }
@@ -88,14 +96,16 @@ export function noteDroppedAnnounce(cfg: OpenClawConfig, sessionKey: string | un
  */
 export function clearSessionAbort(cfg: OpenClawConfig, sessionKey: string | undefined): void {
   const key = normalizeControllerSessionKey(cfg, sessionKey);
-  if (!key) return;
+  if (!key) {
+    return;
+  }
   const entry = ABORTED.get(key);
-  if (!entry) return;
+  if (!entry) {
+    return;
+  }
   ABORTED.delete(key);
   if (entry.droppedCount > 0) {
-    log.info(
-      `[abort-guard] cleared sessionKey=${key} droppedAnnounces=${entry.droppedCount}`,
-    );
+    log.info(`[abort-guard] cleared sessionKey=${key} droppedAnnounces=${entry.droppedCount}`);
   }
 }
 

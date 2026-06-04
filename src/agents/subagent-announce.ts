@@ -2,8 +2,6 @@ import { resolveQueueSettings } from "../auto-reply/reply/queue.js";
 import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
 import { DEFAULT_SUBAGENT_MAX_SPAWN_DEPTH } from "../config/agent-limits.js";
 import { loadConfig } from "../config/config.js";
-import { createSubsystemLogger } from "../logging/subsystem.js";
-import { isSessionAborted, noteDroppedAnnounce } from "./session-abort-guard.js";
 import {
   loadSessionStore,
   resolveAgentIdFromSessionKey,
@@ -13,6 +11,7 @@ import {
 import { callGateway } from "../gateway/call.js";
 import { createBoundDeliveryRouter } from "../infra/outbound/bound-delivery-router.js";
 import type { ConversationRef } from "../infra/outbound/session-binding-service.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { normalizeAccountId, normalizeMainKey } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
@@ -40,6 +39,7 @@ import {
   queueEmbeddedPiMessage,
   waitForEmbeddedPiRunEnd,
 } from "./pi-embedded.js";
+import { isSessionAborted, noteDroppedAnnounce } from "./session-abort-guard.js";
 import {
   runSubagentAnnounceDispatch,
   type SubagentAnnounceDeliveryResult,

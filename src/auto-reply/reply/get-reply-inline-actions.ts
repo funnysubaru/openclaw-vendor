@@ -1,5 +1,6 @@
 import { collectTextContentBlocks } from "../../agents/content-blocks.js";
 import { createOpenClawTools } from "../../agents/openclaw-tools.js";
+import { clearSessionAbort } from "../../agents/session-abort-guard.js";
 import type { SkillCommandSpec } from "../../agents/skills.js";
 import { applyOwnerOnlyToolPolicy } from "../../agents/tool-policy.js";
 import { getChannelDock } from "../../channels/dock.js";
@@ -7,6 +8,7 @@ import type { OpenClawConfig } from "../../config/config.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import { logVerbose } from "../../globals.js";
 import { generateSecureToken } from "../../infra/secure-random.js";
+import type { InputProvenance } from "../../sessions/input-provenance.js";
 import { resolveGatewayMessageChannel } from "../../utils/message-channel.js";
 import {
   listReservedChatSlashCommandNames,
@@ -23,8 +25,6 @@ import {
   shouldSkipMessageByAbortCutoff,
 } from "./abort-cutoff.js";
 import { getAbortMemory, isAbortRequestText } from "./abort.js";
-import { clearSessionAbort } from "../../agents/session-abort-guard.js";
-import type { InputProvenance } from "../../sessions/input-provenance.js";
 import { buildStatusReply, handleCommands } from "./commands.js";
 import type { InlineDirectives } from "./directive-handling.js";
 import { isDirectiveOnly } from "./directive-handling.js";
@@ -44,9 +44,7 @@ import type { TypingController } from "./typing.js";
  *
  * 提取为纯函数便于单测（无副作用，只返回布尔）。
  */
-export function shouldClearAbortGuardForInbound(
-  provenance: InputProvenance | undefined,
-): boolean {
+export function shouldClearAbortGuardForInbound(provenance: InputProvenance | undefined): boolean {
   const kind = provenance?.kind;
   // inter_session 和 internal_system 明确拦住；其余（external_user + undefined）= 解除
   return kind !== "inter_session" && kind !== "internal_system";

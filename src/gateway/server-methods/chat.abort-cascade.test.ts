@@ -148,13 +148,27 @@ describe("chat.abort cascades subagent teardown", () => {
     expect(tearDownSessionRuntimeForAbort).not.toHaveBeenCalled();
   });
 
-  it("explicit runId not found does NOT tear down", async () => {
-    // Early-return path: when the runId is not found, no teardown fires.
-    // (The early-return happens before the insertion point.)
+  it("explicit runId not found STILL tears down for admin (yield case)", async () => {
+    // The yield case: the panel sends an explicit runId for a main chat run that already
+    // ended naturally, so chatAbortControllers has no entry and the explicit-runId branch
+    // early-returns (!active). Teardown is now fired EARLY (before runId branching), so it
+    // must still cascade for an admin even when the run is gone — this is the whole point
+    // of moving the teardown out of the per-branch tail.
     await invokeChatAbort({
       context: createContext(),
       request: { sessionKey: SK, runId: "missing" },
       client: ADMIN,
+    });
+    expect(tearDownSessionRuntimeForAbort).toHaveBeenCalledWith({ sessionKey: SK });
+  });
+
+  it("explicit runId not found does NOT tear down for non-admin", async () => {
+    // The isAdmin gate still holds in the early-fire position: a non-admin hitting the
+    // not-found path triggers no session-wide cascade.
+    await invokeChatAbort({
+      context: createContext(),
+      request: { sessionKey: SK, runId: "missing" },
+      client: USER1,
     });
     expect(tearDownSessionRuntimeForAbort).not.toHaveBeenCalled();
   });

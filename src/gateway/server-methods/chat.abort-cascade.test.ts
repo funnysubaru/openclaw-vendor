@@ -28,6 +28,24 @@ vi.mock("../../config/config.js", async (importOriginal) => {
   };
 });
 
+// review 第2轮 P1：chat.send 的 /stop 分支也要级联 teardown。测它需要绕过 chat.send 进入
+// stopCommand 分支前的两个 import 依赖：loadSessionEntry（读会话）+ resolveSendPolicy（发送策略）。
+vi.mock("../session-utils.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../session-utils.js")>();
+  return {
+    ...actual,
+    loadSessionEntry: () => ({
+      cfg: { session: { mainKey: "main", scope: "per-sender" } },
+      entry: {},
+      canonicalKey: "main", // = 下方 const SK；mock 工厂在 SK 声明前执行，故用字面量避免 TDZ
+      storePath: "/tmp/sessions.json",
+    }),
+  };
+});
+vi.mock("../../sessions/send-policy.js", () => ({
+  resolveSendPolicy: () => "allow",
+}));
+
 import { chatHandlers } from "./chat.js";
 
 // ---------------------------------------------------------------------------
@@ -205,6 +223,67 @@ describe("chat.abort cascades subagent teardown", () => {
   it("non-admin abort does NOT mark the session aborted", async () => {
     // 与 teardown 同样的 isAdmin 闸：非 admin 不触发会话级打标。
     await invokeChatAbort({ context: createContext(), request: { sessionKey: SK }, client: USER1 });
+    expect(markSessionAborted).not.toHaveBeenCalled();
+  });
+
+  // --- review 第2轮 P2：runId/sessionKey mismatch 是畸形请求，不应有任何会话级副作用 ---
+
+  it("runId/sessionKey MISMATCH does NOT tear down or mark, even for admin (no side effects)", async () => {
+    // active 存在但属于另一个 session（active.sessionKey !== 请求的 sessionKey）→ 走 mismatch
+    // 分支返回 "runId does not match sessionKey"。此前 early-fire 会在判定 mismatch 之前就
+    // teardown + 打标 sessionKey 的子树 → 畸形请求误伤指定 session。修复后 mismatch 零副作用。
+    const context = createContext({
+      chatAbortControllers: new Map([
+        ["r1", createActiveRun("some-other-session", { deviceId: "d-other" })],
+      ]),
+    });
+    const respond = await invokeChatAbort({
+      context,
+      request: { sessionKey: SK, runId: "r1" },
+      client: ADMIN,
+    });
+    expect(tearDownSessionRuntimeForAbort).not.toHaveBeenCalled();
+    expect(markSessionAborted).not.toHaveBeenCalled();
+    // 仍返回 mismatch 错误
+    expect(respond).toHaveBeenCalledWith(
+      false,
+      undefined,
+      expect.objectContaining({ message: expect.stringContaining("does not match") }),
+    );
+  });
+});
+
+// review 第2轮 P1：用户在 WebChat/TUI 输入 /stop 走的是 chat.send（不是 chat.abort），
+// 其 stopCommand 分支原本只 abortChatRunsForSessionKeyWithPartials，缺级联 teardown → 子 agent
+// / 队列 / tab 残留、复现自我再生。这里验证 chat.send 的 /stop 与 chat.abort 行为对齐。
+describe("chat.send /stop cascades subagent teardown (review P1)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  async function invokeChatStop(p: {
+    context: ReturnType<typeof createContext>;
+    client?: unknown;
+  }) {
+    const respond = vi.fn();
+    await chatHandlers["chat.send"]({
+      params: { sessionKey: SK, message: "/stop", idempotencyKey: "idem-stop" },
+      respond: respond as never,
+      context: p.context as never,
+      req: {} as never,
+      client: (p.client ?? null) as never,
+      isWebchatConnect: () => false,
+    });
+    return respond;
+  }
+
+  it("admin /stop via chat.send tears down + marks (parity with chat.abort)", async () => {
+    await invokeChatStop({ context: createContext(), client: ADMIN });
+    expect(tearDownSessionRuntimeForAbort).toHaveBeenCalledWith({ sessionKey: SK });
+    expect(markSessionAborted).toHaveBeenCalledWith(expect.anything(), SK);
+  });
+
+  it("non-admin /stop via chat.send does NOT tear down or mark", async () => {
+    await invokeChatStop({ context: createContext(), client: USER1 });
+    expect(tearDownSessionRuntimeForAbort).not.toHaveBeenCalled();
     expect(markSessionAborted).not.toHaveBeenCalled();
   });
 });

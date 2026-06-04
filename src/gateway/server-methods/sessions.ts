@@ -313,8 +313,12 @@ export const sessionsHandlers: GatewayRequestHandlers = {
     if (!key) {
       return;
     }
-    clearBootstrapSnapshot(key);
-    respond(true, { ok: true, key }, undefined);
+    // P2-3：bootstrap 缓存按 canonical key 存储,必须先把 RPC 传入的 raw key（可能是 alias，
+    // 如 "main"）解析成 canonical 再清,否则会返回 ok:true 但实际缓存（canonical key）没被清掉。
+    // 对齐 sessions.patch / sessions.reset 的 canonical 解析方式。
+    const canonicalKey = resolveGatewaySessionTargetFromKey(key).target.canonicalKey ?? key;
+    clearBootstrapSnapshot(canonicalKey);
+    respond(true, { ok: true, key: canonicalKey }, undefined);
   },
   "sessions.delete": async ({ params, respond, client, isWebchatConnect }) => {
     if (!assertValidParams(params, validateSessionsDeleteParams, "sessions.delete", respond)) {

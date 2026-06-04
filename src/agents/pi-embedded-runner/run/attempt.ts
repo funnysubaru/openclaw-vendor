@@ -272,11 +272,20 @@ async function persistSessionsYieldContextMessage(
 // 挂起态的上下文条目。若只剥 interrupt、保留 yield 上下文，strip 后 leaf 仍是 sessions_yield，
 // 会话依旧停在挂起态、orchestrator 续轮仍会等已死子 agent → 闸等于白触发。故两类 yield custom_message
 // 一起剥到尽，把 leaf 退回到 yield 之前的真实历史末端。
-function stripSessionsYieldArtifacts(activeSession: {
-  messages: AgentMessage[];
-  agent: { replaceMessages: (messages: AgentMessage[]) => void };
-  sessionManager?: unknown;
-}) {
+export function stripSessionsYieldArtifacts(
+  activeSession: {
+    messages: AgentMessage[];
+    agent: { replaceMessages: (messages: AgentMessage[]) => void };
+    sessionManager?: unknown;
+  },
+  opts?: { includeYieldContext?: boolean },
+) {
+  const includeYieldContext = opts?.includeYieldContext === true;
+  // 判定一条 yield custom_message 是否该被剥：interrupt（拦截标记）永远剥；
+  // sessions_yield 上下文条目仅在 includeYieldContext=true（abort 闸调用）时才剥。
+  const isStrippableYieldCustomType = (customType?: string): boolean =>
+    customType === SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE ||
+    (includeYieldContext && customType === SESSIONS_YIELD_CONTEXT_CUSTOM_TYPE);
   const strippedMessages = activeSession.messages.slice();
   while (strippedMessages.length > 0) {
     const last = strippedMessages.at(-1) as
@@ -289,8 +298,7 @@ function stripSessionsYieldArtifacts(activeSession: {
     if (
       last?.role === "custom" &&
       "customType" in last &&
-      (last.customType === SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE ||
-        last.customType === SESSIONS_YIELD_CONTEXT_CUSTOM_TYPE)
+      isStrippableYieldCustomType(last.customType)
     ) {
       strippedMessages.pop();
       continue;
@@ -331,12 +339,9 @@ function stripSessionsYieldArtifacts(activeSession: {
       last.type === "message" &&
       last.message?.role === "assistant" &&
       last.message?.stopReason === "aborted";
-    // 同 live-transcript 循环：interrupt 与 yield 上下文两类 custom_message 都要剥，
-    // 否则保留下来的 yield 上下文会让 leaf 仍停在挂起态（见上方函数注释）。
+    // 同 live-transcript 循环：interrupt 永远剥；yield 上下文仅 includeYieldContext=true（abort 闸）时剥。
     const isYieldCustomMessage =
-      last.type === "custom_message" &&
-      (last.customType === SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE ||
-        last.customType === SESSIONS_YIELD_CONTEXT_CUSTOM_TYPE);
+      last.type === "custom_message" && isStrippableYieldCustomType(last.customType);
     if (!isYieldAbortAssistant && !isYieldCustomMessage) {
       break;
     }
@@ -473,7 +478,12 @@ export async function maybeResetOrchestratorYieldContextAfterUserAbort(params: {
     return { applied: false, reason: "inter-session-resume" };
   }
 
-  const strip = params.stripArtifacts ?? stripSessionsYieldArtifacts;
+  // 闸要把会话彻底拉出挂起态，故 includeYieldContext: true（连 sessions_yield 上下文一起剥到尽）。
+  // 正常 yield 流程（2651）则用默认 opts，只剥 interrupt、保留上下文，互不干扰。
+  const strip =
+    params.stripArtifacts ??
+    ((session: Parameters<typeof stripSessionsYieldArtifacts>[0]) =>
+      stripSessionsYieldArtifacts(session, { includeYieldContext: true }));
   const inject = params.injectResetMessage ?? persistSessionAbortedResetMessage;
   // 先剥挂起工件（让会话不再是“等结果”态），再注入修正说明。
   strip(params.activeSession);

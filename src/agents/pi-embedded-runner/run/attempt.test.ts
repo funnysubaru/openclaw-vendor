@@ -6,6 +6,7 @@ import {
   composeSystemPromptWithHookContext,
   isOllamaCompatProvider,
   maybeResetOrchestratorYieldContextAfterUserAbort,
+  stripSessionsYieldArtifacts,
   prependSystemPromptAddition,
   resolveAttemptFsWorkspaceOnly,
   resolveOllamaCompatNumCtxEnabled,
@@ -1407,6 +1408,84 @@ describe("maybeResetOrchestratorYieldContextAfterUserAbort", () => {
 
     // 仍注入了修正说明。
     expect(sendCustomMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("stripSessionsYieldArtifacts 默认（不传 opts）保留 sessions_yield 上下文 —— 正常 yield 不变量（第 4 轮回归测试）", () => {
+    // 正常 yield 流程（attempt.ts:2651 调 stripSessionsYieldArtifacts(activeSession)，不传 opts）：
+    // 只剥 interrupt 拦截标记，**必须保留 sessions_yield 上下文**，否则会话脱离“等结果”挂起态 →
+    // 面板丢 Stop 按钮 / waiting 气泡（这正是第 4 轮修的回归）。
+    const liveMessages = [
+      { role: "user", content: "做个调研" },
+      { role: "assistant", content: [{ type: "text", text: "我先 spawn" }] },
+      { role: "custom", customType: "openclaw.sessions_yield", content: "Turn yielded." },
+      { role: "custom", customType: "openclaw.sessions_yield_interrupt", content: "[interrupt]" },
+    ];
+    const fileEntries = [
+      { type: "session", id: "s0", parentId: null },
+      { type: "message", id: "m1", parentId: "s0", message: { role: "user" } },
+      { type: "message", id: "m2", parentId: "m1", message: { role: "assistant" } },
+      { type: "custom_message", id: "c-yield", parentId: "m2", customType: "openclaw.sessions_yield" },
+      {
+        type: "custom_message",
+        id: "c-interrupt",
+        parentId: "c-yield",
+        customType: "openclaw.sessions_yield_interrupt",
+      },
+    ];
+    const byId = new Map(fileEntries.map((e) => [e.id, { id: e.id }]));
+    const replaceMessages = vi.fn();
+    const rewriteFile = vi.fn();
+    const activeSession = {
+      messages: liveMessages as never[],
+      agent: { replaceMessages },
+      sessionManager: { fileEntries, byId, leafId: "c-interrupt", _rewriteFile: rewriteFile },
+    };
+
+    stripSessionsYieldArtifacts(activeSession); // 默认 opts —— 正常 yield 路径
+
+    // live transcript：剥了 interrupt，但保留 sessions_yield 上下文。
+    const live = replaceMessages.mock.calls[0][0] as Array<{ customType?: string }>;
+    expect(live.some((m) => m.customType === "openclaw.sessions_yield_interrupt")).toBe(false);
+    expect(live.some((m) => m.customType === "openclaw.sessions_yield")).toBe(true);
+    // fileEntries：只 pop interrupt，leaf 退回 c-yield（仍挂起态），yield 上下文保留。
+    expect(fileEntries.map((e) => e.id)).toEqual(["s0", "m1", "m2", "c-yield"]);
+    expect(activeSession.sessionManager.leafId).toBe("c-yield");
+    expect(byId.has("c-yield")).toBe(true);
+    expect(byId.has("c-interrupt")).toBe(false);
+  });
+
+  it("stripSessionsYieldArtifacts({ includeYieldContext: true }) 连 yield 上下文一起剥（abort 闸用）", () => {
+    const liveMessages = [
+      { role: "assistant", content: [{ type: "text", text: "我先 spawn" }] },
+      { role: "custom", customType: "openclaw.sessions_yield", content: "Turn yielded." },
+      { role: "custom", customType: "openclaw.sessions_yield_interrupt", content: "[interrupt]" },
+    ];
+    const fileEntries = [
+      { type: "session", id: "s0", parentId: null },
+      { type: "message", id: "m2", parentId: "s0", message: { role: "assistant" } },
+      { type: "custom_message", id: "c-yield", parentId: "m2", customType: "openclaw.sessions_yield" },
+      {
+        type: "custom_message",
+        id: "c-interrupt",
+        parentId: "c-yield",
+        customType: "openclaw.sessions_yield_interrupt",
+      },
+    ];
+    const byId = new Map(fileEntries.map((e) => [e.id, { id: e.id }]));
+    const replaceMessages = vi.fn();
+    const rewriteFile = vi.fn();
+    const activeSession = {
+      messages: liveMessages as never[],
+      agent: { replaceMessages },
+      sessionManager: { fileEntries, byId, leafId: "c-interrupt", _rewriteFile: rewriteFile },
+    };
+
+    stripSessionsYieldArtifacts(activeSession, { includeYieldContext: true });
+
+    const live = replaceMessages.mock.calls[0][0] as Array<{ customType?: string }>;
+    expect(live.some((m) => m.customType?.startsWith("openclaw.sessions_yield"))).toBe(false);
+    expect(fileEntries.map((e) => e.id)).toEqual(["s0", "m2"]);
+    expect(activeSession.sessionManager.leafId).toBe("m2");
   });
 
   it("leaf 不是 sessions_yield 挂起态 → 不命中", async () => {

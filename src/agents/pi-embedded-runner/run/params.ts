@@ -114,6 +114,14 @@ export type RunEmbeddedPiAgentParams = {
   enqueue?: typeof enqueueCommand;
   extraSystemPrompt?: string;
   inputProvenance?: InputProvenance;
+  /**
+   * 上一轮是否被用户主动 abort（/stop 或 abort 触发词），在 inbound 处理链更早阶段清除
+   * abortCutoff/abortedLastRun 之前由上层捕获并透传进来。仅用于「会话级 abort 闸」：
+   * 当本轮起手发现会话停在 sessions_yield 挂起态且本轮是真实用户输入时，剥挂起态 + 注入修正说明
+   * （见 attempt.ts maybeResetOrchestratorYieldContextAfterUserAbort）。此处不读盘，因为持久标记
+   * 在到达本运行器之前已被 get-reply-inline-actions / body.ts 清除。
+   */
+  abortedLastRunBeforeReset?: boolean;
   streamParams?: AgentStreamParams;
   ownerNumbers?: string[];
   enforceFinalTag?: boolean;

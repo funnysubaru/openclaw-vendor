@@ -79,6 +79,12 @@ export type FollowupRun = {
     blockReplyBreak: "text_end" | "message_end";
     ownerNumbers?: string[];
     inputProvenance?: InputProvenance;
+    /**
+     * 上一轮是否被用户主动 abort（/stop 或 abort 触发词）。在 inbound 处理链更早阶段把
+     * 持久 abortedLastRun/abortCutoff 清回 false 之前由上层捕获并透传。仅用于会话级 abort 闸
+     * （orchestrator 停在 sessions_yield 挂起态时被 /stop，下一轮起手剥挂起态 + 注入修正说明）。
+     */
+    abortedLastRunBeforeReset?: boolean;
     extraSystemPrompt?: string;
     enforceFinalTag?: boolean;
   };

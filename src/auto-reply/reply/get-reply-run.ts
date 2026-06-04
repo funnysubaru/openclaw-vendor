@@ -529,6 +529,11 @@ export async function runPreparedReply(
       blockReplyBreak: resolvedBlockStreamingBreak,
       ownerNumbers: command.ownerList.length > 0 ? command.ownerList : undefined,
       inputProvenance: ctx.InputProvenance ?? sessionCtx.InputProvenance,
+      // 透传「上一轮是否被用户主动 abort」给嵌入式运行器，用于会话级 abort 闸
+      // （orchestrator 停在 sessions_yield 挂起态时被 /stop，下一轮起手剥挂起态 + 注入修正）。
+      // 此处 abortedLastRun 是 inbound 处理链早期从 sessionEntry 读出的内存值，在 applySessionHints
+      // 把持久 abortedLastRun 清回 false 之前就已捕获，因此即使磁盘标记已清也不丢失这次事实。
+      abortedLastRunBeforeReset: abortedLastRun,
       extraSystemPrompt: extraSystemPromptParts.join("\n\n") || undefined,
       ...(isReasoningTagProvider(provider) ? { enforceFinalTag: true } : {}),
     },

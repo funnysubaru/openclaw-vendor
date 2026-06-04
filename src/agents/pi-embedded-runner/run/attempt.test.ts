@@ -5,6 +5,7 @@ import {
   buildAfterTurnRuntimeContext,
   composeSystemPromptWithHookContext,
   isOllamaCompatProvider,
+  maybeResetOrchestratorYieldContextAfterUserAbort,
   prependSystemPromptAddition,
   resolveAttemptFsWorkspaceOnly,
   resolveOllamaCompatNumCtxEnabled,
@@ -1189,5 +1190,137 @@ describe("buildAfterTurnRuntimeContext", () => {
       workspaceDir: "/tmp/workspace",
       agentDir: "/tmp/agent",
     });
+  });
+});
+
+describe("maybeResetOrchestratorYieldContextAfterUserAbort", () => {
+  // 构造一个最小可断言的 live session 桩 + 可注入的 strip/inject 桩。
+  // strip 用 mock 记录是否被调；inject 用 mock 捕获注入的修正消息内容。
+  function makeFixture() {
+    const stripArtifacts = vi.fn();
+    const injectCalls: Array<{
+      customType: string;
+      content: string;
+      display: boolean;
+      triggerTurn?: boolean;
+    }> = [];
+    const sendCustomMessage = vi.fn(
+      async (
+        message: { customType: string; content: string; display: boolean },
+        options?: { triggerTurn?: boolean },
+      ) => {
+        injectCalls.push({ ...message, triggerTurn: options?.triggerTurn });
+      },
+    );
+    // activeSession 桩：messages/agent/sessionManager 让真实 strip 也能跑（这里默认用注入桩，
+    // 但保留这些字段以贴近真实形态）。
+    const activeSession = {
+      messages: [] as never[],
+      agent: { replaceMessages: vi.fn() },
+      sessionManager: undefined,
+      sendCustomMessage,
+    };
+    return { stripArtifacts, injectCalls, activeSession };
+  }
+
+  const yieldLeaf = {
+    type: "custom_message" as const,
+    customType: "openclaw.sessions_yield",
+  };
+
+  it("三条触发判据齐全 → 命中：剥挂起态 + 注入修正 custom_message（保留上下文，不删历史）", async () => {
+    const { stripArtifacts, injectCalls, activeSession } = makeFixture();
+
+    const decision = await maybeResetOrchestratorYieldContextAfterUserAbort({
+      leafEntry: yieldLeaf,
+      abortedLastRunBeforeReset: true,
+      inputProvenanceKind: "external_user",
+      activeSession,
+      stripArtifacts,
+    });
+
+    // 命中：执行了剥挂起态。
+    expect(decision.applied).toBe(true);
+    expect(decision.reason).toBe("applied");
+    expect(stripArtifacts).toHaveBeenCalledTimes(1);
+    expect(stripArtifacts).toHaveBeenCalledWith(activeSession);
+
+    // 命中：注入了一条隐藏的修正说明（display:false、triggerTurn:false、专用 customType）。
+    expect(injectCalls).toHaveLength(1);
+    expect(injectCalls[0].customType).toBe("openclaw.session_aborted_reset");
+    expect(injectCalls[0].display).toBe(false);
+    expect(injectCalls[0].triggerTurn).toBe(false);
+    // 文案要明确传达“子 agent 已终止、别等结果、要重新执行”三层意思。
+    expect(injectCalls[0].content).toMatch(/sub-agents/i);
+    expect(injectCalls[0].content).toMatch(/terminated|will NOT return/i);
+    expect(injectCalls[0].content).toMatch(/re-plan|re-spawn|continue/i);
+  });
+
+  it("缺 abort 标记（正常 yield 等 announce）→ 不命中：不剥、不注入，正常 resume", async () => {
+    const { stripArtifacts, injectCalls, activeSession } = makeFixture();
+
+    const decision = await maybeResetOrchestratorYieldContextAfterUserAbort({
+      leafEntry: yieldLeaf,
+      abortedLastRunBeforeReset: false, // 没有用户主动 abort
+      inputProvenanceKind: "external_user",
+      activeSession,
+      stripArtifacts,
+    });
+
+    expect(decision.applied).toBe(false);
+    expect(decision.reason).toBe("not-aborted");
+    expect(stripArtifacts).not.toHaveBeenCalled();
+    expect(injectCalls).toHaveLength(0);
+  });
+
+  it("输入是子 agent announce（inter_session）而非真实用户 → 不命中：正常 announce resume 不受影响", async () => {
+    const { stripArtifacts, injectCalls, activeSession } = makeFixture();
+
+    const decision = await maybeResetOrchestratorYieldContextAfterUserAbort({
+      leafEntry: yieldLeaf,
+      abortedLastRunBeforeReset: true,
+      inputProvenanceKind: "inter_session", // 子 agent announce
+      activeSession,
+      stripArtifacts,
+    });
+
+    expect(decision.applied).toBe(false);
+    expect(decision.reason).toBe("not-external-user");
+    expect(stripArtifacts).not.toHaveBeenCalled();
+    expect(injectCalls).toHaveLength(0);
+  });
+
+  it("leaf 不是 sessions_yield 挂起态 → 不命中", async () => {
+    const { stripArtifacts, injectCalls, activeSession } = makeFixture();
+
+    const decision = await maybeResetOrchestratorYieldContextAfterUserAbort({
+      leafEntry: { type: "message" }, // 普通消息 leaf，非 yield
+      abortedLastRunBeforeReset: true,
+      inputProvenanceKind: "external_user",
+      activeSession,
+      stripArtifacts,
+    });
+
+    expect(decision.applied).toBe(false);
+    expect(decision.reason).toBe("not-yield-leaf");
+    expect(stripArtifacts).not.toHaveBeenCalled();
+    expect(injectCalls).toHaveLength(0);
+  });
+
+  it("leaf 为 undefined（无会话历史）→ 不命中", async () => {
+    const { stripArtifacts, injectCalls, activeSession } = makeFixture();
+
+    const decision = await maybeResetOrchestratorYieldContextAfterUserAbort({
+      leafEntry: undefined,
+      abortedLastRunBeforeReset: true,
+      inputProvenanceKind: "external_user",
+      activeSession,
+      stripArtifacts,
+    });
+
+    expect(decision.applied).toBe(false);
+    expect(decision.reason).toBe("not-yield-leaf");
+    expect(stripArtifacts).not.toHaveBeenCalled();
+    expect(injectCalls).toHaveLength(0);
   });
 });

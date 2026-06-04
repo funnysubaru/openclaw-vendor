@@ -51,6 +51,7 @@ import {
 } from "../protocol/index.js";
 import { CHAT_SEND_SESSION_KEY_MAX_LENGTH } from "../protocol/schema/primitives.js";
 import { getMaxChatHistoryMessagesBytes } from "../server-constants.js";
+import { tearDownSessionRuntimeForAbort } from "../session-runtime-teardown.js";
 import {
   capArrayByJsonBytes,
   loadSessionEntry,
@@ -1004,6 +1005,24 @@ export const chatHandlers: GatewayRequestHandlers = {
     const ops = createChatAbortOps(context);
     const requester = resolveChatAbortRequester(client);
 
+    // Cascade: tear down the engine-native subagent subtree for this session.
+    // Fired EARLY — before the runId branching — on purpose. The explicit-runId branch
+    // below early-returns when chatAbortControllers has no entry for the runId (the
+    // "yield case": the panel sends a runId for a main chat run that already ended
+    // naturally, so its controller was already removed). If teardown lived in the branch
+    // tails, that early-return would skip it entirely and lingering subagents would keep
+    // running after Stop. Firing here covers every path (no-runId, runId-found,
+    // runId-not-found, even sessionKey mismatch) with one call.
+    //
+    // Session-wide blast radius — the engine has no run-scoped subagent kill, so this
+    // tears down ALL subagents under rawSessionKey. Gated on isAdmin as a forward-looking
+    // restriction point for any future non-admin client; the panel always connects with
+    // operator.admin, so this covers all panel Stop paths. Fire-and-forget so the abort
+    // response is never blocked on teardown.
+    if (requester.isAdmin) {
+      void tearDownSessionRuntimeForAbort({ sessionKey: rawSessionKey });
+    }
+
     if (!runId) {
       const res = abortChatRunsForSessionKeyWithPartials({
         context,
@@ -1017,6 +1036,7 @@ export const chatHandlers: GatewayRequestHandlers = {
         respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"));
         return;
       }
+      // Teardown already fired above (early, admin-gated) — covers this no-runId path.
       respond(true, { ok: true, aborted: res.aborted, runIds: res.runIds });
       return;
     }
@@ -1059,6 +1079,7 @@ export const chatHandlers: GatewayRequestHandlers = {
         ],
       });
     }
+    // Teardown already fired above (early, admin-gated) — covers this runId-found path.
     respond(true, {
       ok: true,
       aborted: res.aborted,

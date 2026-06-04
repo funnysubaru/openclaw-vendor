@@ -32,14 +32,16 @@ const commandQueueMocks = vi.hoisted(() => ({
 vi.mock("../../process/command-queue.js", () => commandQueueMocks);
 
 const subagentRegistryMocks = vi.hoisted(() => ({
-  listSubagentRunsForRequester: vi.fn<(requesterSessionKey: string) => SubagentRunRecord[]>(
+  // abort.ts 现在调 listSubagentRunsForController(aad014c7c1 起从 ForRequester 迁过来),
+  // 这里 mock 名必须对齐被测代码实际 import 的导出,否则 vi.mock 缺导出会整组报错。
+  listSubagentRunsForController: vi.fn<(controllerSessionKey: string) => SubagentRunRecord[]>(
     () => [],
   ),
   markSubagentRunTerminated: vi.fn(() => 1),
 }));
 
 vi.mock("../../agents/subagent-registry.js", () => ({
-  listSubagentRunsForRequester: subagentRegistryMocks.listSubagentRunsForRequester,
+  listSubagentRunsForController: subagentRegistryMocks.listSubagentRunsForController,
   markSubagentRunTerminated: subagentRegistryMocks.markSubagentRunTerminated,
 }));
 
@@ -529,7 +531,7 @@ describe("abort detection", () => {
       },
     });
 
-    subagentRegistryMocks.listSubagentRunsForRequester.mockReturnValueOnce([
+    subagentRegistryMocks.listSubagentRunsForController.mockReturnValueOnce([
       {
         runId: "run-1",
         childSessionKey: childKey,
@@ -570,7 +572,7 @@ describe("abort detection", () => {
     // First call: main session lists depth-1 children
     // Second call (cascade): depth-1 session lists depth-2 children
     // Third call (cascade from depth-2): no further children
-    subagentRegistryMocks.listSubagentRunsForRequester
+    subagentRegistryMocks.listSubagentRunsForController
       .mockReturnValueOnce([
         {
           runId: "run-1",
@@ -609,7 +611,7 @@ describe("abort detection", () => {
   });
 
   it("cascade stop traverses ended depth-1 parents to stop active depth-2 children", async () => {
-    subagentRegistryMocks.listSubagentRunsForRequester.mockClear();
+    subagentRegistryMocks.listSubagentRunsForController.mockClear();
     subagentRegistryMocks.markSubagentRunTerminated.mockClear();
     const sessionKey = "telegram:parent";
     const depth1Key = "agent:main:subagent:child-ended";
@@ -627,7 +629,7 @@ describe("abort detection", () => {
     // main -> ended depth-1 parent
     // depth-1 parent -> active depth-2 child
     // depth-2 child -> none
-    subagentRegistryMocks.listSubagentRunsForRequester
+    subagentRegistryMocks.listSubagentRunsForController
       .mockReturnValueOnce([
         {
           runId: "run-1",

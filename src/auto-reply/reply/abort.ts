@@ -1,14 +1,12 @@
 import { getAcpSessionManager } from "../../acp/control-plane/manager.js";
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { abortEmbeddedPiRun } from "../../agents/pi-embedded.js";
+import { markSessionAborted } from "../../agents/session-abort-guard.js";
 import {
   listSubagentRunsForController,
   markSubagentRunTerminated,
 } from "../../agents/subagent-registry.js";
-import {
-  resolveInternalSessionKey,
-  resolveMainSessionAlias,
-} from "../../agents/tools/sessions-helpers.js";
+import { normalizeControllerSessionKey } from "../../agents/tools/sessions-helpers.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import {
   loadSessionStore,
@@ -202,16 +200,15 @@ function resolveAbortTargetKey(ctx: MsgContext): string | undefined {
   return sessionKey || undefined;
 }
 
+/**
+ * 委托到 sessions-helpers.normalizeControllerSessionKey——单一来源保证归一正确性。
+ * 不在这里持有独立实现副本，防止后续「打标/查闸/清除」三处与本处发生 key 不一致的幽灵 bug。
+ */
 function normalizeRequesterSessionKey(
   cfg: OpenClawConfig,
   key: string | undefined,
 ): string | undefined {
-  const cleaned = key?.trim();
-  if (!cleaned) {
-    return undefined;
-  }
-  const { mainKey, alias } = resolveMainSessionAlias(cfg);
-  return resolveInternalSessionKey({ key: cleaned, alias, mainKey });
+  return normalizeControllerSessionKey(cfg, key);
 }
 
 export function stopSubagentsForRequester(params: {
@@ -373,6 +370,9 @@ export async function tryFastAbortFromMessage(params: {
     } else if (abortKey) {
       setAbortMemory(abortKey, true);
     }
+    // 打标：targetKey 路径 abort 成功，阻断后续 announce 唤醒 / spawn（session-abort-guard）。
+    // requesterSessionKey 内部已走 normalizeControllerSessionKey 归一，与查闸 key 一致。
+    markSessionAborted(cfg, requesterSessionKey);
     const { stopped } = stopSubagentsForRequester({ cfg, requesterSessionKey });
     return { handled: true, aborted, stoppedSubagents: stopped };
   }
@@ -380,6 +380,9 @@ export async function tryFastAbortFromMessage(params: {
   if (abortKey) {
     setAbortMemory(abortKey, true);
   }
+  // 打标：else 路径（无 targetKey）abort 成功，阻断后续 announce 唤醒 / spawn（session-abort-guard）。
+  // 同上，requesterSessionKey 归一后与 announce/spawn 查闸 key 对齐。
+  markSessionAborted(cfg, requesterSessionKey);
   const { stopped } = stopSubagentsForRequester({ cfg, requesterSessionKey });
   return { handled: true, aborted: false, stoppedSubagents: stopped };
 }

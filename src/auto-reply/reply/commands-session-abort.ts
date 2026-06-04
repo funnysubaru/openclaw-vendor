@@ -1,4 +1,5 @@
 import { abortEmbeddedPiRun } from "../../agents/pi-embedded.js";
+import { markSessionAborted } from "../../agents/session-abort-guard.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import { logVerbose } from "../../globals.js";
 import { createInternalHookEvent, triggerInternalHook } from "../../hooks/internal-hooks.js";
@@ -135,6 +136,11 @@ export const handleStopCommand: CommandHandler = async (params, allowTextCommand
   );
   await triggerInternalHook(hookEvent);
 
+  // 打标：/stop 命令 abort 成功，阻断后续 announce 唤醒 / spawn（session-abort-guard）。
+  // /stop 不经过 tryFastAbortFromMessage，是独立路径，必须在此处独立打标。
+  // key 与下方 stopSubagentsForRequester 保持一致（abortTarget.key ?? params.sessionKey），
+  // 内部由 markSessionAborted / normalizeControllerSessionKey 归一，与查闸 key 对齐。
+  markSessionAborted(params.cfg, abortTarget.key ?? params.sessionKey ?? "");
   const { stopped } = stopSubagentsForRequester({
     cfg: params.cfg,
     requesterSessionKey: abortTarget.key ?? params.sessionKey,

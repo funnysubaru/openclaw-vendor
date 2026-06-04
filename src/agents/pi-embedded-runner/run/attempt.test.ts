@@ -1291,7 +1291,7 @@ describe("maybeResetOrchestratorYieldContextAfterUserAbort", () => {
     expect(injectCalls).toHaveLength(0);
   });
 
-  it("面板 chat.send：provenance=undefined（普通用户无 provenance）→ 命中（判据 #3 放宽为 != inter_session）", async () => {
+  it("面板 chat.send：provenance=undefined（普通用户无 provenance）→ 命中（判据 #3 排除 inter_session/internal_system，放行 undefined）", async () => {
     // 这是两轮 live 复验失败的核心场景之一：面板用户 resume 时 systemInputProvenance 仅 ACP 桥可设，
     // 普通用户 ctx.InputProvenance 为 undefined。早先「必须 == external_user」会把这种 resume 误排除。
     const { stripArtifacts, injectCalls, activeSession } = makeFixture();

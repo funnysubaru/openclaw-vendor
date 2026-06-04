@@ -435,11 +435,12 @@ type OrchestratorYieldResetDecision = {
  *   2. 上一轮被用户主动 abort（abortedLastRunBeforeReset）。注意：持久化的 abortCutoff /
  *      abortedLastRun 在本函数执行之前、于 inbound 处理链更早阶段就已被清除（见交付说明），
  *      故此判据的数据来源是上层在“清除发生之前”捕获并透传进来的内存 flag，而非此处读盘。
- *   3. 本轮新输入不是子 agent announce 触发的 resume。判据放宽为「provenance != inter_session」：
- *      只有 inter_session（子 agent announce 回灌，见 subagent-announce.ts）才排除；用户触发的 resume
- *      一律放行——含 external_user（LINE 等渠道用户消息）与 undefined（面板 chat.send，普通用户无
- *      provenance、systemInputProvenance 仅 ACP 桥可设）。早先「必须 == external_user」会把面板用户
- *      的 resume（prov=undefined）误判为非用户输入而漏触发（历史 live 诊断 实测面板 prov=undefined）。
+ *   3. 本轮新输入是**用户主动触发**的 resume。判据为「provenance 既非 inter_session 也非 internal_system」，
+ *      与清闸 shouldClearAbortGuardForInbound(get-reply-inline-actions.ts:50) 严格对齐：排除 inter_session
+ *      （子 agent announce 回灌，见 subagent-announce.ts）与 internal_system（系统/cron 注入、非用户主动）；
+ *      放行 external_user（LINE 等渠道用户消息）与 undefined（面板 chat.send，普通用户无 provenance、
+ *      systemInputProvenance 仅 ACP 桥可设）。早先「必须 == external_user」会把面板用户的 resume
+ *      （prov=undefined）误判为非用户输入而漏触发（历史 live 诊断 实测面板 prov=undefined）。
  *
  * 命中后只做两件事，**不删任何历史**（保留更早成功轮次 + 本轮任务意图 + spawn 记录）：
  *   - stripSessionsYieldArtifacts：从 live transcript + jsonl 剥掉 yield 挂起工件并重设 leaf，
@@ -2531,7 +2532,7 @@ export async function runEmbeddedAttempt(
         });
 
         // Repair orphaned trailing user messages so new prompts don't violate role ordering.
-        const leafEntry = sessionManager.getLeafEntry();
+        let leafEntry = sessionManager.getLeafEntry();
 
         // 会话级 abort 闸（设计 C）：用户在 orchestrator 处于 sessions_yield 挂起态时 /stop 中止本轮，
         // 子 agent 已被杀但会话仍停在“等结果”挂起态；此处在新 prompt append 之前剥掉挂起工件并注入
@@ -2549,6 +2550,11 @@ export async function runEmbeddedAttempt(
             `session-abort guard: reset orchestrator sessions_yield context after user abort. ` +
               `runId=${params.runId} sessionId=${params.sessionId} sessionKey=${params.sessionKey}`,
           );
+          // 闸 strip 已重设 leaf（剥掉 yield 工件、leaf 退回 yield 之前的真实历史末端）。下面的
+          // orphan trailing user 修复必须基于**闸后**的最新 leaf —— 否则会拿闸前那条 yield
+          // custom_message leaf 去判（type 永远不是 "message" → 漏修闸后可能露出的 orphan user）。
+          // review 第2轮 #3。
+          leafEntry = sessionManager.getLeafEntry();
         }
 
         if (leafEntry?.type === "message" && leafEntry.message.role === "user") {

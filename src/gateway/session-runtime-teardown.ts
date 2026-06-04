@@ -16,7 +16,7 @@ import { stopSubagentsForRequester } from "../auto-reply/reply/abort.js";
 import { clearSessionQueues } from "../auto-reply/reply/queue.js";
 import { closeTrackedBrowserTabsForSessions } from "../browser/session-tab-registry.js";
 import { loadConfig } from "../config/config.js";
-import { loadSessionStore } from "../config/sessions.js";
+import { loadSessionStore, updateSessionStoreEntry } from "../config/sessions.js";
 import { logVerbose } from "../globals.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { resolveGatewaySessionStoreTarget } from "./session-utils.js";
@@ -143,6 +143,30 @@ export async function tearDownSessionRuntimeForAbort(params: {
   // 在第一个 teardown 动作（stop subagents）之前打标，保证闸在 abort 流程开始时即生效，
   // 不给 announce 趁虚而入的窗口。key 用 target.canonicalKey（已归一），cfg 同一份 loadConfig。
   markSessionAborted(cfg, target.canonicalKey);
+
+  // 持久化 orchestrator 的 abortedLastRun=true（与文本 /stop 的 persistAbortTargetEntry 对齐）。
+  //
+  // 为什么必须有这步（会话级 abort 闸的承重根因）：面板 chat.abort 走的是本 teardown，而文本 /stop
+  // 走 commands-session-abort.ts 的 applyAbortTarget→persistAbortTargetEntry。后者会把 orchestrator
+  // entry 的 abortedLastRun 写进 store；前者此前只打了内存闸（markSessionAborted），从不写盘。
+  // 于是面板 Stop 后，下一轮真实用户消息进入 get-reply 时，session.ts 从 store 读出的
+  // entry.abortedLastRun 恒为 false → 透传给嵌入式运行器的 abortedLastRunBeforeReset 恒 false →
+  // 「会话级 abort 闸」判据 #2 恒 false → 闸永不触发（live 复验失败的直接原因）。
+  //
+  // 这里对 target.canonicalKey（=orchestrator/controller，已归一，绝非子 agent）打标，
+  // 用 updateSessionStoreEntry：它在 entry 不存在时返回 null（不会凭空创建空 entry，避免把
+  // 一个无 sessionId 的 entry 塞进 store 害下一轮误判为新会话），存在则 merge 后写盘并刷新 updatedAt
+  // （刷新是必要的：下一轮 session.ts 的 freshEntry 判定依赖 updatedAt，刚写的标必然 fresh，读得到）。
+  //
+  // best-effort：包在 safeStep 里，store 写入失败（盘满/锁竞争）不能阻断后续 stop/closeTabs，
+  // 与其它 teardown 步骤一致的隔离语义。
+  await safeStep("persistAbortedFlag", sessionKey, () =>
+    updateSessionStoreEntry({
+      storePath: target.storePath,
+      sessionKey: target.canonicalKey,
+      update: async () => ({ abortedLastRun: true }),
+    }),
+  );
 
   // 1. Stop all spawned subagents (recursive, engine-native kill).
   let stoppedSubagents = 0;

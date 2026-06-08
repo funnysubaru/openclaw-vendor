@@ -75,6 +75,11 @@ export function createSessionsSpawnTool(
     sandboxed?: boolean;
     /** Explicit agent ID override for cron/hook sessions where session key parsing may not work. */
     requesterAgentIdOverride?: string;
+    /**
+     * 死锁守卫用：每次 runtime="subagent" 的 spawn 结算后回调，记录本轮 spawn 成败 + 错误文案。
+     * 仅 subagent 路径上报（acp 不走子代理登记，也非团队编排死锁场景）。见 subagent-yield-guard.ts。
+     */
+    onSpawnOutcome?: (ok: boolean, error?: string) => void;
   } & SpawnedToolContext,
 ): AnyAgentTool {
   return {
@@ -205,6 +210,11 @@ export function createSessionsSpawnTool(
           workspaceDir: opts?.workspaceDir,
         },
       );
+
+      // 死锁守卫上报：成功 = status==="accepted"（已 registerSubagentRun）；其余（forbidden/error）都算本轮失败，
+      // 把错误文案交给 tally，供 yield 边界拒绝时回传模型。
+      const spawnOk = (result as { status?: string }).status === "accepted";
+      opts?.onSpawnOutcome?.(spawnOk, spawnOk ? undefined : (result as { error?: string }).error);
 
       return jsonResult(result);
     },

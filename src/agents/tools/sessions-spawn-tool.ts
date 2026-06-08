@@ -219,12 +219,18 @@ export function createSessionsSpawnTool(
         suppressed?: boolean;
         childSessionKey?: string;
         error?: string;
+        note?: string;
       };
       const spawnOk =
         spawnResult.status === "accepted" &&
         !spawnResult.suppressed &&
         Boolean(spawnResult.childSessionKey);
-      opts?.onSpawnOutcome?.(spawnOk, spawnOk ? undefined : spawnResult.error);
+      // 失败回传：优先 error；abort 抑制的 no-op 壳通常只有 note（无 error），退回 note 把 abort 说明
+      // 透给模型，避免拒绝文案只剩兜底占位（review nit）。
+      opts?.onSpawnOutcome?.(
+        spawnOk,
+        spawnOk ? undefined : (spawnResult.error ?? spawnResult.note),
+      );
 
       return jsonResult(result);
     },

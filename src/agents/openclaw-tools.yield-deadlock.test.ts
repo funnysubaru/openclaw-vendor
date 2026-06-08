@@ -8,6 +8,7 @@ import {
   resetSubagentsConfigOverride,
   setSubagentsConfigOverride,
 } from "./openclaw-tools.subagents.test-harness.js";
+import { clearSessionAbort, markSessionAborted } from "./session-abort-guard.js";
 import { addSubagentRunForTests, resetSubagentRegistryForTests } from "./subagent-registry.js";
 import "./test-helpers/fast-core-tools.js";
 import { createPerSenderSessionConfig } from "./test-helpers/session-config.js";
@@ -145,6 +146,42 @@ describe("openclaw-tools: sessions_yield deadlock guard (integration)", () => {
     expect(yieldResult.details).toMatchObject({ status: "error" });
     expect((yieldResult.details as { error?: string }).error).toContain("sessions_yield refused");
     expect(onYield).not.toHaveBeenCalled();
+  });
+
+  it("abort 抑制的 no-op 壳不算成功 → yield 被拒，且回传文案含 abort note（nit: suppressed 壳）", async () => {
+    // 会话处于 abort 态时，spawnSubagentDirect 早返回 {status:"accepted", suppressed:true, note:"...aborting..."}
+    // 的 no-op 壳（没真起子代理、无 childSessionKey）。守卫必须把它当失败，否则又是「无真实唤醒源却 yield」。
+    markSessionAborted(config, "agent:main:main");
+    try {
+      const onYield = vi.fn();
+      const tools = createOpenClawTools({
+        agentSessionKey: "agent:main:main",
+        sessionId: "test-session",
+        config,
+        onYield,
+      });
+      const spawn = getTool(tools, "sessions_spawn");
+      const yieldTool = getTool(tools, "sessions_yield");
+
+      const spawnResult = await spawn.execute("call-spawn", {
+        task: "x",
+        agentId: "stock-analyst-bdcc7cf0",
+        mode: "run",
+      });
+      // 抑制壳：status=accepted 但 suppressed=true、无 childSessionKey
+      expect(spawnResult.details).toMatchObject({ status: "accepted", suppressed: true });
+
+      const yieldResult = await yieldTool.execute("call-yield", {});
+      expect(yieldResult.details).toMatchObject({ status: "error" });
+      const err = (yieldResult.details as { error?: string }).error ?? "";
+      expect(err).toContain("sessions_yield refused");
+      // nit#2：失败无 error 时退回 note，让模型看到 abort 说明而非兜底占位
+      expect(err).toContain("aborting");
+      expect(onYield).not.toHaveBeenCalled();
+    } finally {
+      // 必须清掉 abort 标记，否则泄漏到后续用例（spawn 会被抑制而非命中 allowlist）。
+      clearSessionAbort(config, "agent:main:main");
+    }
   });
 
   it("对照：纯空 yield（本轮没发起过 spawn）照常挂起，不属于本次保护范围", async () => {

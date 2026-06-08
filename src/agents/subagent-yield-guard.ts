@@ -35,7 +35,7 @@ export function createTurnSpawnTally(): TurnSpawnTally {
   return { attempted: 0, succeeded: 0, errors: [] };
 }
 
-/** 记录一次 sessions_spawn 结算到 tally。失败且带错误文案时收录，供拒绝时回传模型。 */
+/** 记录一次 sessions_spawn 结算到 tally。失败必收一条文案（无文案则兜底），供拒绝时回传模型。 */
 export function recordSpawnOutcome(
   tally: TurnSpawnTally,
   outcome: { ok: boolean; error?: string },

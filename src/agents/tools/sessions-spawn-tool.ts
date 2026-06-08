@@ -75,6 +75,11 @@ export function createSessionsSpawnTool(
     sandboxed?: boolean;
     /** Explicit agent ID override for cron/hook sessions where session key parsing may not work. */
     requesterAgentIdOverride?: string;
+    /**
+     * 死锁守卫用：每次 runtime="subagent" 的 spawn 结算后回调，记录本轮 spawn 成败 + 错误文案。
+     * 仅 subagent 路径上报（acp 不走子代理登记，也非团队编排死锁场景）。见 subagent-yield-guard.ts。
+     */
+    onSpawnOutcome?: (ok: boolean, error?: string) => void;
   } & SpawnedToolContext,
 ): AnyAgentTool {
   return {
@@ -128,17 +133,17 @@ export function createSessionsSpawnTool(
         : undefined;
 
       if (streamTo && runtime !== "acp") {
-        return jsonResult({
-          status: "error",
-          error: `streamTo is only supported for runtime=acp; got runtime=${runtime}`,
-        });
+        // 死锁守卫：runtime=subagent 下的参数校验失败也是「本轮发起过一次 subagent spawn 且失败」，
+        // 必须计入 tally，否则随后 yield 会被当纯空 yield 放行 → 仍可能死锁（review [中]）。
+        const error = `streamTo is only supported for runtime=acp; got runtime=${runtime}`;
+        opts?.onSpawnOutcome?.(false, error);
+        return jsonResult({ status: "error", error });
       }
 
       if (resumeSessionId && runtime !== "acp") {
-        return jsonResult({
-          status: "error",
-          error: `resumeSessionId is only supported for runtime=acp; got runtime=${runtime}`,
-        });
+        const error = `resumeSessionId is only supported for runtime=acp; got runtime=${runtime}`;
+        opts?.onSpawnOutcome?.(false, error);
+        return jsonResult({ status: "error", error });
       }
 
       if (runtime === "acp") {
@@ -204,6 +209,27 @@ export function createSessionsSpawnTool(
           requesterAgentIdOverride: opts?.requesterAgentIdOverride,
           workspaceDir: opts?.workspaceDir,
         },
+      );
+
+      // 死锁守卫上报：成功必须是【真正起了子代理】—— status==="accepted" 且非 abort 抑制壳（suppressed）
+      // 且带 childSessionKey（已 registerSubagentRun）。否则（forbidden/error，或 abort 抑制的 no-op 壳）
+      // 都算本轮失败，把错误文案交给 tally，供 yield 边界拒绝时回传模型（review [低]：accepted 判定过宽）。
+      const spawnResult = result as {
+        status?: string;
+        suppressed?: boolean;
+        childSessionKey?: string;
+        error?: string;
+        note?: string;
+      };
+      const spawnOk =
+        spawnResult.status === "accepted" &&
+        !spawnResult.suppressed &&
+        Boolean(spawnResult.childSessionKey);
+      // 失败回传：优先 error；abort 抑制的 no-op 壳通常只有 note（无 error），退回 note 把 abort 说明
+      // 透给模型，避免拒绝文案只剩兜底占位（review nit）。
+      opts?.onSpawnOutcome?.(
+        spawnOk,
+        spawnOk ? undefined : (spawnResult.error ?? spawnResult.note),
       );
 
       return jsonResult(result);

@@ -1,10 +1,18 @@
 import type { OpenClawConfig } from "../config/config.js";
+import { logVerbose } from "../globals.js";
 import { resolvePluginTools } from "../plugins/tools.js";
 import { getActiveRuntimeWebToolsMetadata } from "../secrets/runtime.js";
 import type { GatewayMessageChannel } from "../utils/message-channel.js";
 import { resolveSessionAgentId } from "./agent-scope.js";
 import type { SandboxFsBridge } from "./sandbox/fs-bridge.js";
 import type { SpawnedToolContext } from "./spawned-context.js";
+import { countActiveRunsForSession } from "./subagent-registry.js";
+import {
+  buildDeadlockYieldRefusalMessage,
+  createTurnSpawnTally,
+  recordSpawnOutcome,
+  shouldRefuseDeadlockYield,
+} from "./subagent-yield-guard.js";
 import type { ToolFsPolicy } from "./tool-fs-policy.js";
 import { createAgentsListTool } from "./tools/agents-list-tool.js";
 import { createBrowserTool } from "./tools/browser-tool.js";
@@ -17,6 +25,7 @@ import { createMessageTool } from "./tools/message-tool.js";
 import { createNodesTool } from "./tools/nodes-tool.js";
 import { createPdfTool } from "./tools/pdf-tool.js";
 import { createSessionStatusTool } from "./tools/session-status-tool.js";
+import { resolveInternalSessionKey, resolveMainSessionAlias } from "./tools/sessions-helpers.js";
 import { createSessionsHistoryTool } from "./tools/sessions-history-tool.js";
 import { createSessionsListTool } from "./tools/sessions-list-tool.js";
 import { createSessionsSendTool } from "./tools/sessions-send-tool.js";
@@ -86,6 +95,9 @@ export function createOpenClawTools(
   const spawnWorkspaceDir = resolveWorkspaceRoot(
     options?.spawnWorkspaceDir ?? options?.workspaceDir,
   );
+  // 死锁守卫：本工具集每个 attempt 构造一次，tally 随之新建 → 恰好 per-attempt 累计本轮 spawn 成败。
+  // sessions_spawn 写入、sessions_yield 读取（二者共享同一引用），用于在 yield 边界识别「空挂起」死锁。
+  const turnSpawnTally = createTurnSpawnTally();
   const runtimeWebTools = getActiveRuntimeWebToolsMetadata();
   const imageTool = options?.agentDir?.trim()
     ? createImageTool({
@@ -187,6 +199,33 @@ export function createOpenClawTools(
     createSessionsYieldTool({
       sessionId: options?.sessionId,
       onYield: options?.onYield,
+      // 死锁守卫：挂起前判定本轮是否「spawn 全败 + 无活跃子代理」。activeSubagents 实时查 registry
+      // （覆盖前轮还在跑的子代理，避免误杀合法等待）。缺会话上下文/未发起过 spawn 时返回 null → 放行原行为。
+      guardDeadlockYield: () => {
+        const cfg = options?.config;
+        const sessionKey = options?.agentSessionKey;
+        if (!cfg || !sessionKey) {
+          // 守卫降级放行：团队 orchestrator 路径（attempt.ts → createOpenClawCodingTools）恒带 config+agentSessionKey。
+          // 缺失说明有调用方漏传接线 → verbose 下记一条便于回归排查（正常路径不触发、零噪音；review [低]）。
+          logVerbose(
+            "[yield-guard] bypassed: missing config or agentSessionKey on createOpenClawTools",
+          );
+          return null;
+        }
+        const { mainKey, alias } = resolveMainSessionAlias(cfg);
+        const internalKey = resolveInternalSessionKey({ key: sessionKey, alias, mainKey });
+        const activeSubagents = countActiveRunsForSession(internalKey);
+        if (
+          !shouldRefuseDeadlockYield({
+            spawnAttempted: turnSpawnTally.attempted,
+            spawnSucceeded: turnSpawnTally.succeeded,
+            activeSubagents,
+          })
+        ) {
+          return null;
+        }
+        return buildDeadlockYieldRefusalMessage(turnSpawnTally.errors);
+      },
     }),
     createSessionsSpawnTool({
       agentSessionKey: options?.agentSessionKey,
@@ -200,6 +239,8 @@ export function createOpenClawTools(
       sandboxed: options?.sandboxed,
       requesterAgentIdOverride: options?.requesterAgentIdOverride,
       workspaceDir: spawnWorkspaceDir,
+      // 死锁守卫：记录本轮每次 subagent spawn 的成败 + 错误，供 sessions_yield 边界判定。
+      onSpawnOutcome: (ok, error) => recordSpawnOutcome(turnSpawnTally, { ok, error }),
     }),
     createSubagentsTool({
       agentSessionKey: options?.agentSessionKey,

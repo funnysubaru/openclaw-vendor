@@ -1,4 +1,5 @@
 import type { OpenClawConfig } from "../config/config.js";
+import { logVerbose } from "../globals.js";
 import { resolvePluginTools } from "../plugins/tools.js";
 import { getActiveRuntimeWebToolsMetadata } from "../secrets/runtime.js";
 import type { GatewayMessageChannel } from "../utils/message-channel.js";
@@ -204,6 +205,11 @@ export function createOpenClawTools(
         const cfg = options?.config;
         const sessionKey = options?.agentSessionKey;
         if (!cfg || !sessionKey) {
+          // 守卫降级放行：团队 orchestrator 路径（attempt.ts → createOpenClawCodingTools）恒带 config+agentSessionKey。
+          // 缺失说明有调用方漏传接线 → verbose 下记一条便于回归排查（正常路径不触发、零噪音；review [低]）。
+          logVerbose(
+            "[yield-guard] bypassed: missing config or agentSessionKey on createOpenClawTools",
+          );
           return null;
         }
         const { mainKey, alias } = resolveMainSessionAlias(cfg);

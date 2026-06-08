@@ -133,17 +133,17 @@ export function createSessionsSpawnTool(
         : undefined;
 
       if (streamTo && runtime !== "acp") {
-        return jsonResult({
-          status: "error",
-          error: `streamTo is only supported for runtime=acp; got runtime=${runtime}`,
-        });
+        // 死锁守卫：runtime=subagent 下的参数校验失败也是「本轮发起过一次 subagent spawn 且失败」，
+        // 必须计入 tally，否则随后 yield 会被当纯空 yield 放行 → 仍可能死锁（review [中]）。
+        const error = `streamTo is only supported for runtime=acp; got runtime=${runtime}`;
+        opts?.onSpawnOutcome?.(false, error);
+        return jsonResult({ status: "error", error });
       }
 
       if (resumeSessionId && runtime !== "acp") {
-        return jsonResult({
-          status: "error",
-          error: `resumeSessionId is only supported for runtime=acp; got runtime=${runtime}`,
-        });
+        const error = `resumeSessionId is only supported for runtime=acp; got runtime=${runtime}`;
+        opts?.onSpawnOutcome?.(false, error);
+        return jsonResult({ status: "error", error });
       }
 
       if (runtime === "acp") {
@@ -211,10 +211,20 @@ export function createSessionsSpawnTool(
         },
       );
 
-      // 死锁守卫上报：成功 = status==="accepted"（已 registerSubagentRun）；其余（forbidden/error）都算本轮失败，
-      // 把错误文案交给 tally，供 yield 边界拒绝时回传模型。
-      const spawnOk = (result as { status?: string }).status === "accepted";
-      opts?.onSpawnOutcome?.(spawnOk, spawnOk ? undefined : (result as { error?: string }).error);
+      // 死锁守卫上报：成功必须是【真正起了子代理】—— status==="accepted" 且非 abort 抑制壳（suppressed）
+      // 且带 childSessionKey（已 registerSubagentRun）。否则（forbidden/error，或 abort 抑制的 no-op 壳）
+      // 都算本轮失败，把错误文案交给 tally，供 yield 边界拒绝时回传模型（review [低]：accepted 判定过宽）。
+      const spawnResult = result as {
+        status?: string;
+        suppressed?: boolean;
+        childSessionKey?: string;
+        error?: string;
+      };
+      const spawnOk =
+        spawnResult.status === "accepted" &&
+        !spawnResult.suppressed &&
+        Boolean(spawnResult.childSessionKey);
+      opts?.onSpawnOutcome?.(spawnOk, spawnOk ? undefined : spawnResult.error);
 
       return jsonResult(result);
     },

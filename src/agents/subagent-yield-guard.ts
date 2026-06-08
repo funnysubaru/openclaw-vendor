@@ -43,8 +43,10 @@ export function recordSpawnOutcome(
   tally.attempted += 1;
   if (outcome.ok) {
     tally.succeeded += 1;
-  } else if (outcome.error) {
-    tally.errors.push(outcome.error);
+  } else {
+    // 失败必收一条文案（缺省也兜底）：拒绝判据看 attempted/succeeded，但 buildDeadlockYieldRefusalMessage
+    // 要靠 errors 给模型可操作细节；若某条失败没带 error 文案，至少留个占位，避免回传文案空洞。
+    tally.errors.push(outcome.error ?? "sessions_spawn failed (no detail)");
   }
 }
 

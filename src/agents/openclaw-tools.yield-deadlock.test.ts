@@ -121,6 +121,32 @@ describe("openclaw-tools: sessions_yield deadlock guard (integration)", () => {
     expect(onYield).toHaveBeenCalledOnce();
   });
 
+  it("参数校验失败的 spawn 也算本轮失败尝试 → 随后 yield 同样被拒（[中] early-return tally）", async () => {
+    const onYield = vi.fn();
+    const tools = createOpenClawTools({
+      agentSessionKey: "agent:main:main",
+      sessionId: "test-session",
+      config,
+      onYield,
+    });
+    const spawn = getTool(tools, "sessions_spawn");
+    const yieldTool = getTool(tools, "sessions_yield");
+
+    // streamTo 只对 runtime=acp 合法；这里 runtime 默认 subagent → 在 spawnSubagentDirect 之前 early-return error。
+    // 这仍是「本轮发起过一次 spawn 且失败」，必须计入 tally，否则随后 yield 会被当纯空 yield 放行 → 仍可能死锁。
+    const spawnResult = await spawn.execute("call-spawn", {
+      task: "x",
+      agentId: "stock-analyst-bdcc7cf0",
+      streamTo: "parent",
+    });
+    expect(spawnResult.details).toMatchObject({ status: "error" });
+
+    const yieldResult = await yieldTool.execute("call-yield", {});
+    expect(yieldResult.details).toMatchObject({ status: "error" });
+    expect((yieldResult.details as { error?: string }).error).toContain("sessions_yield refused");
+    expect(onYield).not.toHaveBeenCalled();
+  });
+
   it("对照：纯空 yield（本轮没发起过 spawn）照常挂起，不属于本次保护范围", async () => {
     const onYield = vi.fn();
     const tools = createOpenClawTools({

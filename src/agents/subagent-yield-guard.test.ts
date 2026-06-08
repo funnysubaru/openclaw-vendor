@@ -57,6 +57,16 @@ describe("subagent yield deadlock guard", () => {
       });
     });
 
+    it("失败但无 error 文案：attempted +1，errors 收兜底文案（保证拒绝时有可操作细节）", () => {
+      const tally = createTurnSpawnTally();
+      recordSpawnOutcome(tally, { ok: false });
+      expect(tally).toEqual({
+        attempted: 1,
+        succeeded: 0,
+        errors: ["sessions_spawn failed (no detail)"],
+      });
+    });
+
     it("多次混合结算累计正确", () => {
       const tally = createTurnSpawnTally();
       recordSpawnOutcome(tally, { ok: false, error: "e1" });

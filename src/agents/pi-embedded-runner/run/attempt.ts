@@ -8,6 +8,11 @@ import {
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
 import { resolveHeartbeatPrompt } from "../../../auto-reply/heartbeat.js";
+// PLG 计费切面：从全局 registry 取注入的 BillingHooks，wrap 到 streamFn 栈
+import {
+  getBillingHooks,
+  wrapProviderWithBilling,
+} from "../../../billing/provider-billing-hooks.js";
 import { resolveChannelCapabilities } from "../../../config/channel-capabilities.js";
 import type { OpenClawConfig } from "../../../config/config.js";
 import { getMachineDisplayName } from "../../../infra/machine-name.js";
@@ -31,6 +36,7 @@ import { buildTtsSystemPromptHint } from "../../../tts/tts.js";
 import { resolveUserPath } from "../../../utils.js";
 import { normalizeMessageChannel } from "../../../utils/message-channel.js";
 import { isReasoningTagProvider } from "../../../utils/provider-utils.js";
+import { resolveModelCostConfig } from "../../../utils/usage-format.js";
 import { resolveOpenClawAgentDir } from "../../agent-paths.js";
 import { resolveSessionAgentIds } from "../../agent-scope.js";
 import { createAnthropicPayloadLogger } from "../../anthropic-payload-log.js";
@@ -2073,6 +2079,35 @@ export async function runEmbeddedAttempt(
       } else {
         // Force a stable streamFn reference so vitest can reliably mock @mariozechner/pi-ai.
         activeSession.agent.streamFn = streamSimple;
+      }
+
+      // PLG 计费切面：在所有 provider 赋值完成后、其余 wrap 之前插入。
+      // getBillingHooks() 从全局 registry 取 Yuiclaw extension 注入的实现；
+      // 未注入时返回 null → wrapProviderWithBilling 原样透传 baseFn，零开销。
+      // 这里是 streamFn 栈里最早的一层 wrap，确保能看到每一次真实 LLM 调用（含多轮 tool-call 续接）。
+      {
+        const billingHooks = getBillingHooks();
+        // 取模型单价配置，用于 postCharge 时即时算 costUsd（单价来自 config，不重造公式）
+        const billingModelCost = resolveModelCostConfig({
+          provider: params.provider,
+          model: params.modelId,
+          config: params.config,
+        });
+        activeSession.agent.streamFn = wrapProviderWithBilling(
+          activeSession.agent.streamFn,
+          billingHooks,
+          {
+            modelName: params.modelId,
+            provider: params.provider,
+            sessionKey: params.sessionKey,
+            sessionId: params.sessionId,
+            runId: params.runId,
+            agentId: sessionAgentId,
+            // messageChannel 用于 Yuiclaw 侧映射到 ChargeSource（panel-chat / line / cron 等）
+            messageChannel: params.messageChannel ?? params.messageProvider ?? undefined,
+            modelCost: billingModelCost,
+          },
+        );
       }
 
       // Ollama with OpenAI-compatible API needs num_ctx in payload.options.

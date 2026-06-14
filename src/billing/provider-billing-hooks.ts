@@ -26,8 +26,15 @@ import { randomUUID } from "node:crypto";
 import type { StreamFn } from "@mariozechner/pi-agent-core";
 import type { NormalizedUsage } from "../agents/usage.js";
 import { normalizeUsage } from "../agents/usage.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import type { ModelCostConfig } from "../utils/usage-format.js";
 import { estimateUsageCost } from "../utils/usage-format.js";
+
+/**
+ * billing 子系统日志通道，与 plugins / hooks 系列保持一致的过滤维度。
+ * gateway 日志过滤时用 subsystem="billing" 即可隔离计费相关 warn/error。
+ */
+const log = createSubsystemLogger("billing");
 
 // =============================================================================
 // BillingHooks 接口
@@ -250,9 +257,10 @@ export function wrapProviderWithBilling(
       } catch (preCheckErr) {
         // preCheck 本身抛错（如 BFF 不可达）：fail-open，继续调用
         // 记录警告但不阻断，避免 billing 基础设施故障影响正常使用
-        console.warn(
-          `[billing] preCheck threw, failing open. eventId=${eventId} err=${String(preCheckErr)}`,
-        );
+        log.warn("preCheck threw, failing open", {
+          eventId,
+          err: String(preCheckErr),
+        });
         checkResult = { allowed: true };
       }
 
@@ -269,7 +277,10 @@ export function wrapProviderWithBilling(
       } catch (baseFnErr) {
         // baseFn 同步抛错（极罕见，但防御一下）
         hooks.cancelReservation(callCtx).catch((err) => {
-          console.warn(`[billing] cancelReservation failed. eventId=${eventId} err=${String(err)}`);
+          log.warn("cancelReservation failed after baseFn sync throw", {
+            eventId,
+            err: String(err),
+          });
         });
         throw baseFnErr;
       }
@@ -284,9 +295,10 @@ export function wrapProviderWithBilling(
           (err) => {
             // baseFn Promise reject
             hooks.cancelReservation(callCtx).catch((cancelErr) => {
-              console.warn(
-                `[billing] cancelReservation failed. eventId=${eventId} err=${String(cancelErr)}`,
-              );
+              log.warn("cancelReservation failed after baseFn Promise reject", {
+                eventId,
+                err: String(cancelErr),
+              });
             });
             throw err;
           },
@@ -328,7 +340,17 @@ function wrapBillingStream(
   // 这是取 usage 最可靠的时机（流已完整消费完）。
   const originalResult = (stream as { result?: () => Promise<unknown> }).result?.bind(stream);
 
-  if (originalResult) {
+  if (!originalResult) {
+    // stream 没有 result() 方法（异常 provider 返回了不完整的流对象）：
+    // billing postCharge 依赖 result() 权威路径获取 usage；
+    // 缺失时无法扣费，记录 warn 并跳过（不静默丢失——至少留下可追查的日志）。
+    // 若未来某 provider 的流形态确实不含 result()，需在这里补对应的 usage 取法。
+    log.warn("stream has no result() method; postCharge will be skipped for this call", {
+      eventId: callCtx.eventId,
+      modelName: callCtx.modelName,
+      provider: callCtx.provider,
+    });
+  } else {
     (stream as { result: () => Promise<unknown> }).result = async () => {
       try {
         const message = await originalResult();
@@ -349,18 +371,20 @@ function wrapBillingStream(
             costUsd,
           })
           .catch((err) => {
-            console.warn(
-              `[billing] postCharge failed. eventId=${callCtx.eventId} err=${String(err)}`,
-            );
+            log.warn("postCharge failed", {
+              eventId: callCtx.eventId,
+              err: String(err),
+            });
           });
 
         return message;
       } catch (err) {
         // result() 抛错（流本身出错 / abort）→ cancelReservation
         hooks.cancelReservation(callCtx).catch((cancelErr) => {
-          console.warn(
-            `[billing] cancelReservation failed. eventId=${callCtx.eventId} err=${String(cancelErr)}`,
-          );
+          log.warn("cancelReservation failed after result() threw", {
+            eventId: callCtx.eventId,
+            err: String(cancelErr),
+          });
         });
         throw err;
       }
@@ -388,9 +412,10 @@ function wrapBillingStream(
             } catch (err) {
               // 迭代中途抛错（流 error / abort）
               hooks.cancelReservation(callCtx).catch((cancelErr) => {
-                console.warn(
-                  `[billing] cancelReservation (iter) failed. eventId=${callCtx.eventId} err=${String(cancelErr)}`,
-                );
+                log.warn("cancelReservation (iter) failed", {
+                  eventId: callCtx.eventId,
+                  err: String(cancelErr),
+                });
               });
               throw err;
             }

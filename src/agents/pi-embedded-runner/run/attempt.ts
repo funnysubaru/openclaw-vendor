@@ -2083,31 +2083,34 @@ export async function runEmbeddedAttempt(
 
       // PLG 计费切面：在所有 provider 赋值完成后、其余 wrap 之前插入。
       // getBillingHooks() 从全局 registry 取 Yuiclaw extension 注入的实现；
-      // 未注入时返回 null → wrapProviderWithBilling 原样透传 baseFn，零开销。
+      // 未注入时（null）整块跳过，零开销——resolveModelCostConfig 也不会执行。
       // 这里是 streamFn 栈里最早的一层 wrap，确保能看到每一次真实 LLM 调用（含多轮 tool-call 续接）。
       {
         const billingHooks = getBillingHooks();
-        // 取模型单价配置，用于 postCharge 时即时算 costUsd（单价来自 config，不重造公式）
-        const billingModelCost = resolveModelCostConfig({
-          provider: params.provider,
-          model: params.modelId,
-          config: params.config,
-        });
-        activeSession.agent.streamFn = wrapProviderWithBilling(
-          activeSession.agent.streamFn,
-          billingHooks,
-          {
-            modelName: params.modelId,
+        if (billingHooks) {
+          // 取模型单价配置，用于 postCharge 时即时算 costUsd（单价来自 config，不重造公式）。
+          // 仅在 hooks 存在时执行，避免未注册场景浪费查询开销。
+          const billingModelCost = resolveModelCostConfig({
             provider: params.provider,
-            sessionKey: params.sessionKey,
-            sessionId: params.sessionId,
-            runId: params.runId,
-            agentId: sessionAgentId,
-            // messageChannel 用于 Yuiclaw 侧映射到 ChargeSource（panel-chat / line / cron 等）
-            messageChannel: params.messageChannel ?? params.messageProvider ?? undefined,
-            modelCost: billingModelCost,
-          },
-        );
+            model: params.modelId,
+            config: params.config,
+          });
+          activeSession.agent.streamFn = wrapProviderWithBilling(
+            activeSession.agent.streamFn,
+            billingHooks,
+            {
+              modelName: params.modelId,
+              provider: params.provider,
+              sessionKey: params.sessionKey,
+              sessionId: params.sessionId,
+              runId: params.runId,
+              agentId: sessionAgentId,
+              // messageChannel 用于 Yuiclaw 侧映射到 ChargeSource（panel-chat / line / cron 等）
+              messageChannel: params.messageChannel ?? params.messageProvider ?? undefined,
+              modelCost: billingModelCost,
+            },
+          );
+        }
       }
 
       // Ollama with OpenAI-compatible API needs num_ctx in payload.options.

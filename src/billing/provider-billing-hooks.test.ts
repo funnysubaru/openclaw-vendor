@@ -9,6 +9,10 @@
  *   5. result() 抛错（流 error） → cancelReservation，不调 postCharge
  *   6. 多次调用 → 每次独立计费（N 次 postCharge）
  *   7. preCheck 抛错 → fail-open，继续调用 baseFn
+ *   8. registry 验证（setBillingHooks / getBillingHooks / clearBillingHooks）
+ *   9. modelCost 缺失时 costUsd 为 undefined
+ *  10. baseFn 返回 Promise<stream>（异步路径）→ preCheck + postCharge 全链路正常
+ *  11. stream 无 result() 方法 → 不触发 postCharge（且不 throw）
  */
 
 import type { StreamFn } from "@mariozechner/pi-agent-core";
@@ -127,8 +131,8 @@ describe("wrapProviderWithBilling", () => {
     // 消费 result()
     await streamResult.result();
 
-    // 等一个 microtask tick，让 postCharge Promise 跑完
-    await Promise.resolve();
+    // 用 vi.waitFor 等 postCharge 真正被调用，避免微任务链加深后测试偶发失败
+    await vi.waitFor(() => expect(postCharge).toHaveBeenCalledTimes(1));
 
     expect(preCheck).toHaveBeenCalledTimes(1);
     expect(baseFn).toHaveBeenCalledTimes(1);
@@ -180,8 +184,8 @@ describe("wrapProviderWithBilling", () => {
 
     await expect((wrapped as Function)({}, {}, {})).rejects.toThrow("provider error");
 
-    // 等 cancel promise
-    await Promise.resolve();
+    // 用 vi.waitFor 等 cancelReservation 真正被调用
+    await vi.waitFor(() => expect(cancelReservation).toHaveBeenCalledTimes(1));
 
     expect(preCheck).toHaveBeenCalledTimes(1);
     expect(baseFn).toHaveBeenCalledTimes(1);
@@ -207,11 +211,10 @@ describe("wrapProviderWithBilling", () => {
     const streamResult = await (wrapped as Function)({}, {}, {});
     await expect(streamResult.result()).rejects.toThrow("stream error");
 
-    // 等 cancel promise
-    await Promise.resolve();
+    // 用 vi.waitFor 等 cancelReservation 真正被调用
+    await vi.waitFor(() => expect(cancelReservation).toHaveBeenCalledTimes(1));
 
     expect(postCharge).not.toHaveBeenCalled();
-    expect(cancelReservation).toHaveBeenCalledTimes(1);
   });
 
   // ---------------------------------------------------------------------------
@@ -229,9 +232,8 @@ describe("wrapProviderWithBilling", () => {
       const s = await (wrapped as Function)({}, {}, {});
       await s.result();
     }
-    await Promise.resolve();
-
-    expect(postCharge).toHaveBeenCalledTimes(3);
+    // 用 vi.waitFor 等所有 postCharge fire-and-forget 全部完成
+    await vi.waitFor(() => expect(postCharge).toHaveBeenCalledTimes(3));
 
     // 每次 eventId 不同
     const eventIds = postCharge.mock.calls.map((call) => call[0].eventId);
@@ -255,10 +257,10 @@ describe("wrapProviderWithBilling", () => {
     // 不应抛错（fail-open）
     const streamResult = await (wrapped as Function)({}, {}, {});
     await streamResult.result();
-    await Promise.resolve();
+    // 用 vi.waitFor 等 postCharge fire-and-forget 完成
+    await vi.waitFor(() => expect(postCharge).toHaveBeenCalledTimes(1));
 
     expect(baseFn).toHaveBeenCalledTimes(1);
-    expect(postCharge).toHaveBeenCalledTimes(1);
   });
 
   // ---------------------------------------------------------------------------
@@ -284,9 +286,94 @@ describe("wrapProviderWithBilling", () => {
 
     const s = await (wrapped as Function)({}, {}, {});
     await s.result();
-    await Promise.resolve();
+    await vi.waitFor(() => expect(postCharge).toHaveBeenCalledTimes(1));
 
-    expect(postCharge).toHaveBeenCalledTimes(1);
     expect(postCharge.mock.calls[0]?.[0].costUsd).toBeUndefined();
+  });
+
+  // ---------------------------------------------------------------------------
+  // 10. baseFn 返回 Promise<stream>（异步路径）→ preCheck + postCharge 全链路正常
+  // ---------------------------------------------------------------------------
+  it("baseFn 返回 Promise<stream> 时，preCheck → result() → postCharge 全链路正常触发", async () => {
+    // 这条测试覆盖 openai-responses WebSocket 等异步 provider 的生产路径：
+    // baseFn 不同步返回 stream，而是返回一个 Promise，resolve 后才有流对象。
+    // wrapProviderWithBilling 里的 `"then" in stream` 分支负责处理这条路径。
+    const { hooks, preCheck, postCharge, cancelReservation } = createMockHooks(true);
+
+    const mockStream = createMockStream({ input_tokens: 200, output_tokens: 100 });
+    // baseFn 返回 Promise.resolve(stream) 模拟异步 provider
+    const baseFn = vi.fn(() => Promise.resolve(mockStream)) as unknown as StreamFn;
+
+    const wrapped = wrapProviderWithBilling(baseFn, hooks, BASE_PARAMS);
+
+    // wrapped 本身也是 Promise（因为 doCall 整体是 async）
+    const streamResult = await (wrapped as Function)({}, {}, {});
+
+    // 消费 result()，触发 postCharge
+    await streamResult.result();
+
+    // 等 postCharge fire-and-forget 完成
+    await vi.waitFor(() => expect(postCharge).toHaveBeenCalledTimes(1));
+
+    expect(preCheck).toHaveBeenCalledTimes(1);
+    expect(baseFn).toHaveBeenCalledTimes(1);
+    expect(cancelReservation).not.toHaveBeenCalled();
+
+    // 校验 postCharge 收到了正确的 usage
+    const postChargeCtx = postCharge.mock.calls[0]?.[0];
+    expect(postChargeCtx.usage?.input).toBe(200);
+    expect(postChargeCtx.usage?.output).toBe(100);
+    // cost = (200 * 3 + 100 * 15) / 1_000_000 = 0.0021
+    expect(postChargeCtx.costUsd).toBeCloseTo(0.0021, 6);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 11. stream 无 result() 方法 → 不触发 postCharge，不 throw
+  // ---------------------------------------------------------------------------
+  it("stream 没有 result() 方法时，不触发 postCharge 且不抛错（billing postCharge 依赖 result() 权威路径）", async () => {
+    // 防止未来某 provider 返回不含 result() 的流时出现 silent failure（调用成功但漏扣费）。
+    // 期望行为：warn 日志记录 + postCharge 跳过 + 主流程不受影响。
+    const { hooks, postCharge, cancelReservation } = createMockHooks(true);
+
+    // 构造一个没有 result() 的最小流对象
+    const streamWithoutResult = {
+      // 故意不带 result 字段
+      [Symbol.asyncIterator]: vi.fn(function () {
+        let done = false;
+        return {
+          async next() {
+            if (!done) {
+              done = true;
+              return { done: false, value: { type: "text_delta", delta: "hi" } };
+            }
+            return { done: true, value: undefined };
+          },
+          async return(value?: unknown) {
+            return { done: true as const, value };
+          },
+          async throw(error?: unknown) {
+            throw error;
+          },
+        };
+      }),
+    };
+
+    const baseFn = vi.fn(() => streamWithoutResult) as unknown as StreamFn;
+    const wrapped = wrapProviderWithBilling(baseFn, hooks, BASE_PARAMS);
+
+    // 不应抛错
+    const streamResult = await (wrapped as Function)({}, {}, {});
+    expect(streamResult).toBeDefined();
+
+    // 迭代流，正常消费
+    for await (const _chunk of streamResult as AsyncIterable<unknown>) {
+      // 消费完即可
+    }
+
+    // postCharge 不应被调用（无 result() 权威路径）
+    // 给一小段时间让任何可能的 fire-and-forget 跑完
+    await Promise.resolve();
+    expect(postCharge).not.toHaveBeenCalled();
+    expect(cancelReservation).not.toHaveBeenCalled();
   });
 });

@@ -12,11 +12,53 @@
  *   8. registry 验证（setBillingHooks / getBillingHooks / clearBillingHooks）
  *   9. modelCost 缺失时 costUsd 为 undefined
  *  10. baseFn 返回 Promise<stream>（异步路径）→ preCheck + postCharge 全链路正常
- *  11. stream 无 result() 方法 → 不触发 postCharge（且不 throw）
+ *  11. stream 无 result() 方法 → 不触发 postCharge（且打了 warn 日志）
+ *  12. preCheck 抛错时 warn 日志被打印（fail-open 路径的可观测性）
  */
 
 import type { StreamFn } from "@mariozechner/pi-agent-core";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+
+// =============================================================================
+// subsystem logger mock —— 拦截 billing 模块的 log.warn，使单测可断言
+// =============================================================================
+
+/**
+ * vi.hoisted 保证这两个 spy 在 vi.mock factory 执行之前就存在，
+ * 与 vitest 的 mock 提升机制对齐（mock factory 比 import 先跑）。
+ */
+const { logWarnSpy, logWarnClear } = vi.hoisted(() => {
+  const warnFn = vi.fn();
+  return {
+    logWarnSpy: warnFn,
+    // 提供一个清空方法，便于在 beforeEach 中重置调用记录
+    logWarnClear: () => warnFn.mockClear(),
+  };
+});
+
+/**
+ * mock createSubsystemLogger，让它返回一个带 spy 的假 logger。
+ * warn 方法接入 logWarnSpy，其余方法为 no-op vi.fn()。
+ * 其他 10 个测试不 assert warn，所以此 mock 对它们无副作用。
+ */
+vi.mock("../logging/subsystem.js", () => {
+  const makeLogger = () => ({
+    subsystem: "billing",
+    isEnabled: vi.fn(() => false),
+    trace: vi.fn(),
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: logWarnSpy,
+    error: vi.fn(),
+    fatal: vi.fn(),
+    raw: vi.fn(),
+    child: vi.fn(function makeFakeChild() {
+      return makeLogger();
+    }),
+  });
+  return { createSubsystemLogger: () => makeLogger() };
+});
+
 import {
   wrapProviderWithBilling,
   setBillingHooks,
@@ -98,6 +140,8 @@ describe("wrapProviderWithBilling", () => {
   beforeEach(() => {
     // 每个测试前清除全局 registry，保证隔离
     clearBillingHooks();
+    // 重置 logger warn spy 的调用记录，避免跨测试污染
+    logWarnClear();
   });
 
   // ---------------------------------------------------------------------------
@@ -328,11 +372,11 @@ describe("wrapProviderWithBilling", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 11. stream 无 result() 方法 → 不触发 postCharge，不 throw
+  // 11. stream 无 result() 方法 → 不触发 postCharge、打 warn 日志、不 throw
   // ---------------------------------------------------------------------------
-  it("stream 没有 result() 方法时，不触发 postCharge 且不抛错（billing postCharge 依赖 result() 权威路径）", async () => {
+  it("stream 没有 result() 方法时，不触发 postCharge 且打 warn 日志（billing postCharge 依赖 result() 权威路径）", async () => {
     // 防止未来某 provider 返回不含 result() 的流时出现 silent failure（调用成功但漏扣费）。
-    // 期望行为：warn 日志记录 + postCharge 跳过 + 主流程不受影响。
+    // 期望行为：warn 日志记录（可观测性）+ postCharge 跳过 + 主流程不受影响。
     const { hooks, postCharge, cancelReservation } = createMockHooks(true);
 
     // 构造一个没有 result() 的最小流对象
@@ -375,5 +419,35 @@ describe("wrapProviderWithBilling", () => {
     await Promise.resolve();
     expect(postCharge).not.toHaveBeenCalled();
     expect(cancelReservation).not.toHaveBeenCalled();
+
+    // warn 应被调用 1 次，消息中含 "no result()" 关键片段（来自 wrapBillingStream 的 fallback 分支）
+    // 这是「调用成功但漏扣费」的可观测性保障：至少留下可追查的 warn 日志
+    expect(logWarnSpy).toHaveBeenCalledTimes(1);
+    expect(logWarnSpy.mock.calls[0]?.[0]).toMatch(/no result\(\)/);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 12. preCheck 抛错时 warn 日志被打印（fail-open 路径的可观测性）
+  // ---------------------------------------------------------------------------
+  it("preCheck 抛错时，fail-open 并且打出 warn 日志（保证可观测性）", async () => {
+    // preCheck 故障（如 BFF 不可达）应 fail-open 继续调用 baseFn，
+    // 同时必须打出 warn 日志，确保问题不被静默吞掉。
+    const { hooks, postCharge } = createMockHooks(true);
+    hooks.preCheck = vi.fn(async () => {
+      throw new Error("BFF timeout");
+    });
+
+    const mockStream = createMockStream({ input_tokens: 100, output_tokens: 50 });
+    const baseFn = vi.fn(() => mockStream) as unknown as StreamFn;
+    const wrapped = wrapProviderWithBilling(baseFn, hooks, BASE_PARAMS);
+
+    // fail-open：不应抛错
+    const streamResult = await (wrapped as Function)({}, {}, {});
+    await streamResult.result();
+    await vi.waitFor(() => expect(postCharge).toHaveBeenCalledTimes(1));
+
+    // preCheck 抛错路径应打出 warn，消息中含 "preCheck threw" 关键片段
+    expect(logWarnSpy).toHaveBeenCalledTimes(1);
+    expect(logWarnSpy.mock.calls[0]?.[0]).toMatch(/preCheck threw/);
   });
 });

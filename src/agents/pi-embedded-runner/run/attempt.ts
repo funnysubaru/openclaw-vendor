@@ -2088,13 +2088,30 @@ export async function runEmbeddedAttempt(
       {
         const billingHooks = getBillingHooks();
         if (billingHooks) {
-          // 取模型单价配置，用于 postCharge 时即时算 costUsd（单价来自 config，不重造公式）。
+          // 取模型单价配置，用于 postCharge 时即时算 costUsd。
+          //
+          // 【根因修复 / 为什么优先用 params.model.cost】
+          // params.model 是经过 resolveModel() 合并的对象（见 model.ts:112）：
+          //   cost: configuredModel?.cost ?? discoveredModel.cost
+          // 即「openclaw.json 手填价 ?? vendor catalog 内建价（models.generated.js）」合并后的值。
+          //
+          // 而 resolveModelCostConfig 只查 config.models.providers[provider].models[].cost，
+          // 即「只看 openclaw.json 那半张价表」。对于默认模型（如 claude-sonnet-4-6）只在
+          // vendor catalog 里有价、未写进 openclaw.json 的情况，它返回 undefined →
+          // billing wrap 的 postCharge 收到 costUsd=undefined → 直接跳过扣费（静默漏扣）。
+          //
+          // 使用 params.model.cost 作为首选，确保计费用的价与用量面板显示的价、
+          // vendor 实际跑模型用的价三者同源（都来自合并后的 resolved model），
+          // 所有 vendor catalog 定价的模型（sonnet/haiku/国产模型）无需维护额外价表即可扣费。
+          // resolveModelCostConfig 仅作兜底（正常情况下 params.model.cost 始终有值）。
           // 仅在 hooks 存在时执行，避免未注册场景浪费查询开销。
-          const billingModelCost = resolveModelCostConfig({
-            provider: params.provider,
-            model: params.modelId,
-            config: params.config,
-          });
+          const billingModelCost =
+            params.model.cost ??
+            resolveModelCostConfig({
+              provider: params.provider,
+              model: params.modelId,
+              config: params.config,
+            });
           activeSession.agent.streamFn = wrapProviderWithBilling(
             activeSession.agent.streamFn,
             billingHooks,

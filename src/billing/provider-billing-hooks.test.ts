@@ -450,4 +450,61 @@ describe("wrapProviderWithBilling", () => {
     expect(logWarnSpy).toHaveBeenCalledTimes(1);
     expect(logWarnSpy.mock.calls[0]?.[0]).toMatch(/preCheck threw/);
   });
+
+  // ---------------------------------------------------------------------------
+  // 13. resolved model 带 cost、config 里无该模型 cost 条目 → costUsd 应用 resolved 价
+  // ---------------------------------------------------------------------------
+  it("resolved model 带 cost 而 config 里无该模型 cost 条目时，postCharge.costUsd 用 resolved model 的价（不返回 undefined）", async () => {
+    // 根因修复验证：
+    // 旧逻辑用 resolveModelCostConfig 取价，只查 config.models.providers[provider].models[].cost；
+    // 当模型只在 vendor catalog 有价（如 claude-sonnet-4-6）而未写入 openclaw.json 时，
+    // resolveModelCostConfig 返回 undefined → postCharge.costUsd 为 undefined → 静默漏扣。
+    //
+    // 新逻辑：modelCost = params.model.cost ?? resolveModelCostConfig(...)
+    // params.model.cost 是 resolveModel() 合并的值（configuredModel?.cost ?? discoveredModel.cost），
+    // 总能拿到 vendor catalog 里的真实单价 → 确保正确扣费。
+    //
+    // 本测试模拟该场景：传入的 modelCost 来自 resolved model（vendor catalog 价），
+    // 而非来自 config（config 里没有该模型 cost 条目）。
+    // 断言：postCharge.costUsd 应用 resolved model 的价，不为 undefined。
+    const { hooks, postCharge } = createMockHooks(true);
+
+    // 构造「resolved model 带 cost，config 里无该模型条目」的场景。
+    // 在 attempt.ts 里，这对应 params.model.cost 有值，resolveModelCostConfig 返回 undefined。
+    // wrapProviderWithBilling 接收的 modelCost 即为 params.model.cost ?? resolveModelCostConfig(...)。
+    // 此处单测直接构造修复后的传入值（resolved model cost），验证 wrap 内部用它正确算出 costUsd。
+    const resolvedModelCost = {
+      // claude-sonnet-4-6 在 vendor catalog 里的真实单价（$/1M tokens）
+      input: 3,
+      output: 15,
+      cacheRead: 0.3,
+      cacheWrite: 3.75,
+    };
+    // config 里刻意不含该模型 cost 条目——模拟「只在 vendor catalog 定价」的真实场景
+    const paramsWithResolvedCost: BillingWrapParams = {
+      ...BASE_PARAMS,
+      modelName: "claude-sonnet-4-6",
+      // modelCost 来自 resolved model（即修复后 params.model.cost 的值），而非 resolveModelCostConfig
+      modelCost: resolvedModelCost,
+    };
+
+    // 1000 input + 500 output tokens
+    // costUsd = (1000 * 3 + 500 * 15) / 1_000_000 = 0.0105
+    const baseFn = vi.fn(() =>
+      createMockStream({ input_tokens: 1000, output_tokens: 500 }),
+    ) as unknown as StreamFn;
+    const wrapped = wrapProviderWithBilling(baseFn, hooks, paramsWithResolvedCost);
+
+    const s = await (wrapped as Function)({}, {}, {});
+    await s.result();
+    await vi.waitFor(() => expect(postCharge).toHaveBeenCalledTimes(1));
+
+    const ctx = postCharge.mock.calls[0]?.[0];
+    // 核心断言：costUsd 应有值（用 resolved model 价算出），而非 undefined
+    expect(ctx.costUsd).toBeDefined();
+    expect(ctx.costUsd).toBeTypeOf("number");
+    expect(ctx.costUsd).toBeCloseTo(0.0105, 6);
+    // 对比：如果仍用旧逻辑（modelCost=undefined），costUsd 应为 undefined → 此断言会失败
+    expect(ctx.costUsd).not.toBeUndefined();
+  });
 });

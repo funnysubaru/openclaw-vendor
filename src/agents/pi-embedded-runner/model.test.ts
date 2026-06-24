@@ -929,6 +929,154 @@ describe("resolveModel", () => {
     expect(result.error).toBe("Unknown model: google-antigravity/some-model");
   });
 
+  // -------------------------------------------------------------------------
+  // 負 cost 防護 guard — pi-ai catalog の openrouter/auto 哨兵値 (-1000000) が
+  // 用量パネル統計や PLG billing wrap に伝播しないことを検証する。
+  //
+  // pi-ai の models.generated.js は OpenRouter pricing="-1"（単価不定哨兵）を
+  // per-million 換算して -1000000 として書き込んでしまう。
+  // applyConfiguredProviderOverrides の入口で sanitizeModelCost を呼ぶことで
+  // 全 3 分岐（早期 return × 2 + 正常合流）を一括カバーする。
+  // -------------------------------------------------------------------------
+
+  describe("負 cost guard (pi-ai catalog 哨兵値対策)", () => {
+    const NEGATIVE_COST = {
+      input: -1000000,
+      output: -1000000,
+      cacheRead: 0,
+      cacheWrite: 0,
+    };
+    const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+    it("分岐1: providerConfig なし — discovered model の負 cost が 0 に清洗される", () => {
+      // !providerConfig の早期 return 分岐（分岐1）
+      mockDiscoveredModel({
+        provider: "openrouter",
+        modelId: "auto",
+        templateModel: {
+          id: "auto",
+          name: "auto",
+          provider: "openrouter",
+          api: "openai-completions",
+          baseUrl: "https://openrouter.ai/api/v1",
+          reasoning: false,
+          input: ["text"],
+          cost: NEGATIVE_COST,
+          contextWindow: 200000,
+          maxTokens: 8192,
+        },
+      });
+
+      // cfg に openrouter プロバイダ設定を入れないことで !providerConfig 分岐を踏む
+      const result = resolveModel("openrouter", "auto", "/tmp/agent", {} as OpenClawConfig);
+
+      expect(result.error).toBeUndefined();
+      expect(result.model?.cost).toEqual(ZERO_COST);
+    });
+
+    it("分岐2: providerConfig あり・configuredModel/baseUrl/api/headers なし — 負 cost が 0 に清洗される", () => {
+      // !configuredModel && !baseUrl && !api && !headers の早期 return 分岐（分岐2）
+      mockDiscoveredModel({
+        provider: "openrouter",
+        modelId: "auto",
+        templateModel: {
+          id: "auto",
+          name: "auto",
+          provider: "openrouter",
+          api: "openai-completions",
+          baseUrl: "https://openrouter.ai/api/v1",
+          reasoning: false,
+          input: ["text"],
+          cost: NEGATIVE_COST,
+          contextWindow: 200000,
+          maxTokens: 8192,
+        },
+      });
+
+      // models 配列に "auto" を含めず、baseUrl/api/headers も省くことで分岐2を踏む
+      const cfg = {
+        models: {
+          providers: {
+            openrouter: {
+              // models の中に "auto" がない → configuredModel = undefined
+              // baseUrl / api / headers も未設定 → 分岐2の条件を全て満たす
+              models: [{ id: "some-other-model", name: "other" }],
+            },
+          },
+        },
+      } as unknown as OpenClawConfig;
+
+      const result = resolveModel("openrouter", "auto", "/tmp/agent", cfg);
+
+      expect(result.error).toBeUndefined();
+      expect(result.model?.cost).toEqual(ZERO_COST);
+    });
+
+    it("分岐3: 正常合流 — configuredModel.cost なし時に discoveredModel の負 cost が 0 に清洗される", () => {
+      // configuredModel が存在しないか cost を持たない場合の末尾合流分岐（分岐3）
+      mockDiscoveredModel({
+        provider: "openrouter",
+        modelId: "auto",
+        templateModel: {
+          id: "auto",
+          name: "auto",
+          provider: "openrouter",
+          api: "openai-completions",
+          baseUrl: "https://openrouter.ai/api/v1",
+          reasoning: false,
+          input: ["text"],
+          cost: NEGATIVE_COST,
+          contextWindow: 200000,
+          maxTokens: 8192,
+        },
+      });
+
+      // baseUrl を指定することで分岐2を回避し、分岐3（正常合流）を踏む
+      const cfg = {
+        models: {
+          providers: {
+            openrouter: {
+              baseUrl: "https://openrouter.ai/api/v1",
+              // configuredModel に cost を設定しない → discoveredModel.cost が使われる
+              models: [{ id: "other-model", name: "other" }],
+            },
+          },
+        },
+      } as unknown as OpenClawConfig;
+
+      const result = resolveModel("openrouter", "auto", "/tmp/agent", cfg);
+
+      expect(result.error).toBeUndefined();
+      expect(result.model?.cost).toEqual(ZERO_COST);
+    });
+
+    it("回帰: 正常な正単価モデルは cost が変わらない（誤清洗しない）", () => {
+      // 正値 cost は一切触らないことを確認
+      const POSITIVE_COST = { input: 2.5, output: 10, cacheRead: 0.25, cacheWrite: 0 };
+      mockDiscoveredModel({
+        provider: "anthropic",
+        modelId: "claude-sonnet-4-5",
+        templateModel: {
+          id: "claude-sonnet-4-5",
+          name: "Claude Sonnet 4.5",
+          provider: "anthropic",
+          api: "anthropic-messages",
+          baseUrl: "https://api.anthropic.com",
+          reasoning: false,
+          input: ["text"],
+          cost: POSITIVE_COST,
+          contextWindow: 200000,
+          maxTokens: 8192,
+        },
+      });
+
+      const result = resolveModel("anthropic", "claude-sonnet-4-5", "/tmp/agent");
+
+      expect(result.error).toBeUndefined();
+      expect(result.model?.cost).toEqual(POSITIVE_COST);
+    });
+  });
+
   it("applies provider baseUrl override to registry-found models", () => {
     mockDiscoveredModel({
       provider: "anthropic",

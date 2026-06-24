@@ -68,21 +68,73 @@ function resolveConfiguredProviderConfig(
   return findNormalizedProviderValue(configuredProviders, provider);
 }
 
+/**
+ * pi-ai の生成済みカタログ（@mariozechner/pi-ai/dist/models.generated.js）は
+ * OpenRouter の動的ルーティングモデル（例: "openrouter/auto"）に対して
+ * cost: { input: -1000000, output: -1000000, cacheRead: 0, cacheWrite: 0 } を書き込む。
+ *
+ * これは OpenRouter の API が pricing="-1"（単価不定の哨兵値）を返すのを
+ * pi-ai のスキャナが per-million 換算しそのまま焼き付けた結果であり、
+ * 実際の課金コストを表すものではない。
+ *
+ * この負値が使われると：
+ * - session jsonl の usage.cost が負数になり用量パネルの統計が狂う
+ * - PLG billing wrap が負の costUsd をレポートしてしまう
+ *
+ * 対策：cost の任意フィールドが負値の場合、その cost オブジェクト全体を
+ * { input:0, output:0, cacheRead:0, cacheWrite:0 } でリセットする。
+ * undefined ではなく 0 を使うのは、下流の pi-ai models.js が
+ * model.cost.input を直接乗算するため undefined だと NaN になるから。
+ *
+ * この関数を applyConfiguredProviderOverrides の入口で呼ぶことで、
+ * 関数内の全 return 分岐（早期 return × 2 + 末尾の正常合流）を一括でカバーする。
+ */
+function sanitizeModelCost(cost: Model<Api>["cost"]): Model<Api>["cost"] {
+  if (!cost) {
+    return cost;
+  }
+  // cost オブジェクトのいずれかのフィールドが負値ならば、
+  // catalog 由来の「単価不定」哨兵が紛れ込んでいると判断して全フィールドを 0 にする。
+  const hasNegativeField =
+    (cost.input ?? 0) < 0 ||
+    (cost.output ?? 0) < 0 ||
+    (cost.cacheRead ?? 0) < 0 ||
+    (cost.cacheWrite ?? 0) < 0;
+  if (!hasNegativeField) {
+    return cost;
+  }
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+}
+
 function applyConfiguredProviderOverrides(params: {
   discoveredModel: Model<Api>;
   providerConfig?: InlineProviderConfig;
   modelId: string;
 }): Model<Api> {
   const { discoveredModel, providerConfig, modelId } = params;
+
+  // pi-ai catalog の負 cost 哨兵を関数入口で清洗する。
+  // ここで一括処理することで以下の全 return 分岐をカバーする：
+  //   1) !providerConfig 早期 return
+  //   2) !configuredModel && !baseUrl && !api && !headers 早期 return
+  //   3) 末尾の正常合流（line ~112: cost: configuredModel?.cost ?? discoveredModel.cost）
+  const sanitizedDiscoveredModel: Model<Api> = {
+    ...discoveredModel,
+    cost: sanitizeModelCost(discoveredModel.cost),
+  };
+
   if (!providerConfig) {
     return {
-      ...discoveredModel,
+      ...sanitizedDiscoveredModel,
       // Discovered models originate from models.json and may contain persistence markers.
-      headers: sanitizeModelHeaders(discoveredModel.headers, { stripSecretRefMarkers: true }),
+      headers: sanitizeModelHeaders(sanitizedDiscoveredModel.headers, {
+        stripSecretRefMarkers: true,
+      }),
     };
   }
   const configuredModel = providerConfig.models?.find((candidate) => candidate.id === modelId);
-  const discoveredHeaders = sanitizeModelHeaders(discoveredModel.headers, {
+  // sanitizedDiscoveredModel のヘッダを使う（cost 清洗済みオブジェクトで統一）
+  const discoveredHeaders = sanitizeModelHeaders(sanitizedDiscoveredModel.headers, {
     stripSecretRefMarkers: true,
   });
   const providerHeaders = sanitizeModelHeaders(providerConfig.headers, {
@@ -92,26 +144,30 @@ function applyConfiguredProviderOverrides(params: {
     stripSecretRefMarkers: true,
   });
   if (!configuredModel && !providerConfig.baseUrl && !providerConfig.api && !providerHeaders) {
+    // 分岐2：providerConfig があるが configuredModel/baseUrl/api/headers のいずれもない場合。
+    // sanitizedDiscoveredModel を使うことで負 cost が漏れない。
     return {
-      ...discoveredModel,
+      ...sanitizedDiscoveredModel,
       headers: discoveredHeaders,
     };
   }
-  const resolvedInput = configuredModel?.input ?? discoveredModel.input;
+  const resolvedInput = configuredModel?.input ?? sanitizedDiscoveredModel.input;
   const normalizedInput =
     Array.isArray(resolvedInput) && resolvedInput.length > 0
       ? resolvedInput.filter((item) => item === "text" || item === "image")
       : (["text"] as Array<"text" | "image">);
 
   return {
-    ...discoveredModel,
-    api: configuredModel?.api ?? providerConfig.api ?? discoveredModel.api,
-    baseUrl: providerConfig.baseUrl ?? discoveredModel.baseUrl,
-    reasoning: configuredModel?.reasoning ?? discoveredModel.reasoning,
+    // 分岐3（正常合流）：sanitizedDiscoveredModel をスプレッドのベースにすることで
+    // configuredModel.cost が未設定の場合でも清洗済みの cost が使われる。
+    ...sanitizedDiscoveredModel,
+    api: configuredModel?.api ?? providerConfig.api ?? sanitizedDiscoveredModel.api,
+    baseUrl: providerConfig.baseUrl ?? sanitizedDiscoveredModel.baseUrl,
+    reasoning: configuredModel?.reasoning ?? sanitizedDiscoveredModel.reasoning,
     input: normalizedInput,
-    cost: configuredModel?.cost ?? discoveredModel.cost,
-    contextWindow: configuredModel?.contextWindow ?? discoveredModel.contextWindow,
-    maxTokens: configuredModel?.maxTokens ?? discoveredModel.maxTokens,
+    cost: configuredModel?.cost ?? sanitizedDiscoveredModel.cost,
+    contextWindow: configuredModel?.contextWindow ?? sanitizedDiscoveredModel.contextWindow,
+    maxTokens: configuredModel?.maxTokens ?? sanitizedDiscoveredModel.maxTokens,
     headers:
       discoveredHeaders || providerHeaders || configuredHeaders
         ? {
@@ -120,7 +176,7 @@ function applyConfiguredProviderOverrides(params: {
             ...configuredHeaders,
           }
         : undefined,
-    compat: configuredModel?.compat ?? discoveredModel.compat,
+    compat: configuredModel?.compat ?? sanitizedDiscoveredModel.compat,
   };
 }
 

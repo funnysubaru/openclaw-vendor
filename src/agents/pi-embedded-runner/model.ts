@@ -68,21 +68,76 @@ function resolveConfiguredProviderConfig(
   return findNormalizedProviderValue(configuredProviders, provider);
 }
 
+/**
+ * The pi-ai generated catalog (@mariozechner/pi-ai/dist/models.generated.js)
+ * writes cost: { input: -1000000, output: -1000000, cacheRead: 0, cacheWrite: 0 }
+ * for dynamic-routing models such as "openrouter/auto".
+ *
+ * This happens because the OpenRouter API returns pricing="-1" (a sentinel for
+ * "price unknown"), which the pi-ai scanner converts to a per-million value and
+ * bakes directly into the generated catalog. The result does not represent actual
+ * billing cost.
+ *
+ * Consequences if the negative values are propagated:
+ * - session jsonl usage.cost becomes negative, corrupting usage-panel statistics
+ * - PLG billing wrap reports a negative costUsd
+ *
+ * Fix: if any field in the cost object is negative, reset the entire object to
+ * { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }.
+ * We use 0 rather than undefined because downstream pi-ai models.js multiplies
+ * model.cost.input directly; undefined would produce NaN.
+ *
+ * Calling this function at the entry point of applyConfiguredProviderOverrides
+ * covers all three return branches in that function in one place:
+ * early return #1 (!providerConfig), early return #2 (no overrides), and the
+ * normal merge at the end.
+ */
+function sanitizeModelCost(cost: Model<Api>["cost"]): Model<Api>["cost"] {
+  if (!cost) {
+    return cost;
+  }
+  // If any field in the cost object is negative, treat it as a catalog-originated
+  // "price unknown" sentinel and zero out all fields.
+  const hasNegativeField =
+    (cost.input ?? 0) < 0 ||
+    (cost.output ?? 0) < 0 ||
+    (cost.cacheRead ?? 0) < 0 ||
+    (cost.cacheWrite ?? 0) < 0;
+  if (!hasNegativeField) {
+    return cost;
+  }
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+}
+
 function applyConfiguredProviderOverrides(params: {
   discoveredModel: Model<Api>;
   providerConfig?: InlineProviderConfig;
   modelId: string;
 }): Model<Api> {
   const { discoveredModel, providerConfig, modelId } = params;
+
+  // Sanitize negative cost sentinels from the pi-ai catalog at the function entry.
+  // Doing it here covers all three return branches in one place:
+  //   1) early return when !providerConfig
+  //   2) early return when !configuredModel && !baseUrl && !api && !headers
+  //   3) the normal merge at the end (cost: configuredModel?.cost ?? discoveredModel.cost)
+  const sanitizedDiscoveredModel: Model<Api> = {
+    ...discoveredModel,
+    cost: sanitizeModelCost(discoveredModel.cost),
+  };
+
   if (!providerConfig) {
     return {
-      ...discoveredModel,
+      ...sanitizedDiscoveredModel,
       // Discovered models originate from models.json and may contain persistence markers.
-      headers: sanitizeModelHeaders(discoveredModel.headers, { stripSecretRefMarkers: true }),
+      headers: sanitizeModelHeaders(sanitizedDiscoveredModel.headers, {
+        stripSecretRefMarkers: true,
+      }),
     };
   }
   const configuredModel = providerConfig.models?.find((candidate) => candidate.id === modelId);
-  const discoveredHeaders = sanitizeModelHeaders(discoveredModel.headers, {
+  // Use sanitizedDiscoveredModel headers so the sanitized cost object is consistently applied.
+  const discoveredHeaders = sanitizeModelHeaders(sanitizedDiscoveredModel.headers, {
     stripSecretRefMarkers: true,
   });
   const providerHeaders = sanitizeModelHeaders(providerConfig.headers, {
@@ -92,26 +147,30 @@ function applyConfiguredProviderOverrides(params: {
     stripSecretRefMarkers: true,
   });
   if (!configuredModel && !providerConfig.baseUrl && !providerConfig.api && !providerHeaders) {
+    // Branch 2: providerConfig exists but none of configuredModel/baseUrl/api/headers are set.
+    // Using sanitizedDiscoveredModel ensures negative costs cannot leak through.
     return {
-      ...discoveredModel,
+      ...sanitizedDiscoveredModel,
       headers: discoveredHeaders,
     };
   }
-  const resolvedInput = configuredModel?.input ?? discoveredModel.input;
+  const resolvedInput = configuredModel?.input ?? sanitizedDiscoveredModel.input;
   const normalizedInput =
     Array.isArray(resolvedInput) && resolvedInput.length > 0
       ? resolvedInput.filter((item) => item === "text" || item === "image")
       : (["text"] as Array<"text" | "image">);
 
   return {
-    ...discoveredModel,
-    api: configuredModel?.api ?? providerConfig.api ?? discoveredModel.api,
-    baseUrl: providerConfig.baseUrl ?? discoveredModel.baseUrl,
-    reasoning: configuredModel?.reasoning ?? discoveredModel.reasoning,
+    // Branch 3 (normal merge): by spreading sanitizedDiscoveredModel as the base,
+    // the sanitized cost is used even when configuredModel does not set its own cost.
+    ...sanitizedDiscoveredModel,
+    api: configuredModel?.api ?? providerConfig.api ?? sanitizedDiscoveredModel.api,
+    baseUrl: providerConfig.baseUrl ?? sanitizedDiscoveredModel.baseUrl,
+    reasoning: configuredModel?.reasoning ?? sanitizedDiscoveredModel.reasoning,
     input: normalizedInput,
-    cost: configuredModel?.cost ?? discoveredModel.cost,
-    contextWindow: configuredModel?.contextWindow ?? discoveredModel.contextWindow,
-    maxTokens: configuredModel?.maxTokens ?? discoveredModel.maxTokens,
+    cost: configuredModel?.cost ?? sanitizedDiscoveredModel.cost,
+    contextWindow: configuredModel?.contextWindow ?? sanitizedDiscoveredModel.contextWindow,
+    maxTokens: configuredModel?.maxTokens ?? sanitizedDiscoveredModel.maxTokens,
     headers:
       discoveredHeaders || providerHeaders || configuredHeaders
         ? {
@@ -120,7 +179,7 @@ function applyConfiguredProviderOverrides(params: {
             ...configuredHeaders,
           }
         : undefined,
-    compat: configuredModel?.compat ?? discoveredModel.compat,
+    compat: configuredModel?.compat ?? sanitizedDiscoveredModel.compat,
   };
 }
 

@@ -1077,6 +1077,92 @@ describe("resolveModel", () => {
       expect(result.error).toBeUndefined();
       expect(result.model?.cost).toEqual(POSITIVE_COST);
     });
+
+    it("preserves configuredModel cost when discoveredModel cost is negative", () => {
+      // Regression: validates that user-configured cost takes priority AND is not sanitized.
+      //
+      // branch 3 logic: cost = configuredModel?.cost ?? sanitizedDiscoveredModel.cost
+      // When configuredModel carries an explicit positive cost, it must be returned as-is,
+      // even if discoveredModel.cost is a negative pi-ai catalog sentinel (-1000000).
+      // The sanitizeModelCost call in applyConfiguredProviderOverrides must only touch
+      // discoveredModel.cost and must NOT reach configuredModel.cost.
+      const CONFIGURED_POSITIVE_COST = { input: 5, output: 15, cacheRead: 0, cacheWrite: 0 };
+      mockDiscoveredModel({
+        provider: "openrouter",
+        modelId: "auto",
+        templateModel: {
+          id: "auto",
+          name: "auto",
+          provider: "openrouter",
+          api: "openai-completions",
+          baseUrl: "https://openrouter.ai/api/v1",
+          reasoning: false,
+          input: ["text"],
+          cost: NEGATIVE_COST, // pi-ai sentinel: unknown pricing
+          contextWindow: 200000,
+          maxTokens: 8192,
+        },
+      });
+
+      // configuredModel explicitly sets a positive cost, and baseUrl bypasses branch 2
+      // so the full branch 3 merge runs.
+      const cfg = {
+        models: {
+          providers: {
+            openrouter: {
+              baseUrl: "https://openrouter.ai/api/v1",
+              models: [{ id: "auto", name: "auto", cost: CONFIGURED_POSITIVE_COST }],
+            },
+          },
+        },
+      } as unknown as OpenClawConfig;
+
+      const result = resolveModel("openrouter", "auto", "/tmp/agent", cfg);
+
+      expect(result.error).toBeUndefined();
+      // Must equal user-configured positive cost, NOT zero and NOT negative.
+      expect(result.model?.cost).toEqual(CONFIGURED_POSITIVE_COST);
+    });
+
+    it("passes through negative configuredModel cost without sanitization", () => {
+      // Documents the contract: sanitizeModelCost only touches discoveredModel.cost.
+      // If the user deliberately sets a negative cost in their config (edge case),
+      // it is passed through untouched — the guard does not police user intent.
+      const USER_NEGATIVE_COST = { input: -1, output: -1, cacheRead: 0, cacheWrite: 0 };
+      mockDiscoveredModel({
+        provider: "openrouter",
+        modelId: "auto",
+        templateModel: {
+          id: "auto",
+          name: "auto",
+          provider: "openrouter",
+          api: "openai-completions",
+          baseUrl: "https://openrouter.ai/api/v1",
+          reasoning: false,
+          input: ["text"],
+          cost: NEGATIVE_COST, // pi-ai sentinel
+          contextWindow: 200000,
+          maxTokens: 8192,
+        },
+      });
+
+      const cfg = {
+        models: {
+          providers: {
+            openrouter: {
+              baseUrl: "https://openrouter.ai/api/v1",
+              models: [{ id: "auto", name: "auto", cost: USER_NEGATIVE_COST }],
+            },
+          },
+        },
+      } as unknown as OpenClawConfig;
+
+      const result = resolveModel("openrouter", "auto", "/tmp/agent", cfg);
+
+      expect(result.error).toBeUndefined();
+      // configuredModel.cost takes precedence and is NOT sanitized by the guard.
+      expect(result.model?.cost).toEqual(USER_NEGATIVE_COST);
+    });
   });
 
   it("applies provider baseUrl override to registry-found models", () => {

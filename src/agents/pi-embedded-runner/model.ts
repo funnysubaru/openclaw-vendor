@@ -69,32 +69,35 @@ function resolveConfiguredProviderConfig(
 }
 
 /**
- * pi-ai の生成済みカタログ（@mariozechner/pi-ai/dist/models.generated.js）は
- * OpenRouter の動的ルーティングモデル（例: "openrouter/auto"）に対して
- * cost: { input: -1000000, output: -1000000, cacheRead: 0, cacheWrite: 0 } を書き込む。
+ * The pi-ai generated catalog (@mariozechner/pi-ai/dist/models.generated.js)
+ * writes cost: { input: -1000000, output: -1000000, cacheRead: 0, cacheWrite: 0 }
+ * for dynamic-routing models such as "openrouter/auto".
  *
- * これは OpenRouter の API が pricing="-1"（単価不定の哨兵値）を返すのを
- * pi-ai のスキャナが per-million 換算しそのまま焼き付けた結果であり、
- * 実際の課金コストを表すものではない。
+ * This happens because the OpenRouter API returns pricing="-1" (a sentinel for
+ * "price unknown"), which the pi-ai scanner converts to a per-million value and
+ * bakes directly into the generated catalog. The result does not represent actual
+ * billing cost.
  *
- * この負値が使われると：
- * - session jsonl の usage.cost が負数になり用量パネルの統計が狂う
- * - PLG billing wrap が負の costUsd をレポートしてしまう
+ * Consequences if the negative values are propagated:
+ * - session jsonl usage.cost becomes negative, corrupting usage-panel statistics
+ * - PLG billing wrap reports a negative costUsd
  *
- * 対策：cost の任意フィールドが負値の場合、その cost オブジェクト全体を
- * { input:0, output:0, cacheRead:0, cacheWrite:0 } でリセットする。
- * undefined ではなく 0 を使うのは、下流の pi-ai models.js が
- * model.cost.input を直接乗算するため undefined だと NaN になるから。
+ * Fix: if any field in the cost object is negative, reset the entire object to
+ * { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }.
+ * We use 0 rather than undefined because downstream pi-ai models.js multiplies
+ * model.cost.input directly; undefined would produce NaN.
  *
- * この関数を applyConfiguredProviderOverrides の入口で呼ぶことで、
- * 関数内の全 return 分岐（早期 return × 2 + 末尾の正常合流）を一括でカバーする。
+ * Calling this function at the entry point of applyConfiguredProviderOverrides
+ * covers all three return branches in that function in one place:
+ * early return #1 (!providerConfig), early return #2 (no overrides), and the
+ * normal merge at the end.
  */
 function sanitizeModelCost(cost: Model<Api>["cost"]): Model<Api>["cost"] {
   if (!cost) {
     return cost;
   }
-  // cost オブジェクトのいずれかのフィールドが負値ならば、
-  // catalog 由来の「単価不定」哨兵が紛れ込んでいると判断して全フィールドを 0 にする。
+  // If any field in the cost object is negative, treat it as a catalog-originated
+  // "price unknown" sentinel and zero out all fields.
   const hasNegativeField =
     (cost.input ?? 0) < 0 ||
     (cost.output ?? 0) < 0 ||
@@ -113,11 +116,11 @@ function applyConfiguredProviderOverrides(params: {
 }): Model<Api> {
   const { discoveredModel, providerConfig, modelId } = params;
 
-  // pi-ai catalog の負 cost 哨兵を関数入口で清洗する。
-  // ここで一括処理することで以下の全 return 分岐をカバーする：
-  //   1) !providerConfig 早期 return
-  //   2) !configuredModel && !baseUrl && !api && !headers 早期 return
-  //   3) 末尾の正常合流（line ~112: cost: configuredModel?.cost ?? discoveredModel.cost）
+  // Sanitize negative cost sentinels from the pi-ai catalog at the function entry.
+  // Doing it here covers all three return branches in one place:
+  //   1) early return when !providerConfig
+  //   2) early return when !configuredModel && !baseUrl && !api && !headers
+  //   3) the normal merge at the end (cost: configuredModel?.cost ?? discoveredModel.cost)
   const sanitizedDiscoveredModel: Model<Api> = {
     ...discoveredModel,
     cost: sanitizeModelCost(discoveredModel.cost),
@@ -133,7 +136,7 @@ function applyConfiguredProviderOverrides(params: {
     };
   }
   const configuredModel = providerConfig.models?.find((candidate) => candidate.id === modelId);
-  // sanitizedDiscoveredModel のヘッダを使う（cost 清洗済みオブジェクトで統一）
+  // Use sanitizedDiscoveredModel headers so the sanitized cost object is consistently applied.
   const discoveredHeaders = sanitizeModelHeaders(sanitizedDiscoveredModel.headers, {
     stripSecretRefMarkers: true,
   });
@@ -144,8 +147,8 @@ function applyConfiguredProviderOverrides(params: {
     stripSecretRefMarkers: true,
   });
   if (!configuredModel && !providerConfig.baseUrl && !providerConfig.api && !providerHeaders) {
-    // 分岐2：providerConfig があるが configuredModel/baseUrl/api/headers のいずれもない場合。
-    // sanitizedDiscoveredModel を使うことで負 cost が漏れない。
+    // Branch 2: providerConfig exists but none of configuredModel/baseUrl/api/headers are set.
+    // Using sanitizedDiscoveredModel ensures negative costs cannot leak through.
     return {
       ...sanitizedDiscoveredModel,
       headers: discoveredHeaders,
@@ -158,8 +161,8 @@ function applyConfiguredProviderOverrides(params: {
       : (["text"] as Array<"text" | "image">);
 
   return {
-    // 分岐3（正常合流）：sanitizedDiscoveredModel をスプレッドのベースにすることで
-    // configuredModel.cost が未設定の場合でも清洗済みの cost が使われる。
+    // Branch 3 (normal merge): by spreading sanitizedDiscoveredModel as the base,
+    // the sanitized cost is used even when configuredModel does not set its own cost.
     ...sanitizedDiscoveredModel,
     api: configuredModel?.api ?? providerConfig.api ?? sanitizedDiscoveredModel.api,
     baseUrl: providerConfig.baseUrl ?? sanitizedDiscoveredModel.baseUrl,

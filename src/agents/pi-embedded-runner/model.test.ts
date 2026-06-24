@@ -930,16 +930,18 @@ describe("resolveModel", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 負 cost 防護 guard — pi-ai catalog の openrouter/auto 哨兵値 (-1000000) が
-  // 用量パネル統計や PLG billing wrap に伝播しないことを検証する。
+  // Negative-cost guard — verifies that the openrouter/auto sentinel value
+  // (-1000000) from the pi-ai catalog does not propagate to usage-panel
+  // statistics or the PLG billing wrap.
   //
-  // pi-ai の models.generated.js は OpenRouter pricing="-1"（単価不定哨兵）を
-  // per-million 換算して -1000000 として書き込んでしまう。
-  // applyConfiguredProviderOverrides の入口で sanitizeModelCost を呼ぶことで
-  // 全 3 分岐（早期 return × 2 + 正常合流）を一括カバーする。
+  // pi-ai's models.generated.js converts OpenRouter pricing="-1" (a sentinel
+  // for "price unknown") to -1000000 on a per-million basis and bakes it into
+  // the generated catalog.  By calling sanitizeModelCost at the entry point of
+  // applyConfiguredProviderOverrides, all three return branches are covered in
+  // one place (early return #1, early return #2, and the normal merge).
   // -------------------------------------------------------------------------
 
-  describe("負 cost guard (pi-ai catalog 哨兵値対策)", () => {
+  describe("negative cost guard (pi-ai catalog sentinel mitigation)", () => {
     const NEGATIVE_COST = {
       input: -1000000,
       output: -1000000,
@@ -948,8 +950,8 @@ describe("resolveModel", () => {
     };
     const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
-    it("分岐1: providerConfig なし — discovered model の負 cost が 0 に清洗される", () => {
-      // !providerConfig の早期 return 分岐（分岐1）
+    it("branch 1: no providerConfig — negative cost on the discovered model is zeroed out", () => {
+      // Exercises the early-return branch where !providerConfig (branch 1).
       mockDiscoveredModel({
         provider: "openrouter",
         modelId: "auto",
@@ -967,15 +969,15 @@ describe("resolveModel", () => {
         },
       });
 
-      // cfg に openrouter プロバイダ設定を入れないことで !providerConfig 分岐を踏む
+      // Omitting the openrouter provider key from cfg forces the !providerConfig branch.
       const result = resolveModel("openrouter", "auto", "/tmp/agent", {} as OpenClawConfig);
 
       expect(result.error).toBeUndefined();
       expect(result.model?.cost).toEqual(ZERO_COST);
     });
 
-    it("分岐2: providerConfig あり・configuredModel/baseUrl/api/headers なし — 負 cost が 0 に清洗される", () => {
-      // !configuredModel && !baseUrl && !api && !headers の早期 return 分岐（分岐2）
+    it("branch 2: providerConfig present but no configuredModel/baseUrl/api/headers — negative cost is zeroed out", () => {
+      // Exercises the early-return branch where !configuredModel && !baseUrl && !api && !headers (branch 2).
       mockDiscoveredModel({
         provider: "openrouter",
         modelId: "auto",
@@ -993,13 +995,13 @@ describe("resolveModel", () => {
         },
       });
 
-      // models 配列に "auto" を含めず、baseUrl/api/headers も省くことで分岐2を踏む
+      // Excluding "auto" from the models array and omitting baseUrl/api/headers forces branch 2.
       const cfg = {
         models: {
           providers: {
             openrouter: {
-              // models の中に "auto" がない → configuredModel = undefined
-              // baseUrl / api / headers も未設定 → 分岐2の条件を全て満たす
+              // "auto" is not in the models list → configuredModel = undefined
+              // baseUrl / api / headers are also unset → all branch-2 conditions are met
               models: [{ id: "some-other-model", name: "other" }],
             },
           },
@@ -1012,8 +1014,8 @@ describe("resolveModel", () => {
       expect(result.model?.cost).toEqual(ZERO_COST);
     });
 
-    it("分岐3: 正常合流 — configuredModel.cost なし時に discoveredModel の負 cost が 0 に清洗される", () => {
-      // configuredModel が存在しないか cost を持たない場合の末尾合流分岐（分岐3）
+    it("branch 3: normal merge — negative discoveredModel cost is zeroed when configuredModel has no cost", () => {
+      // Exercises the tail-merge branch (branch 3): configuredModel exists but has no cost field.
       mockDiscoveredModel({
         provider: "openrouter",
         modelId: "auto",
@@ -1031,13 +1033,13 @@ describe("resolveModel", () => {
         },
       });
 
-      // baseUrl を指定することで分岐2を回避し、分岐3（正常合流）を踏む
+      // Setting baseUrl bypasses branch 2 and reaches branch 3 (normal merge).
       const cfg = {
         models: {
           providers: {
             openrouter: {
               baseUrl: "https://openrouter.ai/api/v1",
-              // configuredModel に cost を設定しない → discoveredModel.cost が使われる
+              // configuredModel does not set cost → discoveredModel.cost is used
               models: [{ id: "other-model", name: "other" }],
             },
           },
@@ -1050,8 +1052,8 @@ describe("resolveModel", () => {
       expect(result.model?.cost).toEqual(ZERO_COST);
     });
 
-    it("回帰: 正常な正単価モデルは cost が変わらない（誤清洗しない）", () => {
-      // 正値 cost は一切触らないことを確認
+    it("regression: a model with positive costs is not modified by the guard", () => {
+      // Verifies that the guard does not touch cost objects with all-positive values.
       const POSITIVE_COST = { input: 2.5, output: 10, cacheRead: 0.25, cacheWrite: 0 };
       mockDiscoveredModel({
         provider: "anthropic",

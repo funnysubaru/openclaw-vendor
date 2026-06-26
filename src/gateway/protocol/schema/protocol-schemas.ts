@@ -140,6 +140,8 @@ import {
 import {
   SessionsCompactParamsSchema,
   SessionsDeleteParamsSchema,
+  SessionsForkParamsSchema,
+  SessionsForkResultSchema,
   SessionsListParamsSchema,
   SessionsPatchParamsSchema,
   SessionsPreviewParamsSchema,
@@ -211,6 +213,9 @@ export const ProtocolSchemas = {
   SessionsDeleteParams: SessionsDeleteParamsSchema,
   SessionsCompactParams: SessionsCompactParamsSchema,
   SessionsUsageParams: SessionsUsageParamsSchema,
+  // sessions.fork: Yuiclaw 对话分支继承上下文地基（design §4.1）
+  SessionsForkParams: SessionsForkParamsSchema,
+  SessionsForkResult: SessionsForkResultSchema,
   ConfigGetParams: ConfigGetParamsSchema,
   ConfigSetParams: ConfigSetParamsSchema,
   ConfigApplyParams: ConfigApplyParamsSchema,

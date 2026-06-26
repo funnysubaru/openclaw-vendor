@@ -1,6 +1,12 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 import { resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import { clearBootstrapSnapshot } from "../../agents/bootstrap-cache.js";
+import {
+  forkSessionFromParent,
+  resolveParentForkMaxTokens,
+} from "../../auto-reply/reply/session-fork.js";
 import { loadConfig } from "../../config/config.js";
 import {
   loadSessionStore,
@@ -13,8 +19,11 @@ import { GATEWAY_CLIENT_IDS } from "../protocol/client-info.js";
 import {
   ErrorCodes,
   errorShape,
+  formatValidationErrors,
   validateSessionsCompactParams,
   validateSessionsDeleteParams,
+  validateSessionsForkParams,
+  validateSessionsForkResult,
   validateSessionsListParams,
   validateSessionsPatchParams,
   validateSessionsPreviewParams,
@@ -514,5 +523,202 @@ export const sessionsHandlers: GatewayRequestHandlers = {
       },
       undefined,
     );
+  },
+
+  // sessions.fork ——「対話ブランチ真継承コンテキスト」RPC（Yuiclaw design §4.1-4.2）
+  //
+  // 業務意図：
+  //   Yuiclaw 工作台のブランチ作成時に源会話の完全な履歴を新会話に複製する。
+  //   引擎にはすでに forkSessionFromParent（session-fork.ts）という実績ある実装があり、
+  //   それを「会話作成時機」で呼び出せるよう薄い RPC として公開するだけ（§0.4 上游已有不重造）。
+  //
+  // 行為：
+  //   1. sourceKey から源会話エントリを取得（存在しない → エラー）
+  //   2. targetAgentId 解析（省略時 = 源 agentId）、newSessionKey 解析（省略時 = 自動生成）
+  //   3. トークン護衛：源 totalTokens > parentForkMaxTokens → 空白会話を作成、inheritedHistory:false
+  //   4. forkSessionFromParent を呼び出し（null 返却時 → step 3 の空白フォールバック）
+  //   5. 新会話を store に登録（forkedFromParent=true、源のメタデータ継承）、永続化
+  //   6. 新会話 3 つ組 + inheritedHistory を返す
+  "sessions.fork": async ({ params, respond, context }) => {
+    if (!assertValidParams(params, validateSessionsForkParams, "sessions.fork", respond)) {
+      return;
+    }
+    const p = params;
+
+    // Step 1: 源会話エントリ取得
+    const sourceKey = String(p.sourceKey).trim();
+    const loaded = loadSessionEntry(sourceKey);
+    const { cfg, storePath, entry: sourceEntry, canonicalKey: canonicalSourceKey } = loaded;
+
+    if (!sourceEntry?.sessionId) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `sessions.fork: source session not found: ${sourceKey}`,
+        ),
+      );
+      return;
+    }
+
+    // Step 2: targetAgentId と newSessionKey の解析
+    // targetAgentId: 省略時は源 agentId を引き継ぐ（跨成員分岐も自然に機能）
+    const parsedSource = parseAgentSessionKey(canonicalSourceKey);
+    const sourceAgentId = normalizeAgentId(parsedSource?.agentId ?? resolveDefaultAgentId(cfg));
+    const targetAgentId =
+      typeof p.targetAgentId === "string" && p.targetAgentId.trim()
+        ? normalizeAgentId(p.targetAgentId.trim())
+        : sourceAgentId;
+
+    // newSessionKey: 省略時は agent:<agentId>:user:<uuid> 形式で生成
+    // 注意: パネル側でよく使われる "user:" プレフィックスのキーを踏襲する
+    const newSessionKey =
+      typeof p.newSessionKey === "string" && p.newSessionKey.trim()
+        ? p.newSessionKey.trim().toLowerCase()
+        : `agent:${targetAgentId}:user:${crypto.randomUUID()}`;
+
+    // targetAgentId と newSessionKey の一致チェック（異なる agent に別 agentId のキーを作れない）
+    const parsedNewKey = parseAgentSessionKey(newSessionKey);
+    if (parsedNewKey && parsedNewKey.agentId !== targetAgentId) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `sessions.fork: newSessionKey agent (${parsedNewKey.agentId}) does not match targetAgentId (${targetAgentId})`,
+        ),
+      );
+      return;
+    }
+
+    // Step 3 & 4: トークン護衛 + fork 実行
+    const parentForkMaxTokens = resolveParentForkMaxTokens(cfg);
+    const parentTotalTokens =
+      typeof sourceEntry.totalTokens === "number" ? sourceEntry.totalTokens : 0;
+    const needsTokenGuard = parentTotalTokens > parentForkMaxTokens;
+
+    // Step 5: targetAgentId のストアターゲットを先に解決する
+    // （cross-agent 時の fork 後ファイル移動先を決定するために fork 前に必要）
+    const targetStoreTarget = resolveGatewaySessionStoreTarget({ cfg, key: newSessionKey });
+    const targetStorePath = targetStoreTarget.storePath;
+    // targetAgentId のセッションディレクトリ（storePath の dirname = sessions/ ディレクトリ）
+    const targetSessionsDir = path.dirname(targetStorePath);
+
+    // Step 4: 実際の fork（護衛が不要な場合）
+    let forkedResult: { sessionId: string; sessionFile: string } | null = null;
+    if (!needsTokenGuard) {
+      // sessionsDir は「親ファイルを探すためのベースディレクトリ」として使われる
+      // （forkSessionFromParent の内部で resolveSessionFilePath に渡される）。
+      // ここではソース agent の sessions ディレクトリを渡す必要がある——
+      // ターゲット agent のディレクトリを渡すと親ファイルの containment check に失敗する。
+      // fork 出力の物理的な配置先は step 4b で mv により調整する。
+      const sourceSessionsDir = path.dirname(storePath);
+      forkedResult = forkSessionFromParent({
+        parentEntry: sourceEntry,
+        agentId: targetAgentId,
+        sessionsDir: sourceSessionsDir,
+      });
+      // forkSessionFromParent が null を返した（親ファイル不存在等）→ 空白フォールバック
+      // 黒洞を避けるためエラーにしない（design §4.2 step 4）
+
+      // Step 4b: cross-agent fork 時は jsonl をターゲット agent の sessionsDir に移動する。
+      // forkSessionFromParent は親ファイルと同じディレクトリに出力するため
+      // （manager.getSessionDir() = 親ファイルの dirname）、sourceAgentId ≠ targetAgentId の
+      // 場合に出力先がソース agent のディレクトリになってしまう。
+      // design §6「fork の jsonl 落 B の agentId 下」を実現するため、handler 側で mv する。
+      if (forkedResult && sourceAgentId !== targetAgentId) {
+        const srcFile = forkedResult.sessionFile;
+        const srcBasename = path.basename(srcFile);
+        const destFile = path.join(targetSessionsDir, srcBasename);
+        try {
+          // ターゲット sessionsDir が存在しない場合は作成する
+          fs.mkdirSync(targetSessionsDir, { recursive: true });
+          fs.renameSync(srcFile, destFile);
+          forkedResult = { sessionId: forkedResult.sessionId, sessionFile: destFile };
+        } catch (err) {
+          // mv 失敗時は元のパス（ソース agent ディレクトリ）のままフォールバック。
+          // 履歴を含む jsonl は絶対パスで store に登録されるので機能的には動くが、
+          // メタデータ（targetStore）と物理ファイル（sourceDir）が別 agent に分離する稀なケース
+          //（跨盤 EXDEV / 権限）。デグレード（履歴喪失）より「存在 + 動作」を優先しつつ、
+          // 後追い診断できるよう warn を残す（review #85 第二輪 Minor 1）。
+          context.logGateway.warn(
+            `sessions.fork: cross-agent jsonl move failed, keeping source path. ` +
+              `src=${srcFile} dest=${destFile} err=${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    }
+
+    const inheritedHistory = Boolean(forkedResult);
+
+    // Step 5b: 新会話を store に登録
+    await updateSessionStore(targetStorePath, (store) => {
+      // 空白エントリの sessionId と sessionFile を確定
+      const sessionId = forkedResult?.sessionId ?? crypto.randomUUID();
+      const sessionFile = forkedResult?.sessionFile ?? "";
+
+      // 新会話エントリを作成
+      // 源のモデル・思考レベル等メタデータを継承する（design §6「元数据継承」）
+      const newEntry: SessionEntry = {
+        sessionId,
+        updatedAt: Date.now(),
+        sessionFile: sessionFile || undefined,
+        // フォーク済みフラグ（session.ts の既存フォーク処理と同じ意味）
+        forkedFromParent: true,
+        // 源のモデル設定を継承
+        model: sourceEntry.model,
+        modelProvider: sourceEntry.modelProvider,
+        thinkingLevel: sourceEntry.thinkingLevel,
+        fastMode: sourceEntry.fastMode,
+        verboseLevel: sourceEntry.verboseLevel,
+        reasoningLevel: sourceEntry.reasoningLevel,
+        elevatedLevel: sourceEntry.elevatedLevel,
+        responseUsage: sourceEntry.responseUsage,
+      };
+
+      store[newSessionKey] = newEntry;
+    });
+
+    // 返却する sessionFile: フォーク成功時は実パス（mv 後）、フォールバック時は空文字
+    const resultSessionFile = forkedResult?.sessionFile ?? "";
+    const resultSessionId = forkedResult?.sessionId ?? "";
+
+    // フォールバック時（空白会話）の sessionId を store から取得
+    let finalSessionId = resultSessionId;
+    let finalSessionFile = resultSessionFile;
+    if (!forkedResult) {
+      // updateSessionStore の後に再読み込みして登録済みエントリを確認
+      const fallbackStore = loadSessionStore(targetStorePath);
+      const fallbackEntry = fallbackStore[newSessionKey];
+      if (fallbackEntry?.sessionId) {
+        finalSessionId = fallbackEntry.sessionId;
+        finalSessionFile = fallbackEntry.sessionFile ?? "";
+      }
+    }
+
+    // レスポンスペイロードを構築し、スキーマバリデーションを通してから返す
+    // （config.schema.lookup の validateConfigSchemaLookupResult と同じパターン）
+    const resultPayload = {
+      sessionKey: newSessionKey,
+      sessionId: finalSessionId,
+      sessionFile: finalSessionFile,
+      inheritedHistory,
+    };
+    if (!validateSessionsForkResult(resultPayload)) {
+      const errors = validateSessionsForkResult.errors ?? [];
+      context.logGateway.warn(
+        `sessions.fork produced invalid payload for ${newSessionKey}: ${formatValidationErrors(errors)}`,
+      );
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.UNAVAILABLE, "sessions.fork returned invalid payload", {
+          details: { errors },
+        }),
+      );
+      return;
+    }
+    respond(true, resultPayload, undefined);
   },
 };

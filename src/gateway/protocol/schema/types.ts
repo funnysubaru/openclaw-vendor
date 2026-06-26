@@ -47,6 +47,9 @@ export type SessionsRefreshBootstrapParams = SchemaType<"SessionsRefreshBootstra
 export type SessionsDeleteParams = SchemaType<"SessionsDeleteParams">;
 export type SessionsCompactParams = SchemaType<"SessionsCompactParams">;
 export type SessionsUsageParams = SchemaType<"SessionsUsageParams">;
+// sessions.fork: 入参/出参类型（Yuiclaw 对话分支继承上下文地基，design §4.1）
+export type SessionsForkParams = SchemaType<"SessionsForkParams">;
+export type SessionsForkResult = SchemaType<"SessionsForkResult">;
 export type ConfigGetParams = SchemaType<"ConfigGetParams">;
 export type ConfigSetParams = SchemaType<"ConfigSetParams">;
 export type ConfigApplyParams = SchemaType<"ConfigApplyParams">;

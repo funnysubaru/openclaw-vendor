@@ -636,8 +636,16 @@ export const sessionsHandlers: GatewayRequestHandlers = {
           fs.mkdirSync(targetSessionsDir, { recursive: true });
           fs.renameSync(srcFile, destFile);
           forkedResult = { sessionId: forkedResult.sessionId, sessionFile: destFile };
-        } catch {
-          // mv 失敗時は元のパスのままフォールバック（デグレードより存在することを優先）
+        } catch (err) {
+          // mv 失敗時は元のパス（ソース agent ディレクトリ）のままフォールバック。
+          // 履歴を含む jsonl は絶対パスで store に登録されるので機能的には動くが、
+          // メタデータ（targetStore）と物理ファイル（sourceDir）が別 agent に分離する稀なケース
+          //（跨盤 EXDEV / 権限）。デグレード（履歴喪失）より「存在 + 動作」を優先しつつ、
+          // 後追い診断できるよう warn を残す（review #85 第二輪 Minor 1）。
+          context.logGateway.warn(
+            `sessions.fork: cross-agent jsonl move failed, keeping source path. ` +
+              `src=${srcFile} dest=${destFile} err=${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       }
     }

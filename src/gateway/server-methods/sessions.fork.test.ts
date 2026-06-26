@@ -92,7 +92,10 @@ async function callForkHandler(params: Record<string, unknown>, respond: ReturnT
   await handler({
     params,
     respond: respond as never,
-    context: {} as never,
+    // logGateway は実 handler に常在（cross-agent mv 失敗時の warn など）。
+    // 跨成員シナリオ（Scenario 4）は mock ファイルが物理的に存在せず renameSync が
+    // ENOENT で catch に入るため、warn が呼ばれても落ちないよう mock を備える。
+    context: { logGateway: { warn: vi.fn(), info: vi.fn(), error: vi.fn() } } as never,
     req: {} as never,
     client: null as never,
     isWebchatConnect: () => false,

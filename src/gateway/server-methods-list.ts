@@ -60,6 +60,7 @@ const BASE_METHODS = [
   "sessions.refreshBootstrap",
   "sessions.delete",
   "sessions.compact",
+  "sessions.fork",
   "last-heartbeat",
   "set-heartbeats",
   "wake",

@@ -127,6 +127,38 @@ export const SessionsCompactParamsSchema = Type.Object(
   { additionalProperties: false },
 );
 
+// sessions.fork: 基于已有会话 fork 出一条带完整历史的新会话（Yuiclaw「对话分支继承上下文」地基）。
+// 设计来源：Yuiclaw design §4.1。
+// 不用 Type.Union / 裸 format，符合 vendor schema 守则。
+export const SessionsForkParamsSchema = Type.Object(
+  {
+    /** 要 fork 的源会话 key（必填，非空）。 */
+    sourceKey: NonEmptyString,
+    /** 新会话所属 agent（缺省 = 源会话的 agentId）。 */
+    targetAgentId: Type.Optional(NonEmptyString),
+    /** 新会话 key（缺省由实现按 agent + uuid 生成）。 */
+    newSessionKey: Type.Optional(NonEmptyString),
+  },
+  { additionalProperties: false },
+);
+
+export const SessionsForkResultSchema = Type.Object(
+  {
+    /** 新会话 key。 */
+    sessionKey: Type.String(),
+    /** 新会话 id。 */
+    sessionId: Type.String(),
+    /** 新会话 jsonl 的绝对路径。 */
+    sessionFile: Type.String(),
+    /**
+     * true = 历史已继承（forkSessionFromParent 成功）；
+     * false = 源对话过大命中 token 护栏，新会话从空起步。
+     */
+    inheritedHistory: Type.Boolean(),
+  },
+  { additionalProperties: false },
+);
+
 export const SessionsUsageParamsSchema = Type.Object(
   {
     /** Specific session key to analyze; if omitted returns all sessions. */

@@ -1,6 +1,12 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 import { resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import { clearBootstrapSnapshot } from "../../agents/bootstrap-cache.js";
+import {
+  forkSessionFromParent,
+  resolveParentForkMaxTokens,
+} from "../../auto-reply/reply/session-fork.js";
 import { loadConfig } from "../../config/config.js";
 import {
   loadSessionStore,
@@ -15,6 +21,7 @@ import {
   errorShape,
   validateSessionsCompactParams,
   validateSessionsDeleteParams,
+  validateSessionsForkParams,
   validateSessionsListParams,
   validateSessionsPatchParams,
   validateSessionsPreviewParams,
@@ -511,6 +518,156 @@ export const sessionsHandlers: GatewayRequestHandlers = {
         compacted: true,
         archived,
         kept: keptLines.length,
+      },
+      undefined,
+    );
+  },
+
+  // sessions.fork ——「対話ブランチ真継承コンテキスト」RPC（Yuiclaw design §4.1-4.2）
+  //
+  // 業務意図：
+  //   Yuiclaw 工作台のブランチ作成時に源会話の完全な履歴を新会話に複製する。
+  //   引擎にはすでに forkSessionFromParent（session-fork.ts）という実績ある実装があり、
+  //   それを「会話作成時機」で呼び出せるよう薄い RPC として公開するだけ（§0.4 上游已有不重造）。
+  //
+  // 行為：
+  //   1. sourceKey から源会話エントリを取得（存在しない → エラー）
+  //   2. targetAgentId 解析（省略時 = 源 agentId）、newSessionKey 解析（省略時 = 自動生成）
+  //   3. トークン護衛：源 totalTokens > parentForkMaxTokens → 空白会話を作成、inheritedHistory:false
+  //   4. forkSessionFromParent を呼び出し（null 返却時 → step 3 の空白フォールバック）
+  //   5. 新会話を store に登録（forkedFromParent=true、源のメタデータ継承）、永続化
+  //   6. 新会話 3 つ組 + inheritedHistory を返す
+  "sessions.fork": async ({ params, respond }) => {
+    if (!assertValidParams(params, validateSessionsForkParams, "sessions.fork", respond)) {
+      return;
+    }
+    const p = params;
+
+    // Step 1: 源会話エントリ取得
+    const sourceKey = String(p.sourceKey).trim();
+    const loaded = loadSessionEntry(sourceKey);
+    const { cfg, storePath, entry: sourceEntry, canonicalKey: canonicalSourceKey } = loaded;
+
+    if (!sourceEntry?.sessionId) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `sessions.fork: source session not found: ${sourceKey}`,
+        ),
+      );
+      return;
+    }
+
+    // Step 2: targetAgentId と newSessionKey の解析
+    // targetAgentId: 省略時は源 agentId を引き継ぐ（跨成員分岐も自然に機能）
+    const parsedSource = parseAgentSessionKey(canonicalSourceKey);
+    const sourceAgentId = normalizeAgentId(parsedSource?.agentId ?? resolveDefaultAgentId(cfg));
+    const targetAgentId =
+      typeof p.targetAgentId === "string" && p.targetAgentId.trim()
+        ? normalizeAgentId(p.targetAgentId.trim())
+        : sourceAgentId;
+
+    // newSessionKey: 省略時は agent:<agentId>:user:<uuid> 形式で生成
+    // 注意: パネル側でよく使われる "user:" プレフィックスのキーを踏襲する
+    const newSessionKey =
+      typeof p.newSessionKey === "string" && p.newSessionKey.trim()
+        ? p.newSessionKey.trim().toLowerCase()
+        : `agent:${targetAgentId}:user:${crypto.randomUUID()}`;
+
+    // targetAgentId と newSessionKey の一致チェック（異なる agent に別 agentId のキーを作れない）
+    const parsedNewKey = parseAgentSessionKey(newSessionKey);
+    if (parsedNewKey && parsedNewKey.agentId !== targetAgentId) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `sessions.fork: newSessionKey agent (${parsedNewKey.agentId}) does not match targetAgentId (${targetAgentId})`,
+        ),
+      );
+      return;
+    }
+
+    // Step 3 & 6: トークン護衛 + fork 実行
+    const parentForkMaxTokens = resolveParentForkMaxTokens(cfg);
+    const parentTotalTokens =
+      typeof sourceEntry.totalTokens === "number" ? sourceEntry.totalTokens : 0;
+    const needsTokenGuard = parentTotalTokens > parentForkMaxTokens;
+
+    // Step 4: 実際の fork（護衛が不要な場合）
+    let forkedResult: { sessionId: string; sessionFile: string } | null = null;
+    if (!needsTokenGuard) {
+      // sessionsDir = storePath の dirname（session.ts:507 と同じパターン）
+      const sessionsDir = path.dirname(storePath);
+      forkedResult = forkSessionFromParent({
+        parentEntry: sourceEntry,
+        agentId: targetAgentId,
+        sessionsDir,
+      });
+      // forkSessionFromParent が null を返した（親ファイル不存在等）→ 空白フォールバック
+      // 黒洞を避けるためエラーにしない（design §4.2 step 4）
+    }
+
+    const inheritedHistory = Boolean(forkedResult);
+
+    // Step 5: 新会話を store に登録
+    // targetAgentId が源と異なる場合は別の storePath になりうる
+    const targetStoreTarget = resolveGatewaySessionStoreTarget({ cfg, key: newSessionKey });
+    const targetStorePath = targetStoreTarget.storePath;
+
+    await updateSessionStore(targetStorePath, (store) => {
+      // 空白エントリの sessionId と sessionFile を確定
+      const sessionId = forkedResult?.sessionId ?? crypto.randomUUID();
+      const sessionFile = forkedResult?.sessionFile ?? "";
+
+      // 新会話エントリを作成
+      // 源のモデル・思考レベル等メタデータを継承する（design §6「元数据継承」）
+      const newEntry: SessionEntry = {
+        sessionId,
+        updatedAt: Date.now(),
+        sessionFile: sessionFile || undefined,
+        // フォーク済みフラグ（session.ts の既存フォーク処理と同じ意味）
+        forkedFromParent: true,
+        // 源のモデル設定を継承
+        model: sourceEntry.model,
+        modelProvider: sourceEntry.modelProvider,
+        thinkingLevel: sourceEntry.thinkingLevel,
+        fastMode: sourceEntry.fastMode,
+        verboseLevel: sourceEntry.verboseLevel,
+        reasoningLevel: sourceEntry.reasoningLevel,
+        elevatedLevel: sourceEntry.elevatedLevel,
+        responseUsage: sourceEntry.responseUsage,
+      };
+
+      store[newSessionKey] = newEntry;
+    });
+
+    // 返却する sessionFile: フォーク成功時は実パス、フォールバック時は空文字
+    const resultSessionFile = forkedResult?.sessionFile ?? "";
+    const resultSessionId = forkedResult?.sessionId ?? "";
+
+    // フォールバック時（空白会話）の sessionId を store から取得
+    let finalSessionId = resultSessionId;
+    let finalSessionFile = resultSessionFile;
+    if (!forkedResult) {
+      // updateSessionStore の後に再読み込みして登録済みエントリを確認
+      const fallbackStore = loadSessionStore(targetStorePath);
+      const fallbackEntry = fallbackStore[newSessionKey];
+      if (fallbackEntry?.sessionId) {
+        finalSessionId = fallbackEntry.sessionId;
+        finalSessionFile = fallbackEntry.sessionFile ?? "";
+      }
+    }
+
+    respond(
+      true,
+      {
+        sessionKey: newSessionKey,
+        sessionId: finalSessionId,
+        sessionFile: finalSessionFile,
+        inheritedHistory,
       },
       undefined,
     );

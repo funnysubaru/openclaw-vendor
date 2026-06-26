@@ -190,6 +190,10 @@ import {
   SessionsCompactParamsSchema,
   type SessionsDeleteParams,
   SessionsDeleteParamsSchema,
+  type SessionsForkParams,
+  SessionsForkParamsSchema,
+  type SessionsForkResult,
+  SessionsForkResultSchema,
   type SessionsListParams,
   SessionsListParamsSchema,
   type SessionsPatchParams,
@@ -330,8 +334,9 @@ export const validateSessionsPatchParams =
   ajv.compile<SessionsPatchParams>(SessionsPatchParamsSchema);
 export const validateSessionsResetParams =
   ajv.compile<SessionsResetParams>(SessionsResetParamsSchema);
-export const validateSessionsRefreshBootstrapParams =
-  ajv.compile<SessionsRefreshBootstrapParams>(SessionsRefreshBootstrapParamsSchema);
+export const validateSessionsRefreshBootstrapParams = ajv.compile<SessionsRefreshBootstrapParams>(
+  SessionsRefreshBootstrapParamsSchema,
+);
 export const validateSessionsDeleteParams = ajv.compile<SessionsDeleteParams>(
   SessionsDeleteParamsSchema,
 );
@@ -340,6 +345,9 @@ export const validateSessionsCompactParams = ajv.compile<SessionsCompactParams>(
 );
 export const validateSessionsUsageParams =
   ajv.compile<SessionsUsageParams>(SessionsUsageParamsSchema);
+// sessions.fork バリデータ（Yuiclaw 対話ブランチ継承コンテキスト基盤、design §4.1）
+export const validateSessionsForkParams = ajv.compile<SessionsForkParams>(SessionsForkParamsSchema);
+export const validateSessionsForkResult = ajv.compile<SessionsForkResult>(SessionsForkResultSchema);
 export const validateConfigGetParams = ajv.compile<ConfigGetParams>(ConfigGetParamsSchema);
 export const validateConfigSetParams = ajv.compile<ConfigSetParams>(ConfigSetParamsSchema);
 export const validateConfigApplyParams = ajv.compile<ConfigApplyParams>(ConfigApplyParamsSchema);
@@ -502,6 +510,8 @@ export {
   SessionsDeleteParamsSchema,
   SessionsCompactParamsSchema,
   SessionsUsageParamsSchema,
+  SessionsForkParamsSchema,
+  SessionsForkResultSchema,
   ConfigGetParamsSchema,
   ConfigSetParamsSchema,
   ConfigApplyParamsSchema,
@@ -658,6 +668,8 @@ export type {
   SessionsDeleteParams,
   SessionsCompactParams,
   SessionsUsageParams,
+  SessionsForkParams,
+  SessionsForkResult,
   CronJob,
   CronListParams,
   CronStatusParams,

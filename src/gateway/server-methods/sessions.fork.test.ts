@@ -397,7 +397,11 @@ describe("sessions.fork — シナリオ 4：targetAgentId 指定（跨成員分
     );
   });
 
-  it("forkSessionFromParent が targetAgentId=b で呼ばれる", async () => {
+  it("forkSessionFromParent が targetAgentId=b + ソース sessionsDir で呼ばれる", async () => {
+    // sessionsDir はソース agent の sessions ディレクトリを渡す必要がある——
+    // forkSessionFromParent が親ファイルを「探す」ためのパスであり、
+    // ターゲット agent のディレクトリを渡すと containment check に失敗する。
+    // fork 後の jsonl 移動先（ターゲット sessionsDir）は handler 内で mv により対処する。
     const respond = makeRespond();
     await callForkHandler(
       { sourceKey: "agent:main:user:parent-cross", targetAgentId: "b" },
@@ -407,6 +411,8 @@ describe("sessions.fork — シナリオ 4：targetAgentId 指定（跨成員分
     expect(mockForkSessionFromParent).toHaveBeenCalledTimes(1);
     const callArg = mockForkSessionFromParent.mock.calls[0][0];
     expect(callArg.agentId).toBe("b");
+    // sessionsDir はソース agent（main）の sessions ディレクトリ
+    expect(callArg.sessionsDir).toBe(path.dirname(STORE_PATH));
   });
 
   it("返却された sessionKey が agent:b: プレフィックスを持つ", async () => {
@@ -442,5 +448,140 @@ describe("sessions.fork — シナリオ 4：targetAgentId 指定（跨成員分
     const [ok, result] = respond.mock.calls[0];
     expect(ok).toBe(true);
     expect(result.sessionFile).toContain(path.dirname(AGENT_B_STORE_PATH));
+  });
+});
+
+describe("sessions.fork — シナリオ 5：forkSessionFromParent が null を返す", () => {
+  // forkSessionFromParent が null を返した場合（親ファイルが見つからない等）の挙動を検証。
+  // 期待：inheritedHistory=false、updateSessionStore は呼ばれる、sessionKey は提供される。
+  // （design §4.2 step 4「黒洞を避ける」。エラーにしないのは意図通り。）
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    mockLoadSessionEntry.mockReturnValue({
+      cfg: { session: { mainKey: "main", parentForkMaxTokens: 100_000 }, agents: [] },
+      storePath: STORE_PATH,
+      entry: {
+        sessionId: "parent-sess-nullfork",
+        sessionFile: "/tmp/openclaw-test/agents/main/sessions/parent-null.jsonl",
+        updatedAt: Date.now() - 1000,
+        totalTokens: 10_000,
+        model: "claude-opus-4-8",
+      },
+      canonicalKey: "agent:main:user:parent-null",
+      legacyKey: undefined,
+    });
+
+    mockResolveGatewaySessionStoreTarget.mockReturnValue({
+      agentId: "main",
+      storePath: STORE_PATH,
+      canonicalKey: "agent:main:user:null-fork-result",
+      storeKeys: ["agent:main:user:null-fork-result"],
+    });
+
+    mockResolveParentForkMaxTokens.mockReturnValue(100_000);
+
+    // forkSessionFromParent が null を返す（親ファイル不存在等の想定外エラー）
+    mockForkSessionFromParent.mockReturnValue(null);
+
+    // updateSessionStore はコールバックを実行する
+    mockUpdateSessionStore.mockImplementation(
+      async (_storePath: string, cb: (store: Record<string, unknown>) => unknown) => {
+        const store: Record<string, unknown> = {};
+        await cb(store);
+      },
+    );
+
+    // loadSessionStore: 空白フォールバックのエントリを返す
+    mockLoadSessionStore.mockReturnValue({
+      "agent:main:user:null-fork-result": {
+        sessionId: "null-fork-fallback-uuid",
+        updatedAt: Date.now(),
+        forkedFromParent: true,
+      },
+    });
+  });
+
+  it("inheritedHistory=false を返す（null fork はフォールバック扱い）", async () => {
+    const respond = makeRespond();
+    await callForkHandler({ sourceKey: "agent:main:user:parent-null" }, respond);
+
+    const [ok, result] = respond.mock.calls[0];
+    expect(ok).toBe(true);
+    expect(result.inheritedHistory).toBe(false);
+  });
+
+  it("updateSessionStore は呼ばれる（空白会話を作成する）", async () => {
+    const respond = makeRespond();
+    await callForkHandler({ sourceKey: "agent:main:user:parent-null" }, respond);
+
+    expect(mockUpdateSessionStore).toHaveBeenCalledTimes(1);
+  });
+
+  it("sessionKey が返される（null fork でも会話キーは使える）", async () => {
+    const respond = makeRespond();
+    await callForkHandler({ sourceKey: "agent:main:user:parent-null" }, respond);
+
+    const [ok, result] = respond.mock.calls[0];
+    expect(ok).toBe(true);
+    expect(result.sessionKey).toBeTruthy();
+    expect(typeof result.sessionKey).toBe("string");
+  });
+});
+
+describe("sessions.fork — シナリオ 6：newSessionKey の agentId がtargetAgentId と不一致", () => {
+  // targetAgentId=b + newSessionKey が agent:main:... の場合、
+  // 異なる agent に別 agent の key を割り当てようとしている → INVALID_REQUEST エラー。
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    mockLoadSessionEntry.mockReturnValue({
+      cfg: { session: { mainKey: "main", parentForkMaxTokens: 100_000 }, agents: [] },
+      storePath: STORE_PATH,
+      entry: {
+        sessionId: "parent-sess-mismatch",
+        sessionFile: "/tmp/openclaw-test/agents/main/sessions/parent-mismatch.jsonl",
+        updatedAt: Date.now() - 1000,
+        totalTokens: 10_000,
+        model: "claude-opus-4-8",
+      },
+      canonicalKey: "agent:main:user:parent-mismatch",
+      legacyKey: undefined,
+    });
+  });
+
+  it("targetAgentId=b + newSessionKey=agent:main:... は INVALID_REQUEST エラー", async () => {
+    const respond = makeRespond();
+    await callForkHandler(
+      {
+        sourceKey: "agent:main:user:parent-mismatch",
+        targetAgentId: "b",
+        newSessionKey: "agent:main:user:conflicting-key",
+      },
+      respond,
+    );
+
+    expect(respond).toHaveBeenCalledTimes(1);
+    const [ok, _result, error] = respond.mock.calls[0];
+    expect(ok).toBe(false);
+    expect(error).toBeDefined();
+    // エラーコードは INVALID_REQUEST
+    expect(error.code).toBe("INVALID_REQUEST");
+  });
+
+  it("不一致の場合は forkSessionFromParent は呼ばれない", async () => {
+    const respond = makeRespond();
+    await callForkHandler(
+      {
+        sourceKey: "agent:main:user:parent-mismatch",
+        targetAgentId: "b",
+        newSessionKey: "agent:main:user:conflicting-key",
+      },
+      respond,
+    );
+
+    expect(mockForkSessionFromParent).not.toHaveBeenCalled();
   });
 });

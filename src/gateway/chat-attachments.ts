@@ -1,5 +1,6 @@
 import { estimateBase64DecodedBytes } from "../media/base64.js";
 import { sniffMimeFromBase64 } from "../media/sniff-mime-from-base64.js";
+import { saveMediaBuffer } from "../media/store.js";
 
 export type ChatAttachment = {
   type?: string;
@@ -28,6 +29,12 @@ type NormalizedAttachment = {
   mime: string;
   base64: string;
 };
+
+/**
+ * 依赖注入接口：便于单测中替换 saveMediaBuffer，避免真实落盘。
+ * 正常运行时使用 media/store.ts 的实现。
+ */
+export type SaveMediaBufferFn = typeof saveMediaBuffer;
 
 function normalizeMime(mime?: string): string | undefined {
   if (!mime) {
@@ -91,21 +98,51 @@ function validateAttachmentBase64OrThrow(
 
 /**
  * Parse attachments and extract images as structured content blocks.
- * Returns the message text and an array of image content blocks
- * compatible with Claude API's image format.
+ *
+ * 业务意图（Yuiclaw 扩展行为）：
+ * 对每一张图片，除了保留原有的内联 base64 image 块（供多模态模型"看图"），
+ * 还会同步把 buffer 落盘到 media/inbound/ 目录，并在消息文本末尾追加：
+ *   [media attached: <absolutePath> (<mimeType>)]
+ * 这样下游 skill / AI 员工在需要处理图片文件时，可以直接从文本拿到确切路径，
+ * 无需自己搜索文件系统或上网下载错误图片。
+ *
+ * 政策差异（相对上游 openclaw）：
+ * 上游只对超过 2MB 的图片 offload；我们对所有图片都同时落盘一份，小图也不例外。
+ * 这是"既内联也存文件"策略，不是"大图才挪走"。
+ *
+ * 容错行为：
+ * 落盘失败时记日志、跳过该图的 path 追加，内联 base64 照常发送，
+ * 不因存盘失败而中断整条消息。
+ *
+ * 参考渠道（本仓库已有相同模式）：
+ * - src/web/inbound/monitor.ts:292
+ * - src/discord/monitor/message-utils.ts:290
+ * - src/browser/proxy-files.ts:16
+ *
+ * Returns the message text (可能追加了 [media attached: ...] 行) 和内联 image content 数组。
  */
 export async function parseMessageWithAttachments(
   message: string,
   attachments: ChatAttachment[] | undefined,
-  opts?: { maxBytes?: number; log?: AttachmentLog },
+  opts?: {
+    maxBytes?: number;
+    log?: AttachmentLog;
+    /** 仅供单测注入，正常运行时不传（走 saveMediaBuffer 默认实现） */
+    saveMediaBufferFn?: SaveMediaBufferFn;
+  },
 ): Promise<ParsedMessageWithImages> {
   const maxBytes = opts?.maxBytes ?? 5_000_000; // decoded bytes (5,000,000)
   const log = opts?.log;
+  // 默认使用 media/store.ts 的 saveMediaBuffer；单测可注入 mock 避免真实 I/O。
+  const saveMedia = opts?.saveMediaBufferFn ?? saveMediaBuffer;
+
   if (!attachments || attachments.length === 0) {
     return { message, images: [] };
   }
 
   const images: ChatImageContent[] = [];
+  // 落盘成功的图片路径和类型，用于在消息末尾追加 [media attached: ...] 行。
+  const savedPaths: Array<{ path: string; mimeType: string }> = [];
 
   for (const [idx, att] of attachments.entries()) {
     if (!att) {
@@ -134,14 +171,48 @@ export async function parseMessageWithAttachments(
       );
     }
 
+    const finalMime = sniffedMime ?? providedMime ?? mime;
+
+    // 内联 base64 image 块——多模态模型 plan 阶段需要"看图"，不能去掉。
     images.push({
       type: "image",
       data: b64,
-      mimeType: sniffedMime ?? providedMime ?? mime,
+      mimeType: finalMime,
     });
+
+    // 同步落盘到 media/inbound/，让下游 skill / AI 员工能拿到确切文件路径。
+    // 策略：对所有图片都落盘（包括小图），这是 Yuiclaw 的业务需求。
+    // 容错：落盘失败只记日志、不阻断消息发送。
+    try {
+      const buffer = Buffer.from(b64, "base64");
+      const saved = await saveMedia(buffer, finalMime, "inbound");
+      savedPaths.push({ path: saved.path, mimeType: finalMime });
+    } catch (err) {
+      // 落盘失败不中断消息，仅记日志。内联 base64 仍会发送。
+      log?.warn(`attachment ${label}: failed to save to disk (${String(err)}), path skipped`);
+    }
   }
 
-  return { message, images };
+  // 在消息文本末尾追加 [media attached: ...] 行，格式对齐本仓库其他渠道（media-note.ts）。
+  // 单图：[media attached: <path> (<mimeType>)]
+  // 多图：首行 [media attached: N files]，然后逐行 [media attached N/M: <path> (<mimeType>)]
+  let finalMessage = message;
+  if (savedPaths.length === 1) {
+    // 此处 length === 1 已确认，index 0 存在，无需 ! 断言。
+    const entry = savedPaths[0];
+    const note = `[media attached: ${entry.path} (${entry.mimeType})]`;
+    finalMessage = finalMessage ? `${finalMessage}\n${note}` : note;
+  } else if (savedPaths.length > 1) {
+    const count = savedPaths.length;
+    const lines: string[] = [`[media attached: ${count} files]`];
+    for (const [i, entry] of savedPaths.entries()) {
+      lines.push(`[media attached ${i + 1}/${count}: ${entry.path} (${entry.mimeType})]`);
+    }
+    const note = lines.join("\n");
+    finalMessage = finalMessage ? `${finalMessage}\n${note}` : note;
+  }
+
+  return { message: finalMessage, images };
 }
 
 /**

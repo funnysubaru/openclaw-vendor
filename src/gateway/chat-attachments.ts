@@ -202,8 +202,8 @@ export async function parseMessageWithAttachments(
   // 多图：首行 [media attached: N files]，然后逐行 [media attached N/M: <path> (<mimeType>)]
   //
   // ⚠️ 格式字节必须与 src/auto-reply/media-note.ts 的 formatMediaAttachedLine 产出保持一致，
-  //   因为 src/gateway/images.ts 的 mediaAttachedPattern 和 Yuiclaw extensions 的
-  //   prependContext / SKILL.md 都锚定这个格式进行解析。
+  //   因为 src/agents/pi-embedded-runner/run/images.ts:119 的 mediaAttachedPattern 和
+  //   Yuiclaw extensions 的 prependContext / SKILL.md 都锚定这个格式进行解析。
   //   （media-note.ts 的 formatMediaAttachedLine 是模块私有函数，且多图首行没有被它包装，
   //    故此处保留手拼；若将来抽取为公共 helper，须同步验证格式零变化。）
   //

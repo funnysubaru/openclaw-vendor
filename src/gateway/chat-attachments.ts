@@ -185,7 +185,11 @@ export async function parseMessageWithAttachments(
     // 容错：落盘失败只记日志、不阻断消息发送。
     try {
       const buffer = Buffer.from(b64, "base64");
-      const saved = await saveMedia(buffer, finalMime, "inbound");
+      // 第 4 参 maxBytes 与上方大小校验保持同源，第 5 参 originalFilename 传入
+      // att.fileName（用户上传时的原始文件名），使落盘文件名形如 {sanitized}---{uuid}.ext，
+      // 与 web 渠道（monitor.ts:292）的落盘策略一致，便于 skill 拿到可读文件名。
+      // att.fileName 缺省时 originalFilename=undefined，saveMediaBuffer 自动退回纯 UUID 命名。
+      const saved = await saveMedia(buffer, finalMime, "inbound", maxBytes, att.fileName);
       savedPaths.push({ path: saved.path, mimeType: finalMime });
     } catch (err) {
       // 落盘失败不中断消息，仅记日志。内联 base64 仍会发送。
@@ -196,6 +200,16 @@ export async function parseMessageWithAttachments(
   // 在消息文本末尾追加 [media attached: ...] 行，格式对齐本仓库其他渠道（media-note.ts）。
   // 单图：[media attached: <path> (<mimeType>)]
   // 多图：首行 [media attached: N files]，然后逐行 [media attached N/M: <path> (<mimeType>)]
+  //
+  // ⚠️ 格式字节必须与 src/auto-reply/media-note.ts 的 formatMediaAttachedLine 产出保持一致，
+  //   因为 src/gateway/images.ts 的 mediaAttachedPattern 和 Yuiclaw extensions 的
+  //   prependContext / SKILL.md 都锚定这个格式进行解析。
+  //   （media-note.ts 的 formatMediaAttachedLine 是模块私有函数，且多图首行没有被它包装，
+  //    故此处保留手拼；若将来抽取为公共 helper，须同步验证格式零变化。）
+  //
+  // 【部分失败时的格式退化】最终格式由**成功落盘的张数**决定，与原始附件数无关。
+  //   例如：提交 2 张图，只有 1 张落盘成功 → 输出单图格式 [media attached: path (mime)]
+  //   而非 N files 首行。agent 侧不应假设「多附件请求必有 N files 首行」。
   let finalMessage = message;
   if (savedPaths.length === 1) {
     // 此处 length === 1 已确认，index 0 存在，无需 ! 断言。

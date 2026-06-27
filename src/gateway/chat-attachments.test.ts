@@ -25,14 +25,27 @@ async function parseWithWarnings(
 /**
  * 构造一个 saveMediaBuffer mock，返回指定的 path。
  * 用于避免单测中真实写磁盘，同时验证调用行为。
+ * calls 记录所有参数（含 maxBytes / originalFilename），方便断言 Important 1 的传参对齐。
  */
 function makeSaveMediaMock(fixedPath: string): {
   fn: SaveMediaBufferFn;
-  calls: Array<{ buffer: Buffer; contentType?: string; subdir?: string }>;
+  calls: Array<{
+    buffer: Buffer;
+    contentType?: string;
+    subdir?: string;
+    maxBytes?: number;
+    originalFilename?: string;
+  }>;
 } {
-  const calls: Array<{ buffer: Buffer; contentType?: string; subdir?: string }> = [];
-  const fn: SaveMediaBufferFn = async (buffer, contentType, subdir) => {
-    calls.push({ buffer, contentType, subdir });
+  const calls: Array<{
+    buffer: Buffer;
+    contentType?: string;
+    subdir?: string;
+    maxBytes?: number;
+    originalFilename?: string;
+  }> = [];
+  const fn: SaveMediaBufferFn = async (buffer, contentType, subdir, maxBytes, originalFilename) => {
+    calls.push({ buffer, contentType, subdir, maxBytes, originalFilename });
     return {
       id: "test-id",
       path: fixedPath,
@@ -225,6 +238,9 @@ describe("parseMessageWithAttachments - 落盘到 media/inbound（Yuiclaw 扩展
     expect(calls[0]?.contentType).toBe("image/png");
     // buffer 内容应等于 base64 decode 结果。
     expect(calls[0]?.buffer).toEqual(Buffer.from(PNG_1x1, "base64"));
+    // maxBytes 应与 opts.maxBytes 一致（默认 5_000_000），originalFilename 应透传 att.fileName。
+    expect(calls[0]?.maxBytes).toBe(5_000_000);
+    expect(calls[0]?.originalFilename).toBe("upload.png");
 
     // 消息文本末尾出现了 [media attached: <path> (<mimeType>)] 标记。
     expect(parsed.message).toContain("请看这张图");
@@ -330,6 +346,29 @@ describe("parseMessageWithAttachments - 落盘到 media/inbound（Yuiclaw 扩展
     );
     // 不该在空字符串前加换行，直接从标记开始。
     expect(parsed.message).toBe("[media attached: /media/inbound/img.png (image/png)]");
+  });
+
+  it("originalFilename 透传：att.fileName 有值时传给 saveMediaBuffer；缺省时传 undefined", async () => {
+    // Important 1：落盘时应传入原始文件名，使落盘文件名形如 {sanitized}---{uuid}.ext（与 web 渠道一致）。
+    // 这让电商设计师等 skill 把图 cp 进 inputs/ 时能拿到可读文件名（如「正面.jpg」而非纯 UUID）。
+    const { fn: fnWithName, calls: callsWithName } = makeSaveMediaMock("/media/inbound/img.png");
+    await parseWithWarnings(
+      "有文件名",
+      [{ type: "image", mimeType: "image/png", fileName: "正面.jpg", content: PNG_1x1 }],
+      fnWithName,
+    );
+    // fileName 非空时，originalFilename 应等于 att.fileName。
+    expect(callsWithName[0]?.originalFilename).toBe("正面.jpg");
+
+    // att.fileName 缺省（undefined）时，originalFilename 应为 undefined，
+    // saveMediaBuffer 内部会退回纯 UUID 命名。
+    const { fn: fnNoName, calls: callsNoName } = makeSaveMediaMock("/media/inbound/uuid.png");
+    await parseWithWarnings(
+      "无文件名",
+      [{ type: "image", mimeType: "image/png", content: PNG_1x1 }],
+      fnNoName,
+    );
+    expect(callsNoName[0]?.originalFilename).toBeUndefined();
   });
 });
 

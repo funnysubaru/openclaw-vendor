@@ -12,6 +12,7 @@ import {
 } from "./models-config.e2e-harness.js";
 import { ensureOpenClawModelsJson } from "./models-config.js";
 import { readGeneratedModelsJson } from "./models-config.test-utils.js";
+import { resolveModel } from "./pi-embedded-runner/model.js";
 
 installModelsConfigTestHooks();
 
@@ -51,18 +52,44 @@ describe("openai-codex implicit provider", () => {
         await writeCodexOauthProfile(agentDir);
 
         const providers = await resolveImplicitProvidersForTest({ agentDir });
-        // gpt-5.4-mini / gpt-5.5 are declared directly in buildOpenAICodexProvider()
-        // (see models-config.providers.static.ts) because the pinned
-        // @mariozechner/pi-ai model registry doesn't know these ids yet.
+        // Codex OAuth 存在时会合成 openai-codex 的 implicit provider，只带
+        // baseUrl/api、不带 apiKey；机型清单刻意留空（models: []），因为
+        // openai-codex 的机型来自 pi-ai 内置目录，不从这里的 implicit 块取。
         expect(providers?.["openai-codex"]).toMatchObject({
           baseUrl: "https://chatgpt.com/backend-api",
           api: "openai-codex-responses",
-          models: [
-            expect.objectContaining({ id: "gpt-5.4-mini" }),
-            expect.objectContaining({ id: "gpt-5.5" }),
-          ],
+          models: [],
         });
         expect(providers?.["openai-codex"]).not.toHaveProperty("apiKey");
+      });
+    });
+  });
+
+  it("resolves gpt-5.5 / gpt-5.4-mini at request time with no cfg (real-runtime gate)", async () => {
+    await withModelsTempHome(async () => {
+      await withTempEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS, async () => {
+        unsetEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS);
+        const agentDir = resolveOpenClawAgentDir();
+        // 模拟 Codex OAuth + 真实 boot 写盘路径，尽量贴近线上 agent 启动。
+        await writeCodexOauthProfile(agentDir);
+        await ensureOpenClawModelsJson({});
+
+        // 关键验收门：cfg = undefined，复刻真实请求时 resolveModel 的调用
+        // （run.ts:364 传的是用户 openclaw.json，其中并没有生成的 providers 块）。
+        // 之前 buildOpenAICodexProvider 塞静态模型的机制在这一场景会报
+        // "Unknown model"，因为 ModelRegistry.find() 只认 pi-ai 内置目录、
+        // 不认 models.json 的 implicit 块。改用 pnpm patch 把两款补进 pi-ai
+        // 内置目录后，find() 直接命中，这里必须转绿。
+        for (const modelId of ["gpt-5.5", "gpt-5.4-mini"]) {
+          const result = resolveModel("openai-codex", modelId, agentDir, undefined);
+          expect(result.error).toBeUndefined();
+          expect(result.model).toMatchObject({
+            provider: "openai-codex",
+            id: modelId,
+            api: "openai-codex-responses",
+            baseUrl: "https://chatgpt.com/backend-api",
+          });
+        }
       });
     });
   });

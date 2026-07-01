@@ -459,34 +459,15 @@ export function buildOpenAICodexProvider(): ProviderConfig {
   return {
     baseUrl: OPENAI_CODEX_BASE_URL,
     api: "openai-codex-responses",
-    // gpt-5.5 / gpt-5.4-mini: added ahead of the upstream @mariozechner/pi-ai
-    // model registry catching up (pinned pi-ai 0.57.1 does not know these ids
-    // yet). Declaring them here makes them flow through the same
-    // models.json write path as every other implicit provider, so they show
-    // up in the model picker catalog AND resolve correctly at request time
-    // (see resolveModelWithRegistry's buildInlineProviderModels fallback in
-    // pi-embedded-runner/model.ts). api/baseUrl are inherited from the
-    // provider entry above, so they don't need to be repeated per model.
-    models: [
-      {
-        id: "gpt-5.4-mini",
-        name: "GPT-5.4 Mini",
-        reasoning: true,
-        input: ["text", "image"],
-        cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
-        contextWindow: 272000,
-        maxTokens: 128000,
-      },
-      {
-        id: "gpt-5.5",
-        name: "GPT-5.5",
-        reasoning: true,
-        input: ["text", "image"],
-        cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
-        contextWindow: 272000,
-        maxTokens: 128000,
-      },
-    ],
+    // 这里刻意留空：openai-codex 的机型清单（含新增的 gpt-5.5 / gpt-5.4-mini）
+    // 全部来自 @mariozechner/pi-ai 的内置目录（models.generated.js 的
+    // "openai-codex" 块）。运行时解析走 pi-coding-agent 的 ModelRegistry.find()，
+    // 它读的正是 pi-ai getModels() 的内置目录，而不是这里写进 models.json 的
+    // implicit-provider 块——所以模型只有进内置目录才能在请求时真正 resolve 到，
+    // 否则会「选得到但报 Unknown model」。因 pinned pi-ai 0.57.1 尚不认识
+    // gpt-5.5 / gpt-5.4-mini，我们用 pnpm patch 把这两款补进它的内置目录
+    // （patches/@mariozechner__pi-ai@0.57.1.patch），故此处无需再声明。
+    models: [],
   };
 }
 

@@ -105,10 +105,16 @@ const MATRIX_CASES: MatrixCase[] = [
       },
     },
     assertProviders(providers) {
+      // gpt-5.4-mini / gpt-5.5 are declared directly in buildOpenAICodexProvider()
+      // (see models-config.providers.static.ts) since the pinned pi-ai
+      // model registry does not know these ids yet.
       expect(providers?.["openai-codex"]).toMatchObject({
         baseUrl: "https://chatgpt.com/backend-api",
         api: "openai-codex-responses",
-        models: [],
+        models: [
+          expect.objectContaining({ id: "gpt-5.4-mini" }),
+          expect.objectContaining({ id: "gpt-5.5" }),
+        ],
       });
       expect(providers?.["openai-codex"]).not.toHaveProperty("apiKey");
       expect(providers?.["minimax-portal"]?.apiKey).toBe(MINIMAX_OAUTH_MARKER);

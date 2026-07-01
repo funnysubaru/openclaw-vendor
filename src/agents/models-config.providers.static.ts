@@ -459,7 +459,34 @@ export function buildOpenAICodexProvider(): ProviderConfig {
   return {
     baseUrl: OPENAI_CODEX_BASE_URL,
     api: "openai-codex-responses",
-    models: [],
+    // gpt-5.5 / gpt-5.4-mini: added ahead of the upstream @mariozechner/pi-ai
+    // model registry catching up (pinned pi-ai 0.57.1 does not know these ids
+    // yet). Declaring them here makes them flow through the same
+    // models.json write path as every other implicit provider, so they show
+    // up in the model picker catalog AND resolve correctly at request time
+    // (see resolveModelWithRegistry's buildInlineProviderModels fallback in
+    // pi-embedded-runner/model.ts). api/baseUrl are inherited from the
+    // provider entry above, so they don't need to be repeated per model.
+    models: [
+      {
+        id: "gpt-5.4-mini",
+        name: "GPT-5.4 Mini",
+        reasoning: true,
+        input: ["text", "image"],
+        cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
+        contextWindow: 272000,
+        maxTokens: 128000,
+      },
+      {
+        id: "gpt-5.5",
+        name: "GPT-5.5",
+        reasoning: true,
+        input: ["text", "image"],
+        cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
+        contextWindow: 272000,
+        maxTokens: 128000,
+      },
+    ],
   };
 }
 

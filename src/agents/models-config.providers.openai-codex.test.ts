@@ -51,10 +51,16 @@ describe("openai-codex implicit provider", () => {
         await writeCodexOauthProfile(agentDir);
 
         const providers = await resolveImplicitProvidersForTest({ agentDir });
+        // gpt-5.4-mini / gpt-5.5 are declared directly in buildOpenAICodexProvider()
+        // (see models-config.providers.static.ts) because the pinned
+        // @mariozechner/pi-ai model registry doesn't know these ids yet.
         expect(providers?.["openai-codex"]).toMatchObject({
           baseUrl: "https://chatgpt.com/backend-api",
           api: "openai-codex-responses",
-          models: [],
+          models: [
+            expect.objectContaining({ id: "gpt-5.4-mini" }),
+            expect.objectContaining({ id: "gpt-5.5" }),
+          ],
         });
         expect(providers?.["openai-codex"]).not.toHaveProperty("apiKey");
       });

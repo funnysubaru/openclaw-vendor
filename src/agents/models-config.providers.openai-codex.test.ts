@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { resolveOpenClawAgentDir } from "./agent-paths.js";
+import { loadModelCatalog, resetModelCatalogCacheForTest } from "./model-catalog.js";
 import {
   installModelsConfigTestHooks,
   MODELS_CONFIG_IMPLICIT_ENV_VARS,
@@ -92,6 +93,30 @@ describe("openai-codex implicit provider", () => {
         }
       });
     });
+  });
+
+  it("surfaces gpt-5.5 / gpt-5.4-mini in the model-catalog layer (getAll)", async () => {
+    // 可选补充验收（round 2/3 review Minor 项）：model-catalog.ts 的 loadModelCatalog()
+    // 走的是真实 ModelRegistry.getAll()（picker/列表用），跟上面 resolveModel() 走的
+    // find() 是两条不同代码路径。两条路径背后都依赖同一份 pi-ai patch 后的内置目录，
+    // 这里不 mock __setModelCatalogImportForTest，直接验证 patch 对 getAll() 同样生效。
+    resetModelCatalogCacheForTest();
+    await withModelsTempHome(async () => {
+      await withTempEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS, async () => {
+        unsetEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS);
+        const agentDir = resolveOpenClawAgentDir();
+        await writeCodexOauthProfile(agentDir);
+        await ensureOpenClawModelsJson({});
+
+        const catalog = await loadModelCatalog({ useCache: false });
+        const codexModelIds = new Set(
+          catalog.filter((entry) => entry.provider === "openai-codex").map((entry) => entry.id),
+        );
+        expect(codexModelIds.has("gpt-5.5")).toBe(true);
+        expect(codexModelIds.has("gpt-5.4-mini")).toBe(true);
+      });
+    });
+    resetModelCatalogCacheForTest();
   });
 
   it("replaces stale openai-codex baseUrl in generated models.json", async () => {

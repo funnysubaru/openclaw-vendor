@@ -59,6 +59,13 @@ describe("listThinkingLevels", () => {
     expect(listThinkingLevels("openai-codex", "gpt-5.4")).toContain("xhigh");
   });
 
+  it("includes xhigh for openai-codex gpt-5.5 and gpt-5.4-mini", () => {
+    // 两款新 Codex 订阅机型都已登记进 XHIGH_MODEL_REFS 白名单
+    // （thinking.ts），因此和上面的 gpt-5.4 一样具备 xhigh 思考档。
+    expect(listThinkingLevels("openai-codex", "gpt-5.5")).toContain("xhigh");
+    expect(listThinkingLevels("openai-codex", "gpt-5.4-mini")).toContain("xhigh");
+  });
+
   it("includes xhigh for github-copilot gpt-5.2 refs", () => {
     expect(listThinkingLevels("github-copilot", "gpt-5.2")).toContain("xhigh");
     expect(listThinkingLevels("github-copilot", "gpt-5.2-codex")).toContain("xhigh");

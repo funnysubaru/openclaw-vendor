@@ -459,6 +459,14 @@ export function buildOpenAICodexProvider(): ProviderConfig {
   return {
     baseUrl: OPENAI_CODEX_BASE_URL,
     api: "openai-codex-responses",
+    // 这里刻意留空：openai-codex 的机型清单（含新增的 gpt-5.5 / gpt-5.4-mini）
+    // 全部来自 @mariozechner/pi-ai 的内置目录（models.generated.js 的
+    // "openai-codex" 块）。运行时解析走 pi-coding-agent 的 ModelRegistry.find()，
+    // 它读的正是 pi-ai getModels() 的内置目录，而不是这里写进 models.json 的
+    // implicit-provider 块——所以模型只有进内置目录才能在请求时真正 resolve 到，
+    // 否则会「选得到但报 Unknown model」。因 pinned pi-ai 0.57.1 尚不认识
+    // gpt-5.5 / gpt-5.4-mini，我们用 pnpm patch 把这两款补进它的内置目录
+    // （patches/@mariozechner__pi-ai@0.57.1.patch），故此处无需再声明。
     models: [],
   };
 }

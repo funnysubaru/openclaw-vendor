@@ -408,8 +408,9 @@ describe("runGatewayLoop", () => {
   });
 
   // Yuiclaw B组：Windows 上父进程管不了子进程的 POSIX 信号，改用 stdin 暗号
-  // 触发同一条 request("stop") 优雅关闭路径。下面三个用例覆盖：①暗号生效
-  // ②非暗号行不触发 ③env 未开启时压根不装 readline（对上游/其它运行方式零影响）。
+  // 触发同一条 request("stop") 优雅关闭路径。下面四个用例覆盖：①暗号生效
+  // ②非暗号行不触发 ③env 未开启时压根不装 readline ④env 非严格 "1" 值同样不装
+  // readline（对上游/其它运行方式零影响）。
   it("shuts down on stdin sentinel when OPENCLAW_STDIN_CONTROL=1", async () => {
     vi.clearAllMocks();
     process.env.OPENCLAW_STDIN_CONTROL = "1";

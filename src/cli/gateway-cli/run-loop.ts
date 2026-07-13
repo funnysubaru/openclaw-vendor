@@ -1,3 +1,4 @@
+import { createInterface, type Interface } from "node:readline";
 import {
   abortEmbeddedPiRun,
   getActiveEmbeddedRunCount,
@@ -35,10 +36,21 @@ export async function runGatewayLoop(params: {
   let shuttingDown = false;
   let restartResolver: (() => void) | null = null;
 
+  // Yuiclaw B组：Windows 优雅关闭通道。Windows 上 Node 子进程收不到别的进程
+  // 发来的 POSIX 信号（taskkill /F 是无信号强杀），所以下面 SIGTERM→request("stop")
+  // 的优雅路径够不着。父进程（Yuiclaw launcher）改从 stdin 写一行暗号来触发同一条
+  // 路径。暗号常量必须与 Yuiclaw 侧 packages/gateway/src/launcher.ts 的
+  // STDIN_SHUTDOWN_SENTINEL 保持一致——改一侧必须同改另一侧。
+  const STDIN_SHUTDOWN_SENTINEL = "__openclaw_stdin_shutdown__";
+  let stdinControl: Interface | null = null;
+
   const cleanupSignals = () => {
     process.removeListener("SIGTERM", onSigterm);
     process.removeListener("SIGINT", onSigint);
     process.removeListener("SIGUSR1", onSigusr1);
+    // stdin 控制通道随信号 handler 一起拆，避免退出后悬挂 readline 监听。
+    stdinControl?.close();
+    stdinControl = null;
   };
   const exitProcess = (code: number) => {
     cleanupSignals();
@@ -199,6 +211,20 @@ export async function runGatewayLoop(params: {
   process.on("SIGTERM", onSigterm);
   process.on("SIGINT", onSigint);
   process.on("SIGUSR1", onSigusr1);
+
+  // 仅当父进程（Yuiclaw launcher, Windows）显式开启才读 stdin。默认不装，对上游
+  // 及其它运行方式零影响。收到暗号行即复用现成 request("stop") 走完整优雅关闭。
+  if (process.env.OPENCLAW_STDIN_CONTROL === "1") {
+    stdinControl = createInterface({ input: process.stdin });
+    stdinControl.on("line", (line) => {
+      if (line.trim() === STDIN_SHUTDOWN_SENTINEL) {
+        gatewayLog.info("received stdin shutdown request; shutting down");
+        request("stop", "stdin");
+      }
+    });
+    // stdin 不单独 ref 住事件循环（gateway 靠 server 保活），进程该退还是退。
+    process.stdin.unref();
+  }
 
   try {
     const onIteration = createRestartIterationHook(() => {

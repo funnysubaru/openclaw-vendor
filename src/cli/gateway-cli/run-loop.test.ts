@@ -425,6 +425,8 @@ describe("runGatewayLoop", () => {
           restartExpectedMs: null,
         });
         expect(runtime.exit).toHaveBeenCalledWith(0);
+        // cleanupSignals 应把 stdin readline 一并拆掉，避免退出后悬挂监听。
+        expect(fakeRl.close).toHaveBeenCalled();
       });
     } finally {
       delete process.env.OPENCLAW_STDIN_CONTROL;
@@ -455,6 +457,22 @@ describe("runGatewayLoop", () => {
       await createSignaledLoopHarness();
       expect(readline.createInterface).not.toHaveBeenCalled();
     });
+  });
+
+  it("does not install stdin control for non-'1' env value", async () => {
+    vi.clearAllMocks();
+    // 严格 === "1" 判定：不能把任何 truthy 字符串（如 "0" / "true"）都当开启，
+    // 防止环境变量误传非 "1" 值时意外装上 stdin 控制通道。
+    process.env.OPENCLAW_STDIN_CONTROL = "0";
+    const readline = await import("node:readline");
+    try {
+      await withIsolatedSignals(async () => {
+        await createSignaledLoopHarness();
+        expect(readline.createInterface).not.toHaveBeenCalled();
+      });
+    } finally {
+      delete process.env.OPENCLAW_STDIN_CONTROL;
+    }
   });
 });
 

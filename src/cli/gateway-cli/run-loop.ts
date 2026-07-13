@@ -215,7 +215,8 @@ export async function runGatewayLoop(params: {
   // 仅当父进程（Yuiclaw launcher, Windows）显式开启才读 stdin。默认不装，对上游
   // 及其它运行方式零影响。收到暗号行即复用现成 request("stop") 走完整优雅关闭。
   if (process.env.OPENCLAW_STDIN_CONTROL === "1") {
-    stdinControl = createInterface({ input: process.stdin });
+    // terminal:false 明确按非交互管道处理（父进程写一行就走，不需要 TTY 行编辑/回显）。
+    stdinControl = createInterface({ input: process.stdin, terminal: false });
     stdinControl.on("line", (line) => {
       if (line.trim() === STDIN_SHUTDOWN_SENTINEL) {
         gatewayLog.info("received stdin shutdown request; shutting down");

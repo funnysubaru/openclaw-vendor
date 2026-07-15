@@ -115,12 +115,31 @@ export function decodeCapturedOutputBuffer(params: {
   }
 }
 
-/** 按 chunk 增量喂给 supervisor adapter 的流式解码函数类型：每次喂一个 Buffer chunk，吐出这次能确定的字符串片段。 */
-export type StreamingWindowsDecoder = (chunk: Buffer) => string;
+/**
+ * 按 chunk 增量喂给 supervisor adapter 的流式解码器接口。
+ * `decode`：每次喂一个 Buffer chunk，吐出这次能确定的字符串片段（可能为空——
+ * 多字节字符尚未凑齐，被解码器缓存在内部状态里等下一个 chunk）。
+ * `flush`：流结束时调用一次（PR-B review Minor#1/F1），把内部缓存的、
+ * 尚未凑成完整字符的尾部字节按"数据流已经结束"的语义强制吐出来，避免
+ * 进程被杀/管道意外关闭等场景下截断在缓冲区里的最后半个多字节字符被静默丢弃。
+ * 没有可 flush 的缓冲状态时返回空字符串（不是 undefined，调用方判空即可）。
+ */
+export interface StreamingWindowsDecoder {
+  decode(chunk: Buffer): string;
+  flush(): string;
+}
+
+/** 非 win32 / UTF-8 / 不支持的 encoding 场景下的兜底实现：逐 chunk 直接 toString，flush 恒为空——没有跨 chunk 状态可 flush。 */
+function createPassthroughStreamDecoder(): StreamingWindowsDecoder {
+  return {
+    decode: (chunk: Buffer) => chunk.toString("utf8"),
+    flush: () => "",
+  };
+}
 
 /**
  * 为一条流式输出（supervisor/agent-shell 的 stdout 或 stderr，各自独立建一个实例）
- * 创建一个"跨 chunk 复用同一个解码器状态"的增量解码函数。
+ * 创建一个"跨 chunk 复用同一个解码器状态"的增量解码器。
  *
  * 为什么不能直接复用 decodeCapturedOutputBuffer（B2.4 风险评估结论）：
  * decodeCapturedOutputBuffer 每次调用都 `new TextDecoder(encoding)` 独立解码一整段
@@ -138,10 +157,11 @@ export type StreamingWindowsDecoder = (chunk: Buffer) => string;
  *
  * 调用方约束：必须给每条独立的流（如同一个子进程的 stdout 一个实例、stderr 另一个
  * 实例）各建一个，不能共用同一个解码器——否则 stdout/stderr 交替到达时会互相污染
- * 对方缓存的"未完成字节"状态，解出更离谱的乱码。
+ * 对方缓存的"未完成字节"状态，解出更离谱的乱码。且流结束时必须调用一次 `flush()`
+ * （见接口注释 / F1），否则最后一个被截断在缓冲区里的多字节字符会静默丢失。
  *
  * 非 win32 / 探测不到代码页 / 代码页就是 UTF-8：直接走 `chunk.toString("utf8")`，
- * 与改动前的 `chunk.toString()` 行为等价（R4.4：非 win32 不受影响）。
+ * 与改动前的 `chunk.toString()` 行为等价（R4.4：非 win32 不受影响），`flush()` 恒为空。
  * 目标 encoding 不受 TextDecoder 支持：退回 `chunk.toString("utf8")`，与
  * decodeCapturedOutputBuffer 的兜底策略保持一致。
  */
@@ -151,11 +171,11 @@ export function createWindowsStreamDecoder(params?: {
 }): StreamingWindowsDecoder {
   const platform = params?.platform ?? process.platform;
   if (platform !== "win32") {
-    return (chunk: Buffer) => chunk.toString("utf8");
+    return createPassthroughStreamDecoder();
   }
   const encoding = params?.windowsEncoding ?? resolveWindowsConsoleEncoding();
   if (!encoding || encoding.toLowerCase() === "utf-8") {
-    return (chunk: Buffer) => chunk.toString("utf8");
+    return createPassthroughStreamDecoder();
   }
   let decoder: TextDecoder;
   try {
@@ -163,13 +183,27 @@ export function createWindowsStreamDecoder(params?: {
     // 保证 exec 输出管线不会因为一次解码失败整体崩掉。
     decoder = new TextDecoder(encoding);
   } catch {
-    return (chunk: Buffer) => chunk.toString("utf8");
+    return createPassthroughStreamDecoder();
   }
-  return (chunk: Buffer) => {
-    try {
-      return decoder.decode(chunk, { stream: true });
-    } catch {
-      return chunk.toString("utf8");
-    }
+  return {
+    decode: (chunk: Buffer) => {
+      try {
+        return decoder.decode(chunk, { stream: true });
+      } catch {
+        return chunk.toString("utf8");
+      }
+    },
+    // F1：不传 { stream: true }（等价于 stream:false）—— 告诉解码器"数据流已经
+    // 结束"，把内部缓存的、尚未凑成完整字符的尾部字节按最终语义 flush 出来
+    // （WHATWG Encoding 规范：流终止时的不完整多字节序列会被替换成 U+FFFD 吐出，
+    // 而不是继续悬空等待一个永远不会到达的续传 chunk）。只应在进程/流确认结束后
+    // 调用一次；重复调用是安全的（TextDecoder 内部状态已清空，会返回空字符串）。
+    flush: () => {
+      try {
+        return decoder.decode();
+      } catch {
+        return "";
+      }
+    },
   };
 }

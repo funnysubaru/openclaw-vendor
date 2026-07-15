@@ -98,24 +98,24 @@ describe("createWindowsStreamDecoder（B2.4 风险处置：流式 chunk 解码�
   const gbkSupported = detectGbkSupport();
 
   it("非 win32：每个 chunk 独立走 UTF-8 toString，无状态", () => {
-    const decode = createWindowsStreamDecoder({ platform: "darwin" });
-    expect(decode(Buffer.from("第一段", "utf8"))).toBe("第一段");
-    expect(decode(Buffer.from("第二段", "utf8"))).toBe("第二段");
+    const decoder = createWindowsStreamDecoder({ platform: "darwin" });
+    expect(decoder.decode(Buffer.from("第一段", "utf8"))).toBe("第一段");
+    expect(decoder.decode(Buffer.from("第二段", "utf8"))).toBe("第二段");
   });
 
   it('win32 + UTF-8 代码页：等价于 chunk.toString("utf8")', () => {
-    const decode = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "utf-8" });
-    expect(decode(Buffer.from("hello", "utf8"))).toBe("hello");
+    const decoder = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "utf-8" });
+    expect(decoder.decode(Buffer.from("hello", "utf8"))).toBe("hello");
   });
 
   it("win32 + GBK：完整 chunk（未跨边界）能正确解出中文", () => {
     if (!gbkSupported) {
       return;
     }
-    const decode = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "gbk" });
+    const decoder = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "gbk" });
     // "测试" 的 GBK 字节
     const chunk = Buffer.from([0xb2, 0xe2, 0xca, 0xd4]);
-    expect(decode(chunk)).toBe("测试");
+    expect(decoder.decode(chunk)).toBe("测试");
   });
 
   it("核心场景：GBK 双字节字符被切在两个 chunk 边界之间时仍能正确拼出（不产出半个字符的替换符）", () => {
@@ -124,9 +124,9 @@ describe("createWindowsStreamDecoder（B2.4 风险处置：流式 chunk 解码�
     }
     // "测试" 的 GBK 字节 [0xb2, 0xe2, 0xca, 0xd4]，故意从中间切成两段模拟
     // Node 流式 pipe 把一个字符切在两个 data 事件之间的真实场景。
-    const decode = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "gbk" });
-    const firstHalf = decode(Buffer.from([0xb2])); // "测" 字的第一个字节，尚不构成完整字符
-    const secondHalf = decode(Buffer.from([0xe2, 0xca, 0xd4])); // 续上后半段 + "试" 的完整字节
+    const decoder = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "gbk" });
+    const firstHalf = decoder.decode(Buffer.from([0xb2])); // "测" 字的第一个字节，尚不构成完整字符
+    const secondHalf = decoder.decode(Buffer.from([0xe2, 0xca, 0xd4])); // 续上后半段 + "试" 的完整字节
 
     // 流式解码：前半段单独喂时不应产出错误的替换符（应为空——字节不完整，解码器持有状态等续传）。
     expect(firstHalf).toBe("");
@@ -135,24 +135,77 @@ describe("createWindowsStreamDecoder（B2.4 风险处置：流式 chunk 解码�
   });
 
   it("若目标机器不支持该 encoding（如精简 ICU），兜底回退 chunk.toString，不抛错", () => {
-    const decode = createWindowsStreamDecoder({
+    const decoder = createWindowsStreamDecoder({
       platform: "win32",
       windowsEncoding: "not-a-real-encoding",
     });
-    expect(decode(Buffer.from("fallback", "utf8"))).toBe("fallback");
+    expect(decoder.decode(Buffer.from("fallback", "utf8"))).toBe("fallback");
   });
 
   it("两个独立实例互不干扰（模拟 stdout/stderr 各自持有状态）", () => {
     if (!gbkSupported) {
       return;
     }
-    const decodeA = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "gbk" });
-    const decodeB = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "gbk" });
+    const decoderA = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "gbk" });
+    const decoderB = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "gbk" });
 
     // A 只喂半个字符（缓存悬空字节），B 完整喂一个不相关的字符——两者应互不影响。
-    decodeA(Buffer.from([0xb2]));
-    expect(decodeB(Buffer.from([0xb2, 0xe2, 0xca, 0xd4]))).toBe("测试");
+    decoderA.decode(Buffer.from([0xb2]));
+    expect(decoderB.decode(Buffer.from([0xb2, 0xe2, 0xca, 0xd4]))).toBe("测试");
     // A 补齐后应该还能正确拼出自己缓存的那半个字符，不受 B 的调用干扰。
-    expect(decodeA(Buffer.from([0xe2]))).toBe("测");
+    expect(decoderA.decode(Buffer.from([0xe2]))).toBe("测");
+  });
+
+  // PR-B review Minor#1（F1）：流结束时 flush 残留字节，避免进程被杀/管道意外关闭
+  // 场景下截断在缓冲区末尾的最后半个多字节字符被静默丢弃。
+  describe("flush()（F1：流结束时吐出残留的未完成字节）", () => {
+    it("核心场景：GBK 字符被截断在流末尾（进程被杀/管道意外关闭），flush() 前 decode 不出字符，flush() 后吐出该字符", () => {
+      if (!gbkSupported) {
+        return;
+      }
+      const decoder = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "gbk" });
+      // "测" 字 GBK 两字节 [0xb2, 0xe2]，只喂第一个字节就模拟流结束（如进程被 SIGKILL）。
+      const midStream = decoder.decode(Buffer.from([0xb2]));
+      expect(midStream).toBe("");
+
+      // flush() 之前不该凭空吐出任何东西——上面已经断言过 decode() 本身为空。
+      // 调用 flush() 后，WHATWG Encoding 规范要求把这个不完整序列替换成 U+FFFD 吐出，
+      // 而不是永远悬空、被静默丢弃。
+      const tail = decoder.flush();
+      expect(tail.length).toBeGreaterThan(0);
+      expect(tail).toContain("�");
+    });
+
+    it("完整字符流（没有被截断）：flush() 返回空字符串，不会凭空多吐字符", () => {
+      if (!gbkSupported) {
+        return;
+      }
+      const decoder = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "gbk" });
+      expect(decoder.decode(Buffer.from([0xb2, 0xe2, 0xca, 0xd4]))).toBe("测试");
+      // 已经是完整字符，解码器内部没有残留的未完成字节，flush 应为空。
+      expect(decoder.flush()).toBe("");
+    });
+
+    it("非 win32 / UTF-8 代码页路径：flush() 恒返回空字符串（没有跨 chunk 状态可 flush）", () => {
+      const nonWin = createWindowsStreamDecoder({ platform: "darwin" });
+      nonWin.decode(Buffer.from("任意内容", "utf8"));
+      expect(nonWin.flush()).toBe("");
+
+      const utf8OnWin = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "utf-8" });
+      utf8OnWin.decode(Buffer.from("任意内容", "utf8"));
+      expect(utf8OnWin.flush()).toBe("");
+    });
+
+    it("重复调用 flush() 是安全的，第二次不会重复吐出同一段残留字节", () => {
+      if (!gbkSupported) {
+        return;
+      }
+      const decoder = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "gbk" });
+      decoder.decode(Buffer.from([0xb2])); // 留一个悬空字节
+      const firstFlush = decoder.flush();
+      expect(firstFlush.length).toBeGreaterThan(0);
+      const secondFlush = decoder.flush();
+      expect(secondFlush).toBe("");
+    });
   });
 });

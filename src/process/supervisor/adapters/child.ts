@@ -136,9 +136,11 @@ export async function createChildAdapter(params: {
   // 缓冲区末尾（进程被杀 / 管道意外关闭这种极端场景），不 flush 就会静默丢掉这半个
   // 字符。win32 之外 / UTF-8 代码页路径下 flush() 恒返回 ""，这里统一无条件调用，
   // 调用方（child.ts 自己）不用关心平台差异。这个 "close" 监听在 createChildAdapter
-  // 返回前就注册好，保证晚于它注册的 wait() 内部 "close" 监听（调用方 await
-  // adapter.wait() 时才会挂上）后触发，flush 出来的尾串能在 wait() resolve 前
-  // 送达 listener，不会被调用方错过。
+  // 返回前（本函数同步执行到这里）就注册好了——Node 的 EventEmitter 按监听器的
+  // **注册顺序**依次触发同一个事件，而 wait() 内部那个 "close" 监听要等调用方真的
+  // `await adapter.wait()` 时才会挂上（发生在更晚的时间点），所以这里先注册的
+  // flush 补投必然先于 wait() 那个后注册的监听触发，flush 出来的尾串能在
+  // wait() resolve 前送达 listener，不会被调用方错过。
   child.once("close", () => {
     const stdoutTail = stdoutDecoder.flush();
     if (stdoutTail) {

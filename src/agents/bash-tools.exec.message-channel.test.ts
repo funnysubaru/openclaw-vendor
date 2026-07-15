@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { createExecTool } from "./bash-tools.exec.js";
 import { sanitizeBinaryOutput } from "./shell-utils.js";
 
@@ -12,21 +12,40 @@ const printChannelCmd = isWin
   ? "Write-Output $env:OPENCLAW_MESSAGE_CHANNEL"
   : 'printf "%s" "${OPENCLAW_MESSAGE_CHANNEL:-}"';
 
+// review Minor#2：光看"打印出来的值是不是空"分不清"key 真的不存在"和"key 存在但值是空
+// 字符串"——两条 shell 语法专门只判存在性，不看值本身：
+// POSIX `${VAR+isset}` 只要 VAR 这个 key 存在（哪怕值是空串）就展开成 "isset"，
+// key 真的 unset 时展开成空；PowerShell 用 Test-Path env:VAR 做等价判断。
+const printChannelPresenceCmd = isWin
+  ? 'if (Test-Path env:OPENCLAW_MESSAGE_CHANNEL) { Write-Output "isset" } else { Write-Output "unset" }'
+  : 'printf "%s" "${OPENCLAW_MESSAGE_CHANNEL+isset}"';
+
 const normalizeText = (value?: string) =>
   sanitizeBinaryOutput(value ?? "")
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n")
     .trim();
 
-async function runAndCaptureChannel(messageProvider?: string): Promise<string> {
+async function runExecTool(params: {
+  messageProvider?: string;
+  command: string;
+  env?: Record<string, string>;
+}): Promise<string> {
   const tool = createExecTool({
     host: "gateway",
     security: "full",
     ask: "off",
-    messageProvider,
+    messageProvider: params.messageProvider,
   });
-  const result = await tool.execute("call-message-channel", { command: printChannelCmd });
+  const result = await tool.execute("call-message-channel", {
+    command: params.command,
+    env: params.env,
+  });
   return normalizeText(result.content.find((c) => c.type === "text")?.text);
+}
+
+async function runAndCaptureChannel(messageProvider?: string): Promise<string> {
+  return runExecTool({ messageProvider, command: printChannelCmd });
 }
 
 describe("exec OPENCLAW_MESSAGE_CHANNEL 注入（R3/组件5）", () => {
@@ -75,5 +94,54 @@ describe("exec OPENCLAW_MESSAGE_CHANNEL 注入（R3/组件5）", () => {
     ]);
 
     expect(results).toEqual(["telegram", "webchat", "mobile-chat"]);
+  });
+
+  // review Important#1（安全问题，首轮漏判）：`...opts.env` 展开若带着继承/伪造的
+  // OPENCLAW_MESSAGE_CHANNEL，而本 run 又拿不到真实 channel，旧写法"只在拿得到时
+  // 才赋值"会让这个残留值原样透传进子进程——下游 ppt preview 硬闸会把它当真实
+  // channel 读，面板会话可能被误判成 bot channel 从而绕过安全闸。这里覆盖两个
+  // 污染来源：①父进程 process.env 继承 ②tool 调用自己的 params.env 显式携带。
+  describe("污染回归测（review Important#1：拿不到 channel 时必须清掉继承/伪造的残留值）", () => {
+    const originalProcessEnvChannel = process.env.OPENCLAW_MESSAGE_CHANNEL;
+
+    afterEach(() => {
+      // 每个用例结束都还原 process.env，避免污染同文件其它用例或后续测试文件。
+      if (originalProcessEnvChannel === undefined) {
+        delete process.env.OPENCLAW_MESSAGE_CHANNEL;
+      } else {
+        process.env.OPENCLAW_MESSAGE_CHANNEL = originalProcessEnvChannel;
+      }
+    });
+
+    it("父进程 process.env 里预置了残留 channel、本 run 无 messageProvider → 子进程 env 里该 key 必须不存在", async () => {
+      process.env.OPENCLAW_MESSAGE_CHANNEL = "line";
+
+      const presence = await runExecTool({
+        messageProvider: undefined,
+        command: printChannelPresenceCmd,
+      });
+
+      // 断言的是"key 不存在"（unset/(no output)），不是"值是空字符串"——
+      // 后者分辨不出"真的清掉了"还是"凑巧被覆盖成空串"。
+      expect(presence).toBe(isWin ? "unset" : "(no output)");
+    });
+
+    it("tool 调用自己的 params.env 显式携带伪造 channel、本 run 无 messageProvider → 仍必须不存在", async () => {
+      const presence = await runExecTool({
+        messageProvider: undefined,
+        command: printChannelPresenceCmd,
+        env: { OPENCLAW_MESSAGE_CHANNEL: "line" },
+      });
+
+      expect(presence).toBe(isWin ? "unset" : "(no output)");
+    });
+
+    it("即便父进程 process.env 有残留值，本 run 真有 channel 时 runtime 计算值仍会覆盖它（不是巧合地被清空）", async () => {
+      process.env.OPENCLAW_MESSAGE_CHANNEL = "line";
+
+      const value = await runExecTool({ messageProvider: "webchat", command: printChannelCmd });
+
+      expect(value).toBe("webchat");
+    });
   });
 });

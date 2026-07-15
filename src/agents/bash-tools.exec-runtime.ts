@@ -328,9 +328,22 @@ export async function runExecProcess(opts: {
   // 面板 run 有概率读到 bot run 写入的 channel 值，从而绕过下游安全闸（如 ppt-master
   // 的 preview 硬闸：面板必须强制、bot 才豁免）。这里的写法天然按 run 隔离：
   // shellRuntimeEnv 是每次 runExecProcess 调用各自的局部变量，不存在跨 run 共享状态。
-  // 只在拿得到 channel 时才注入；拿不到就不设该 key（不是设成空字符串）——下游
-  // （如 run_engine.py 的 os.environ.get）读不到时按"未知渠道，默认按面板处理"
-  // 更安全的语义走（R3.5：识别不了默认拦）。
+  //
+  // review Important#1（安全问题，首轮漏判，已修）：上面 `...opts.env` 展开时，
+  // 若父进程 process.env 或 tool 调用的 params.env 里本来就带了一个
+  // OPENCLAW_MESSAGE_CHANNEL（继承残留，或被 tool 层伪造），而本次 run 又拿不到
+  // 真实 channel（normalizeMessageChannel 结果为空）——之前的写法只在"拿得到"时才
+  // 赋值，"拿不到"时从不清理，等于让继承/伪造的旧值原样透传进子进程。下游 ppt
+  // preview 硬闸的 `_preview_gate_exempt()` 会把这个伪造值当真实 channel 读，
+  // 面板会话可能因此被误判成 bot channel 而绕过安全闸——正好与 R3.5"拿不到就不设
+  // key、默认按面板拦"的设计初衷相反。
+  //
+  // 修法（delete-then-set）：先无条件清掉展开进来的残留/伪造值，再仅在本 run
+  // 真有 channel 时写入 runtime 计算出的值。这样该 key 的最终值只可能来自这里的
+  // normalizeMessageChannel 计算结果，或彻底不存在——tool params.env 与继承的
+  // process.env 都不可能让它"蒙混过关"（哪怕本 run 有 channel，运行时算出的值也
+  // 会覆盖 tool 层塞进来的任何同名 key，天然满足"该 key 只允许 runtime 写入"）。
+  delete shellRuntimeEnv.OPENCLAW_MESSAGE_CHANNEL;
   const normalizedMessageChannel = normalizeMessageChannel(opts.messageChannel);
   if (normalizedMessageChannel) {
     shellRuntimeEnv.OPENCLAW_MESSAGE_CHANNEL = normalizedMessageChannel;

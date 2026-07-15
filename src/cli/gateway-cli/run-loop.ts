@@ -304,10 +304,21 @@ export async function runGatewayLoop(params: {
     // 父进程（Yuiclaw GatewayLauncher）收到这条消息才能确认可以安全地改用
     // postMessage 触发关闭，而不是继续走旧的强杀路径；协议版本号让父进程在
     // 未来协议变更时能做兼容性判断，而不是盲目假设子进程支持当前协议。
-    process.parentPort.postMessage({
-      type: GATEWAY_CONTROL_READY_TYPE,
-      protocolVersion: GATEWAY_CONTROL_PROTOCOL_VERSION,
-    });
+    //
+    // PR review 追加：握手本身只是「能力上报」而非关闭流程的必要前提——父进程
+    // 收不到 ready 消息时会自行回退到旧的强杀路径（退化但不致命）。所以这里
+    // 必须把 postMessage 包一层 try/catch：此时 gateway lock 已拿到、
+    // parentPortListener 也已装好，若 postMessage 在极端情况下（如对端
+    // MessagePort 已提前关闭）抛错，绝不能让异常冒泡砸穿 runGatewayLoop 的
+    // 启动流程，只需记一条 warn 日志留痕、继续正常启动。
+    try {
+      process.parentPort.postMessage({
+        type: GATEWAY_CONTROL_READY_TYPE,
+        protocolVersion: GATEWAY_CONTROL_PROTOCOL_VERSION,
+      });
+    } catch (err) {
+      gatewayLog.warn(`parentport ready handshake postMessage failed: ${String(err)}`);
+    }
   }
 
   // 说明：double-stop 幂等不需要在这里额外加互斥锁。parentPort 通道与 stdin /

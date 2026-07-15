@@ -274,6 +274,10 @@ export async function processGatewayAllowlist(
           execCommand: enforcedCommand,
           workdir: params.workdir,
           env: params.env,
+          // Yuiclaw PR-B（R3/组件5）：这条 gateway allowlist 路径也带上该 run 的原始渠道
+          // （已有的 params.turnSourceChannel，与 exec.ts 主路径同源），保持两个
+          // runExecProcess 调用点行为一致，不留下"只有一条路径注入了 channel"的死角。
+          messageChannel: params.turnSourceChannel,
           sandbox: undefined,
           containerWorkdir: null,
           usePty: params.pty,

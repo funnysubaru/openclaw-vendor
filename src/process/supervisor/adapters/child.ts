@@ -2,6 +2,7 @@ import type { ChildProcessWithoutNullStreams, SpawnOptions } from "node:child_pr
 import { killProcessTree } from "../../kill-tree.js";
 import { spawnWithFallback } from "../../spawn-utils.js";
 import { resolveWindowsCommandShim } from "../../windows-command.js";
+import { createWindowsStreamDecoder } from "../../windows-encoding.js";
 import type { ManagedRunStdin, SpawnProcessAdapter } from "../types.js";
 import { toStringEnv } from "./env.js";
 
@@ -100,15 +101,26 @@ export async function createChildAdapter(params: {
       }
     : undefined;
 
+  // Yuiclaw PR-B（R4/组件6）：Windows 上把子进程输出按探测到的控制台代码页
+  // （中文机常见 GBK/cp936）正确解码，而不是硬当 UTF-8——PS 5.1 默认输出就是
+  // 控制台代码页字节，不是 UTF-8，硬 toString() 在中文/日文/韩文 Windows 上会乱码。
+  // stdout / stderr 各建一个独立的流式解码器实例（不能共用，见 createWindowsStreamDecoder
+  // 注释）：每个实例内部持有跨 chunk 复用的 TextDecoder 状态，正确处理多字节字符
+  // （GBK 2 字节等）恰好跨在两个 chunk 边界之间的情况，不会把半个字符解出乱码。
+  // 非 win32：createWindowsStreamDecoder 内部直接走 chunk.toString("utf8")，
+  // 与改动前完全等价，无副作用（R4.4）。
+  const decodeStdoutChunk = createWindowsStreamDecoder();
+  const decodeStderrChunk = createWindowsStreamDecoder();
+
   const onStdout = (listener: (chunk: string) => void) => {
     child.stdout.on("data", (chunk) => {
-      listener(chunk.toString());
+      listener(decodeStdoutChunk(chunk));
     });
   };
 
   const onStderr = (listener: (chunk: string) => void) => {
     child.stderr.on("data", (chunk) => {
-      listener(chunk.toString());
+      listener(decodeStderrChunk(chunk));
     });
   };
 

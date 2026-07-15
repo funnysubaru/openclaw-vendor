@@ -3,10 +3,13 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { spawnWithFallbackMock, killProcessTreeMock } = vi.hoisted(() => ({
-  spawnWithFallbackMock: vi.fn(),
-  killProcessTreeMock: vi.fn(),
-}));
+const { spawnWithFallbackMock, killProcessTreeMock, createWindowsStreamDecoderMock } = vi.hoisted(
+  () => ({
+    spawnWithFallbackMock: vi.fn(),
+    killProcessTreeMock: vi.fn(),
+    createWindowsStreamDecoderMock: vi.fn(),
+  }),
+);
 
 vi.mock("../../spawn-utils.js", () => ({
   spawnWithFallback: spawnWithFallbackMock,
@@ -14,6 +17,13 @@ vi.mock("../../spawn-utils.js", () => ({
 
 vi.mock("../../kill-tree.js", () => ({
   killProcessTree: killProcessTreeMock,
+}));
+
+// Yuiclaw PR-B（R4/组件6）：mock 掉真实的 createWindowsStreamDecoder，只验证 child.ts
+// 有没有正确"为 stdout/stderr 各建一个独立解码器实例、并把每个 chunk 交给对应解码器"，
+// 不在这里重复测解码算法本身的正确性（那部分在 windows-encoding.test.ts 里独立覆盖）。
+vi.mock("../../windows-encoding.js", () => ({
+  createWindowsStreamDecoder: createWindowsStreamDecoderMock,
 }));
 
 let createChildAdapter: typeof import("./child.js").createChildAdapter;
@@ -45,7 +55,7 @@ async function createAdapterHarness(params?: {
     env: params?.env,
     stdinMode: "pipe-open",
   });
-  return { adapter, killMock };
+  return { adapter, killMock, child };
 }
 
 describe("createChildAdapter", () => {
@@ -59,6 +69,11 @@ describe("createChildAdapter", () => {
     spawnWithFallbackMock.mockClear();
     killProcessTreeMock.mockClear();
     delete process.env.OPENCLAW_SERVICE_MARKER;
+    // 默认给一个"原样 toString"的桩解码器，等价于改动前的 chunk.toString()，
+    // 让不关心编码逻辑的既有用例（kill/env 相关）继续按原语义跑；
+    // 需要断言解码细节的用例会自己覆盖这个默认实现。
+    createWindowsStreamDecoderMock.mockReset();
+    createWindowsStreamDecoderMock.mockImplementation(() => (chunk: Buffer) => chunk.toString());
   });
 
   afterAll(() => {
@@ -137,5 +152,44 @@ describe("createChildAdapter", () => {
       options?: { env?: Record<string, string> };
     };
     expect(spawnArgs.options?.env).toEqual({ FOO: "bar", COUNT: "12" });
+  });
+
+  describe("Windows 代码页解码接线（R4/组件6）", () => {
+    it("为 stdout / stderr 各建一个独立的流式解码器实例", async () => {
+      await createAdapterHarness({ pid: 5555 });
+
+      // 两条流各自独立 createWindowsStreamDecoder() 一次（不能共用一个实例，
+      // 否则 stdout/stderr 交替到达时会互相污染对方缓存的"未完成字节"状态）。
+      expect(createWindowsStreamDecoderMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("stdout 的每个 chunk 都交给它专属的解码器，listener 收到解码后的结果", async () => {
+      const stdoutDecode = vi.fn((chunk: Buffer) => `stdout:${chunk.toString()}`);
+      const stderrDecode = vi.fn((chunk: Buffer) => `stderr:${chunk.toString()}`);
+      createWindowsStreamDecoderMock
+        .mockReset()
+        .mockReturnValueOnce(stdoutDecode)
+        .mockReturnValueOnce(stderrDecode);
+
+      const { adapter, child } = await createAdapterHarness({ pid: 6666 });
+
+      const receivedStdout: string[] = [];
+      const receivedStderr: string[] = [];
+      adapter.onStdout((chunk) => receivedStdout.push(chunk));
+      adapter.onStderr((chunk) => receivedStderr.push(chunk));
+
+      // createStubChild 用 PassThrough 实打实赋值给 child.stdout/stderr（见本文件顶部），
+      // 只是 ChildProcess 类型本身把这两个字段声明成 `| null`；这里断言非空是安全的。
+      child.stdout!.emit("data", Buffer.from("hello"));
+      child.stderr!.emit("data", Buffer.from("world"));
+
+      expect(stdoutDecode).toHaveBeenCalledWith(Buffer.from("hello"));
+      expect(stderrDecode).toHaveBeenCalledWith(Buffer.from("world"));
+      // stdout 的 chunk 绝不会被喂给 stderr 的解码器，反之亦然——两条流严格隔离。
+      expect(stdoutDecode).not.toHaveBeenCalledWith(Buffer.from("world"));
+      expect(stderrDecode).not.toHaveBeenCalledWith(Buffer.from("hello"));
+      expect(receivedStdout).toEqual(["stdout:hello"]);
+      expect(receivedStderr).toEqual(["stderr:world"]);
+    });
   });
 });

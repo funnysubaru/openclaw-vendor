@@ -474,6 +474,10 @@ export function createExecTool(
         execCommand: execCommandOverride,
         workdir,
         env,
+        // Yuiclaw PR-B（R3/组件5）：defaults.messageProvider 就是这个 run 的原始渠道
+        // （与上面 turnSourceChannel: defaults?.messageProvider 同源，见 executeNodeHostCommand /
+        // processGatewayAllowlist 调用处），透传给 runExecProcess 去注入 OPENCLAW_MESSAGE_CHANNEL。
+        messageChannel: defaults?.messageProvider,
         sandbox,
         containerWorkdir,
         usePty,

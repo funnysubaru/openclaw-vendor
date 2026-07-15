@@ -7,6 +7,7 @@ import { isDangerousHostEnvVarName } from "../infra/host-env-security.js";
 import { findPathKey, mergePathPrepend } from "../infra/path-prepend.js";
 import { enqueueSystemEvent } from "../infra/system-events.js";
 import { scopedHeartbeatWakeOptions } from "../routing/session-key.js";
+import { normalizeMessageChannel } from "../utils/message-channel.js";
 import type { ProcessSession } from "./bash-process-registry.js";
 import type { ExecToolDetails } from "./bash-tools.exec-types.js";
 import type { BashSandboxConfig } from "./bash-tools.shared.js";
@@ -293,6 +294,12 @@ export async function runExecProcess(opts: {
   execCommand?: string;
   workdir: string;
   env: Record<string, string>;
+  // Yuiclaw PR-B（R3/组件5）：该 run 的原始（未归一化）消息渠道，如 "webchat"（面板）、
+  // "line"/"telegram"/"mobile-chat"（bot channel）等。透传自调用方已有的
+  // messageProvider/turnSourceChannel（与 executeNodeHostCommand 等其它 exec 路径的
+  // turnSourceChannel 同源，不新造一套 channel 语义）。可选——拿不到就不注入下面的
+  // OPENCLAW_MESSAGE_CHANNEL，下游（如 ppt-master 的 preview 硬闸）读不到时按默认拦处理。
+  messageChannel?: string;
   sandbox?: BashSandboxConfig;
   containerWorkdir?: string | null;
   usePty: boolean;
@@ -314,6 +321,20 @@ export async function runExecProcess(opts: {
     ...opts.env,
     OPENCLAW_SHELL: "exec",
   };
+  // Yuiclaw PR-B（R3/组件5，方案 B——按 run 隔离）：把该 run 的归一化消息渠道注入
+  // 这次 exec 的子进程 env。刻意选择"每次 exec 调用独立组装 shellRuntimeEnv 时注入"
+  // （方案 B），而不是在 run 开始时改全局 process.env（方案 A）——后者在多 run 并发
+  // （比如面板会话与 bot 会话同时各自触发一次 exec）时共享同一个 process.env，
+  // 面板 run 有概率读到 bot run 写入的 channel 值，从而绕过下游安全闸（如 ppt-master
+  // 的 preview 硬闸：面板必须强制、bot 才豁免）。这里的写法天然按 run 隔离：
+  // shellRuntimeEnv 是每次 runExecProcess 调用各自的局部变量，不存在跨 run 共享状态。
+  // 只在拿得到 channel 时才注入；拿不到就不设该 key（不是设成空字符串）——下游
+  // （如 run_engine.py 的 os.environ.get）读不到时按"未知渠道，默认按面板处理"
+  // 更安全的语义走（R3.5：识别不了默认拦）。
+  const normalizedMessageChannel = normalizeMessageChannel(opts.messageChannel);
+  if (normalizedMessageChannel) {
+    shellRuntimeEnv.OPENCLAW_MESSAGE_CHANNEL = normalizedMessageChannel;
+  }
 
   const session: ProcessSession = {
     id: sessionId,

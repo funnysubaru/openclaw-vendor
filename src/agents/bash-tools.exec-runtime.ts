@@ -7,6 +7,7 @@ import { isDangerousHostEnvVarName } from "../infra/host-env-security.js";
 import { findPathKey, mergePathPrepend } from "../infra/path-prepend.js";
 import { enqueueSystemEvent } from "../infra/system-events.js";
 import { scopedHeartbeatWakeOptions } from "../routing/session-key.js";
+import { normalizeMessageChannel } from "../utils/message-channel.js";
 import type { ProcessSession } from "./bash-process-registry.js";
 import type { ExecToolDetails } from "./bash-tools.exec-types.js";
 import type { BashSandboxConfig } from "./bash-tools.shared.js";
@@ -293,6 +294,12 @@ export async function runExecProcess(opts: {
   execCommand?: string;
   workdir: string;
   env: Record<string, string>;
+  // Yuiclaw PR-B（R3/组件5）：该 run 的原始（未归一化）消息渠道，如 "webchat"（面板）、
+  // "line"/"telegram"/"mobile-chat"（bot channel）等。透传自调用方已有的
+  // messageProvider/turnSourceChannel（与 executeNodeHostCommand 等其它 exec 路径的
+  // turnSourceChannel 同源，不新造一套 channel 语义）。可选——拿不到就不注入下面的
+  // OPENCLAW_MESSAGE_CHANNEL，下游（如 ppt-master 的 preview 硬闸）读不到时按默认拦处理。
+  messageChannel?: string;
   sandbox?: BashSandboxConfig;
   containerWorkdir?: string | null;
   usePty: boolean;
@@ -314,6 +321,33 @@ export async function runExecProcess(opts: {
     ...opts.env,
     OPENCLAW_SHELL: "exec",
   };
+  // Yuiclaw PR-B（R3/组件5，方案 B——按 run 隔离）：把该 run 的归一化消息渠道注入
+  // 这次 exec 的子进程 env。刻意选择"每次 exec 调用独立组装 shellRuntimeEnv 时注入"
+  // （方案 B），而不是在 run 开始时改全局 process.env（方案 A）——后者在多 run 并发
+  // （比如面板会话与 bot 会话同时各自触发一次 exec）时共享同一个 process.env，
+  // 面板 run 有概率读到 bot run 写入的 channel 值，从而绕过下游安全闸（如 ppt-master
+  // 的 preview 硬闸：面板必须强制、bot 才豁免）。这里的写法天然按 run 隔离：
+  // shellRuntimeEnv 是每次 runExecProcess 调用各自的局部变量，不存在跨 run 共享状态。
+  //
+  // review Important#1（安全问题，首轮漏判，已修）：上面 `...opts.env` 展开时，
+  // 若父进程 process.env 或 tool 调用的 params.env 里本来就带了一个
+  // OPENCLAW_MESSAGE_CHANNEL（继承残留，或被 tool 层伪造），而本次 run 又拿不到
+  // 真实 channel（normalizeMessageChannel 结果为空）——之前的写法只在"拿得到"时才
+  // 赋值，"拿不到"时从不清理，等于让继承/伪造的旧值原样透传进子进程。下游 ppt
+  // preview 硬闸的 `_preview_gate_exempt()` 会把这个伪造值当真实 channel 读，
+  // 面板会话可能因此被误判成 bot channel 而绕过安全闸——正好与 R3.5"拿不到就不设
+  // key、默认按面板拦"的设计初衷相反。
+  //
+  // 修法（delete-then-set）：先无条件清掉展开进来的残留/伪造值，再仅在本 run
+  // 真有 channel 时写入 runtime 计算出的值。这样该 key 的最终值只可能来自这里的
+  // normalizeMessageChannel 计算结果，或彻底不存在——tool params.env 与继承的
+  // process.env 都不可能让它"蒙混过关"（哪怕本 run 有 channel，运行时算出的值也
+  // 会覆盖 tool 层塞进来的任何同名 key，天然满足"该 key 只允许 runtime 写入"）。
+  delete shellRuntimeEnv.OPENCLAW_MESSAGE_CHANNEL;
+  const normalizedMessageChannel = normalizeMessageChannel(opts.messageChannel);
+  if (normalizedMessageChannel) {
+    shellRuntimeEnv.OPENCLAW_MESSAGE_CHANNEL = normalizedMessageChannel;
+  }
 
   const session: ProcessSession = {
     id: sessionId,

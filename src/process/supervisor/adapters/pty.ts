@@ -123,6 +123,26 @@ export async function createPtyAdapter(params: {
     },
   };
 
+  // Yuiclaw PR-B（R4/组件6）调查结论：这里刻意**不**套用 child.ts 那套
+  // createWindowsStreamDecoder（按控制台代码页重新解码）。
+  //
+  // 原因：@lydell/node-pty 在 Windows 上（windowsPtyAgent.js）无条件对底层
+  // conout socket 做了 `setEncoding('utf8')`，且该行为**不受**其自身 `encoding`
+  // spawn 选项控制（windowsTerminal.js 对 Windows 平台直接忽略这个选项，只打
+  // 一句 warn）。也就是说：到这个 onData 回调时，`chunk` 已经是 node-pty 内部
+  // 用 UTF-8 StringDecoder 强制解码好的 JS string，不是原始字节——PS 5.1 若实际
+  // 输出的是 GBK 字节，此时非法字节序列已经被替换成 U+FFFD、信息已不可逆丢失。
+  // 在这一层再对它做一次"当 GBK 解码"，等于对一个已经损坏的 UTF-8 字符串做
+  // 二次错误解码，只会产出更严重的双重乱码，而不是修复。
+  //
+  // 好消息：agent 默认的 exec/bash 调用（ppt-master run_engine 等）走的是
+  // child.ts（plain child_process.spawn，未设 pty:true），只有 agent 显式传
+  // `pty: true`（TTY 场景，如需要交互式终端的子 agent/coding agent）才会走到
+  // 这个 pty adapter。所以 child.ts 的修复已覆盖 R4 报告的实际乱码场景；
+  // 这条 PTY 路径的 Windows 编码问题（若未来真的需要修）属于不同性质的
+  // bug——正确方向是让 PowerShell 子进程自身输出 UTF-8（如 spawn 前注入
+  // `[Console]::OutputEncoding=UTF8`，即设计文档风险§1 的"方案 B"），而不是
+  // 在这一层做事后重新解码。详见 openclaw-vendor PR 描述里的调查记录。
   const onStdout = (listener: (chunk: string) => void) => {
     dataListener =
       pty.onData((chunk) => {

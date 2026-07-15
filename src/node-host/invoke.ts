@@ -1,7 +1,19 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { GatewayClient } from "../gateway/client.js";
+// Yuiclaw PR-B：Windows 代码页解码逻辑已抽到 process/windows-encoding.ts（无副作用纯函数模块），
+// 这里改为 import + 透传 re-export，保持既有对外 API（parseWindowsCodePage / decodeCapturedOutputBuffer）
+// 不变，不破坏本文件已有的调用点与测试（invoke.sanitize-env.test.ts 仍从 "./invoke.js" import）。
+// 抽出的动机见 windows-encoding.ts 顶部注释：避免 supervisor/adapters 直接引用本文件时
+// 把 GatewayClient/exec-approvals 等重依赖也拖进去。parseWindowsCodePage 本文件内部不再直接
+// 调用，只做透传 re-export，故只 import decodeCapturedOutputBuffer / resolveWindowsConsoleEncoding
+// 两个本文件仍在用的符号，parseWindowsCodePage 走单独的 export...from 语句。
+import {
+  decodeCapturedOutputBuffer,
+  resolveWindowsConsoleEncoding,
+} from "../process/windows-encoding.js";
+export { decodeCapturedOutputBuffer, parseWindowsCodePage } from "../process/windows-encoding.js";
 import {
   ensureExecApprovals,
   mergeExecApprovalsSocketDefaults,
@@ -32,16 +44,6 @@ import type {
 const OUTPUT_CAP = 200_000;
 const OUTPUT_EVENT_TAIL = 20_000;
 const DEFAULT_NODE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-const WINDOWS_CODEPAGE_ENCODING_MAP: Record<number, string> = {
-  65001: "utf-8",
-  54936: "gb18030",
-  936: "gbk",
-  950: "big5",
-  932: "shift_jis",
-  949: "euc-kr",
-  1252: "windows-1252",
-};
-let cachedWindowsConsoleEncoding: string | null | undefined;
 
 const execHostEnforced = process.env.OPENCLAW_NODE_EXEC_HOST?.trim().toLowerCase() === "app";
 const execHostFallbackAllowed =
@@ -101,65 +103,6 @@ function truncateOutput(raw: string, maxChars: number): { text: string; truncate
     return { text: raw, truncated: false };
   }
   return { text: `... (truncated) ${raw.slice(raw.length - maxChars)}`, truncated: true };
-}
-
-export function parseWindowsCodePage(raw: string): number | null {
-  if (!raw) {
-    return null;
-  }
-  const match = raw.match(/\b(\d{3,5})\b/);
-  if (!match?.[1]) {
-    return null;
-  }
-  const codePage = Number.parseInt(match[1], 10);
-  if (!Number.isFinite(codePage) || codePage <= 0) {
-    return null;
-  }
-  return codePage;
-}
-
-function resolveWindowsConsoleEncoding(): string | null {
-  if (process.platform !== "win32") {
-    return null;
-  }
-  if (cachedWindowsConsoleEncoding !== undefined) {
-    return cachedWindowsConsoleEncoding;
-  }
-  try {
-    const result = spawnSync("cmd.exe", ["/d", "/s", "/c", "chcp"], {
-      windowsHide: true,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const raw = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
-    const codePage = parseWindowsCodePage(raw);
-    cachedWindowsConsoleEncoding =
-      codePage !== null ? (WINDOWS_CODEPAGE_ENCODING_MAP[codePage] ?? null) : null;
-  } catch {
-    cachedWindowsConsoleEncoding = null;
-  }
-  return cachedWindowsConsoleEncoding;
-}
-
-export function decodeCapturedOutputBuffer(params: {
-  buffer: Buffer;
-  platform?: NodeJS.Platform;
-  windowsEncoding?: string | null;
-}): string {
-  const utf8 = params.buffer.toString("utf8");
-  const platform = params.platform ?? process.platform;
-  if (platform !== "win32") {
-    return utf8;
-  }
-  const encoding = params.windowsEncoding ?? resolveWindowsConsoleEncoding();
-  if (!encoding || encoding.toLowerCase() === "utf-8") {
-    return utf8;
-  }
-  try {
-    return new TextDecoder(encoding).decode(params.buffer);
-  } catch {
-    return utf8;
-  }
 }
 
 function redactExecApprovals(file: ExecApprovalsFile): ExecApprovalsFile {

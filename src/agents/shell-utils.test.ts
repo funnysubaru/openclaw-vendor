@@ -127,6 +127,7 @@ describe("resolvePowerShellPath", () => {
       "SystemRoot",
       "WINDIR",
       "PATH",
+      "YUICLAW_BUNDLED_PWSH_PATH",
     ]);
   });
 
@@ -205,5 +206,69 @@ describe("resolvePowerShellPath", () => {
     delete process.env.WINDIR;
 
     expect(resolvePowerShellPath()).toBe(ps51Path);
+  });
+
+  // Yuiclaw PR-B（R5/组件7）：YUICLAW_BUNDLED_PWSH_PATH 候选必须排在所有分支最前面，
+  // 且必须优先于系统里已装的 pwsh7——理由：bundle 版本是 Yuiclaw 自己校验过、保证存在的
+  // 基线，而用户系统里"恰好装了"的 pwsh7 版本不可控（未测试过 / 可能被用户误删或损坏）。
+  it("YUICLAW_BUNDLED_PWSH_PATH 指向存在的文件时优先于系统 PowerShell 7", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-bundled-pwsh-"));
+    const pwsh7Dir = path.join(base, "PowerShell", "7");
+    fs.mkdirSync(pwsh7Dir, { recursive: true });
+    const systemPwsh7Path = path.join(pwsh7Dir, "pwsh.exe");
+    fs.writeFileSync(systemPwsh7Path, "");
+
+    const bundledDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-bundled-pwsh-bin-"));
+    const bundledPwshPath = path.join(bundledDir, "pwsh.exe");
+    fs.writeFileSync(bundledPwshPath, "");
+    tempDirs.push(base, bundledDir);
+
+    // 即便系统 ProgramFiles 下也确实装了 pwsh7（会被后续分支命中），
+    // bundled 候选仍应该胜出——它排在函数最前面直接 return。
+    process.env.ProgramFiles = base;
+    process.env.PATH = "";
+    process.env.YUICLAW_BUNDLED_PWSH_PATH = bundledPwshPath;
+    delete process.env.ProgramW6432;
+    delete process.env.SystemRoot;
+    delete process.env.WINDIR;
+
+    expect(resolvePowerShellPath()).toBe(bundledPwshPath);
+  });
+
+  it("YUICLAW_BUNDLED_PWSH_PATH 指向不存在的文件时落回原有逻辑（bundle 缺失/裁剪的降级，R5.4/O1）", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-bundled-pwsh-missing-"));
+    const pwsh7Dir = path.join(base, "PowerShell", "7");
+    fs.mkdirSync(pwsh7Dir, { recursive: true });
+    const systemPwsh7Path = path.join(pwsh7Dir, "pwsh.exe");
+    fs.writeFileSync(systemPwsh7Path, "");
+    tempDirs.push(base);
+
+    process.env.ProgramFiles = base;
+    process.env.PATH = "";
+    // 指向一个确实不存在的路径——模拟安装包裁剪/解压失败导致 bundle 缺失的场景。
+    process.env.YUICLAW_BUNDLED_PWSH_PATH = path.join(base, "does-not-exist", "pwsh.exe");
+    delete process.env.ProgramW6432;
+    delete process.env.SystemRoot;
+    delete process.env.WINDIR;
+
+    expect(resolvePowerShellPath()).toBe(systemPwsh7Path);
+  });
+
+  it("未设置 YUICLAW_BUNDLED_PWSH_PATH 时行为与改动前完全一致", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-bundled-pwsh-unset-"));
+    const pwsh7Dir = path.join(base, "PowerShell", "7");
+    fs.mkdirSync(pwsh7Dir, { recursive: true });
+    const systemPwsh7Path = path.join(pwsh7Dir, "pwsh.exe");
+    fs.writeFileSync(systemPwsh7Path, "");
+    tempDirs.push(base);
+
+    process.env.ProgramFiles = base;
+    process.env.PATH = "";
+    delete process.env.YUICLAW_BUNDLED_PWSH_PATH;
+    delete process.env.ProgramW6432;
+    delete process.env.SystemRoot;
+    delete process.env.WINDIR;
+
+    expect(resolvePowerShellPath()).toBe(systemPwsh7Path);
   });
 });

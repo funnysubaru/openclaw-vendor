@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GatewayBonjourBeacon } from "../../infra/bonjour-discovery.js";
 import { pickBeaconHost, pickGatewayPort } from "./discover.js";
 
@@ -76,6 +76,23 @@ vi.mock("node:readline", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:readline")>()),
   createInterface: vi.fn(() => fakeRl),
 }));
+
+// Yuiclaw 防篡改加固块 A 第二批：parentPort 优雅关闭接收端测试用的可控 mock。
+// process.parentPort 在真实 utilityProcess 子进程里是 Electron 运行时注入的
+// 全局对象，普通 Node 测试进程里天然不存在；测试通过直接给 process 挂一个假
+// parentPort（postMessage / on / removeListener 全打桩）来模拟 utilityProcess
+// 环境，用 capturedParentPortListener 拿到 run-loop 注册的 message 回调后手动
+// 触发，不依赖真实 Electron MessagePort。
+let capturedParentPortListener: ((event: { data?: unknown }) => void) | null = null;
+const fakeParentPort = {
+  postMessage: vi.fn(),
+  on: vi.fn((ev: string, cb: (event: { data?: unknown }) => void) => {
+    if (ev === "message") {
+      capturedParentPortListener = cb;
+    }
+  }),
+  removeListener: vi.fn(),
+};
 
 const LOOP_SIGNALS = ["SIGTERM", "SIGINT", "SIGUSR1"] as const;
 type LoopSignal = (typeof LOOP_SIGNALS)[number];
@@ -474,6 +491,187 @@ describe("runGatewayLoop", () => {
     } finally {
       delete process.env.OPENCLAW_STDIN_CONTROL;
     }
+  });
+
+  // Yuiclaw 防篡改加固块 A 第二批（gateway-utilityprocess-migration 任务 6）：
+  // parentPort 优雅关闭接收端测试。utilityProcess.fork() 派生的子进程 stdin
+  // 恒为 ignore，上面的 stdin 通道够不着，这里换 MessagePort 语义的 parentPort
+  // 通道。覆盖：①双守卫都满足才装监听 ②缺 env 不装 ③缺 parentPort 不装
+  // ④装监听后主动发就绪握手（type+protocolVersion）⑤收到暗号复用 request("stop")
+  // 完整优雅路径 ⑥double-stop 幂等（shuttingDown 闸门挡住第二次）⑦cleanup 摘监听。
+  describe("parentPort graceful shutdown channel", () => {
+    afterEach(() => {
+      // 每个用例后都摘掉假 parentPort，避免污染后续用例（尤其是"缺 parentPort
+      // 不装"这类依赖 process.parentPort 为 undefined 的用例）。
+      delete (process as { parentPort?: unknown }).parentPort;
+      capturedParentPortListener = null;
+      // PR review 追加：兜底清除 env，防止某个用例的 try/finally 因提前
+      // throw 而漏执行，导致 OPENCLAW_PARENTPORT_CONTROL 泄漏到下一个用例
+      // 污染判定。各用例自身的 finally 仍保留作双保险（互不冲突，delete 一个
+      // 不存在的 env key 是无副作用的空操作）。
+      delete process.env.OPENCLAW_PARENTPORT_CONTROL;
+    });
+
+    it("installs listener and sends ready handshake when both guards satisfied", async () => {
+      vi.clearAllMocks();
+      process.env.OPENCLAW_PARENTPORT_CONTROL = "1";
+      (process as { parentPort?: unknown }).parentPort = fakeParentPort;
+      try {
+        await withIsolatedSignals(async () => {
+          await createSignaledLoopHarness();
+          expect(fakeParentPort.on).toHaveBeenCalledWith("message", expect.any(Function));
+          expect(capturedParentPortListener).toBeTypeOf("function");
+          // 握手：装好监听后立刻主动上报就绪 + 协议版本，父进程据此确认新通道可用。
+          expect(fakeParentPort.postMessage).toHaveBeenCalledWith({
+            type: "__openclaw_parentport_ready__",
+            protocolVersion: 1,
+          });
+        });
+      } finally {
+        delete process.env.OPENCLAW_PARENTPORT_CONTROL;
+      }
+    });
+
+    it("does not install listener when OPENCLAW_PARENTPORT_CONTROL is unset", async () => {
+      vi.clearAllMocks();
+      delete process.env.OPENCLAW_PARENTPORT_CONTROL;
+      (process as { parentPort?: unknown }).parentPort = fakeParentPort;
+      await withIsolatedSignals(async () => {
+        await createSignaledLoopHarness();
+        expect(fakeParentPort.on).not.toHaveBeenCalled();
+        expect(fakeParentPort.postMessage).not.toHaveBeenCalled();
+      });
+    });
+
+    it("does not install listener when process.parentPort is absent (plain Node / Server Mode)", async () => {
+      vi.clearAllMocks();
+      process.env.OPENCLAW_PARENTPORT_CONTROL = "1";
+      delete (process as { parentPort?: unknown }).parentPort;
+      try {
+        await withIsolatedSignals(async () => {
+          // 没有真实/假 parentPort 时不应抛错，只是静默跳过安装。
+          await createSignaledLoopHarness();
+          expect(capturedParentPortListener).toBeNull();
+        });
+      } finally {
+        delete process.env.OPENCLAW_PARENTPORT_CONTROL;
+      }
+    });
+
+    it("shuts down via full request('stop') path on shutdown message", async () => {
+      vi.clearAllMocks();
+      process.env.OPENCLAW_PARENTPORT_CONTROL = "1";
+      (process as { parentPort?: unknown }).parentPort = fakeParentPort;
+      try {
+        await withIsolatedSignals(async () => {
+          const { close, runtime, exited } = await createSignaledLoopHarness();
+          expect(capturedParentPortListener).toBeTypeOf("function");
+          // Electron MessageEvent 语义：payload 挂在 event.data 上。
+          capturedParentPortListener!({ data: { type: "__openclaw_parentport_shutdown__" } });
+          await expect(exited).resolves.toBe(0);
+          // 复用了 request("stop") 完整优雅路径：server.close 走 stopping 分支、
+          // 退出码为 0——而不是 process.exit() 之类绕过 lock 释放的强杀。
+          expect(close).toHaveBeenCalledWith({
+            reason: "gateway stopping",
+            restartExpectedMs: null,
+          });
+          expect(runtime.exit).toHaveBeenCalledWith(0);
+        });
+      } finally {
+        delete process.env.OPENCLAW_PARENTPORT_CONTROL;
+      }
+    });
+
+    it("shuts down via full request('stop') path on bare (non-data-wrapped) shutdown payload", async () => {
+      vi.clearAllMocks();
+      process.env.OPENCLAW_PARENTPORT_CONTROL = "1";
+      (process as { parentPort?: unknown }).parentPort = fakeParentPort;
+      try {
+        await withIsolatedSignals(async () => {
+          const { close, runtime, exited } = await createSignaledLoopHarness();
+          expect(capturedParentPortListener).toBeTypeOf("function");
+          // run-loop.ts 的接收端对 message 事件做归一化："data" in event 就取
+          // event.data，否则把 event 本身当 payload（防御 Electron 版本间字段
+          // 位置差异）。上面那条用例覆盖了 { data: {...} } 包一层的常见形态，
+          // 这里补覆盖裸 payload（不含 data 字段）走的回退分支，确保两条路径
+          // 都能触发同样完整的优雅关闭。
+          const barePayload = {
+            type: "__openclaw_parentport_shutdown__",
+          } as unknown as { data?: unknown };
+          capturedParentPortListener!(barePayload);
+          await expect(exited).resolves.toBe(0);
+          expect(close).toHaveBeenCalledWith({
+            reason: "gateway stopping",
+            restartExpectedMs: null,
+          });
+          expect(runtime.exit).toHaveBeenCalledWith(0);
+        });
+      } finally {
+        delete process.env.OPENCLAW_PARENTPORT_CONTROL;
+      }
+    });
+
+    it("ignores non-matching parentport message payloads", async () => {
+      vi.clearAllMocks();
+      process.env.OPENCLAW_PARENTPORT_CONTROL = "1";
+      (process as { parentPort?: unknown }).parentPort = fakeParentPort;
+      try {
+        await withIsolatedSignals(async () => {
+          const { close } = await createSignaledLoopHarness();
+          capturedParentPortListener!({ data: { type: "some-other-message" } });
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(close).not.toHaveBeenCalled();
+        });
+      } finally {
+        delete process.env.OPENCLAW_PARENTPORT_CONTROL;
+      }
+    });
+
+    it("is idempotent against double-stop (second shutdown message ignored while shutting down)", async () => {
+      vi.clearAllMocks();
+      process.env.OPENCLAW_PARENTPORT_CONTROL = "1";
+      (process as { parentPort?: unknown }).parentPort = fakeParentPort;
+      try {
+        await withIsolatedSignals(async () => {
+          const { close, exited } = await createSignaledLoopHarness();
+          // 两次收到关闭暗号（模拟父进程重复 postMessage 或与信号通道竞态），
+          // 靠 request() 顶部现成的 shuttingDown 闸门天然去重，不需要额外互斥锁。
+          capturedParentPortListener!({ data: { type: "__openclaw_parentport_shutdown__" } });
+          capturedParentPortListener!({ data: { type: "__openclaw_parentport_shutdown__" } });
+          await expect(exited).resolves.toBe(0);
+          expect(close).toHaveBeenCalledTimes(1);
+        });
+      } finally {
+        delete process.env.OPENCLAW_PARENTPORT_CONTROL;
+      }
+    });
+
+    it("removes the parentport listener on cleanup", async () => {
+      vi.clearAllMocks();
+      process.env.OPENCLAW_PARENTPORT_CONTROL = "1";
+      (process as { parentPort?: unknown }).parentPort = fakeParentPort;
+      try {
+        await withIsolatedSignals(async () => {
+          const { close, exited } = await createSignaledLoopHarness();
+          // PR review 追加：先把安装时捕获的监听器引用存下来，下面断言
+          // removeListener 摘掉的必须是同一个函数引用——而不是任意 Function，
+          // 防止将来重构时误摘错监听器（比如摘了别的通道的）却测不出来。
+          const installedListener = capturedParentPortListener;
+          expect(installedListener).toBeTypeOf("function");
+          const sigterm = () => {
+            installedListener!({ data: { type: "__openclaw_parentport_shutdown__" } });
+          };
+          sigterm();
+          await exited;
+          expect(close).toHaveBeenCalled();
+          // cleanupSignals() 与 stdinControl?.close() 对称，退出后应把 parentPort
+          // 的 message 监听一并摘掉，且必须是安装时的同一个函数引用。
+          expect(fakeParentPort.removeListener).toHaveBeenCalledWith("message", installedListener);
+        });
+      } finally {
+        delete process.env.OPENCLAW_PARENTPORT_CONTROL;
+      }
+    });
   });
 });
 

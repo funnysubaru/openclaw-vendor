@@ -13,12 +13,16 @@ const printChannelCmd = isWin
   : 'printf "%s" "${OPENCLAW_MESSAGE_CHANNEL:-}"';
 
 // review Minor#2：光看"打印出来的值是不是空"分不清"key 真的不存在"和"key 存在但值是空
-// 字符串"——两条 shell 语法专门只判存在性，不看值本身：
-// POSIX `${VAR+isset}` 只要 VAR 这个 key 存在（哪怕值是空串）就展开成 "isset"，
-// key 真的 unset 时展开成空；PowerShell 用 Test-Path env:VAR 做等价判断。
+// 字符串"——两条 shell 语法专门只判存在性，不看值本身，且两平台都**显式**打印
+// isset/unset token（review Minor#1：不再让 POSIX 侧靠"空输出→(no output)占位符"
+// 这种间接判定，两条分支断言语义完全对称）：
+// POSIX 用 `[ "${OPENCLAW_MESSAGE_CHANNEL+x}" = x ]`——key 存在时 `${VAR+x}` 展开成
+// 字面量 "x"，与 "x" 相等即 isset；key 真的 unset 时 `${VAR+x}` 展开成空，不等于
+// "x"，判 unset，两种情况都显式 printf 对应 token，不依赖"没输出"这种弱信号。
+// PowerShell 用 Test-Path env:VAR 做等价判断，本就是显式输出，不必改。
 const printChannelPresenceCmd = isWin
   ? 'if (Test-Path env:OPENCLAW_MESSAGE_CHANNEL) { Write-Output "isset" } else { Write-Output "unset" }'
-  : 'printf "%s" "${OPENCLAW_MESSAGE_CHANNEL+isset}"';
+  : 'if [ "${OPENCLAW_MESSAGE_CHANNEL+x}" = x ]; then printf isset; else printf unset; fi';
 
 const normalizeText = (value?: string) =>
   sanitizeBinaryOutput(value ?? "")
@@ -121,9 +125,10 @@ describe("exec OPENCLAW_MESSAGE_CHANNEL 注入（R3/组件5）", () => {
         command: printChannelPresenceCmd,
       });
 
-      // 断言的是"key 不存在"（unset/(no output)），不是"值是空字符串"——
-      // 后者分辨不出"真的清掉了"还是"凑巧被覆盖成空串"。
-      expect(presence).toBe(isWin ? "unset" : "(no output)");
+      // review Minor#1：两平台都断言显式的 "unset" token（不再靠 POSIX 侧"没输出→
+      // (no output) 占位符"这种间接信号），断言语义完全对称——判的是"key 不存在"，
+      // 不是"值是空字符串"（后者分辨不出"真的清掉了"还是"凑巧被覆盖成空串"）。
+      expect(presence).toBe("unset");
     });
 
     it("tool 调用自己的 params.env 显式携带伪造 channel、本 run 无 messageProvider → 仍必须不存在", async () => {
@@ -133,7 +138,7 @@ describe("exec OPENCLAW_MESSAGE_CHANNEL 注入（R3/组件5）", () => {
         env: { OPENCLAW_MESSAGE_CHANNEL: "line" },
       });
 
-      expect(presence).toBe(isWin ? "unset" : "(no output)");
+      expect(presence).toBe("unset");
     });
 
     it("即便父进程 process.env 有残留值，本 run 真有 channel 时 runtime 计算值仍会覆盖它（不是巧合地被清空）", async () => {

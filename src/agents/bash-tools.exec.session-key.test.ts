@@ -126,5 +126,34 @@ describe("exec OPENCLAW_SESSION_KEY 注入", () => {
 
       expect(value).toBe("agent:ppt-master:main");
     });
+
+    // review Minor#1：上面两条污染用例都是"本 run 无 sessionKey"，另一条是"父进程残留 +
+    // 有值"。缺的正是最该钉死的一格——**tool 调用自己伪造 + 本 run 有真实 sessionKey**。
+    // 该格的安全性由 env 构造顺序保证（mergedEnv 先并入 params.env → shellRuntimeEnv 无条件
+    // delete → 再写 runtime 值），逻辑上伪造覆盖不了；但不显式断言的话，日后有人调整
+    // delete/set 顺序时回归要靠读代码才能发现。
+    it("tool 调用伪造 + 本 run 有真实 sessionKey → 子进程读到的是真实值，伪造覆盖不了", async () => {
+      const value = await runExecTool({
+        sessionKey: "agent:ppt-master:main",
+        command: printSessionKeyCmd,
+        env: { OPENCLAW_SESSION_KEY: "agent:forged:by-tool-call" },
+      });
+
+      expect(value).toBe("agent:ppt-master:main");
+    });
+  });
+
+  // review Minor#2：与 bash-tools.exec.message-channel.test.ts 的并发隔离用例对齐。
+  // 实现上 shellRuntimeEnv 是每次调用的局部对象，设计上天然隔离；补测是为了钉死
+  // "别把它提成模块级共享变量"这类重构——真出这种回归，表现是两个会话互相串号，
+  // 而 ppt-master 唤醒串号 = 把系统消息发进别人的会话，属最坏后果那一档。
+  it("两个不同 sessionKey 的 run 并发执行时互不污染", async () => {
+    const [first, second] = await Promise.all([
+      runExecTool({ sessionKey: "agent:alpha:main", command: printSessionKeyCmd }),
+      runExecTool({ sessionKey: "agent:beta:main", command: printSessionKeyCmd }),
+    ]);
+
+    expect(first).toBe("agent:alpha:main");
+    expect(second).toBe("agent:beta:main");
   });
 });

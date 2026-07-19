@@ -127,6 +127,30 @@ describe("decodeCapturedOutputBuffer（整段 buffer 一次性解码，node-host
     expect(decoded).toBe("测试～；");
   });
 
+  // code review Important#3 回应：looksLikeUtf8 的启发式（"能被严格 UTF-8 解码器
+  // 完整接受"）不是万无一失的——理论上存在一小撮 GBK 字节序列，恰好也构成合法
+  // UTF-8，会被误判。这条测试用一个**真实构造出来的碰撞向量**把这个已知、已在
+  // 代码注释里承认的风险钉成可复现的回归测试：字节 [0xC2, 0xA9] 作为 GBK 解码是
+  // "漏"（U+6F0F），作为严格 UTF-8 解码是"©"（U+00A9）——两种解读都不报错，是一次
+  // 真实的编码碰撞，不是编造的极端值。
+  //
+  // 这条测试的意义**不是要修掉这个碰撞**（本设计从一开始就接受这个取舍，见
+  // decodeCapturedOutputBuffer 顶部模块注释），而是把"当前接受的误判行为"钉死成
+  // 显式断言——如果未来有人重构 looksLikeUtf8 的判定逻辑（比如加长度阈值、换判定
+  // 算法）意外改变了这个碰撞场景的结果，这条测试会失败，逼着改动者明确意识到
+  // "这个已知取舍被动了"，而不是悄悄地行为漂移。
+  it("Important#3 回归护栏：已知的 UTF-8/GBK 碰撞向量——记录当前接受的误判行为，不是要修掉它", () => {
+    const collidingBytes = Buffer.from([0xc2, 0xa9]);
+    const decoded = decodeCapturedOutputBuffer({
+      buffer: collidingBytes,
+      platform: "win32",
+      windowsEncoding: "gbk",
+    });
+    // 当前设计：UTF-8 优先，这两个字节被解成 "©"，而不是 GBK 语境下"正确"的
+    // "漏"。这是已接受的启发式局限，不是本 PR 要修的 bug。
+    expect(decoded).toBe("©");
+  });
+
   it("纯 ASCII 内容不受 Fix B 的 UTF-8 探测影响（无非 ASCII 字节，跳过判定直接走原逻辑）", () => {
     const buffer = Buffer.from("plain ascii output", "utf8");
     const decoded = decodeCapturedOutputBuffer({
@@ -253,6 +277,40 @@ describe("createWindowsStreamDecoder（B2.4 风险处置：流式 chunk 解码�
       // 正确落到 GBK 分支（与既有测试 "win32 + GBK：完整 chunk" 断言一致）。
       const chunk = Buffer.from([0xb2, 0xe2, 0xca, 0xd4]);
       expect(decoder.decode(chunk)).toBe("测试");
+    });
+
+    // code review Important#3 回应：与 decodeCapturedOutputBuffer 同源的已知碰撞
+    // 向量（字节 [0xC2, 0xA9]：GBK 解读是"漏"，严格 UTF-8 解读是"©"，两种解读都
+    // 不报错）。流式路径同样接受这个取舍——记录当前行为，不是要修掉它。
+    it("Important#3 回归护栏：已知的 UTF-8/GBK 碰撞向量在流式路径下的行为", () => {
+      const decoder = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "gbk" });
+      const collidingBytes = Buffer.from([0xc2, 0xa9]);
+      expect(decoder.decode(collidingBytes)).toBe("©");
+    });
+
+    // code review Minor#3 回应：三态机的"未判定→已判定 UTF-8"是单向、不可逆的
+    // deliberate trade-off（见 createWindowsStreamDecoder 函数级注释"判定之后
+    // ……不再重新判断"）——一旦某个 chunk 含非 ASCII 字节且通过严格 UTF-8 校验，
+    // 后续所有 chunk 都会被当作 UTF-8 处理，即使后面来的其实是货真价实的 GBK
+    // 字节，也不会被重新识别、切回 GBK 解码。
+    //
+    // code review Minor#4 回应：这条测试同时覆盖"先 UTF-8 中文、后 GBK"混合流的
+    // 已知限制——不是要修掉它（真实场景里同一个子进程中途切换输出编码本身就
+    // 极其反常，不值得为此增加状态机复杂度），而是把这个限制用可复现的断言钉
+    // 下来，防止未来有人在不知情的情况下改变这个行为。
+    it("Minor#3/#4：一旦提交为 UTF-8 就不可反悔——先 UTF-8 中文、后真 GBK 字节的混合流会把 GBK 部分解花（已知限制，非本 PR 待修 bug）", () => {
+      if (!gbkSupported) {
+        return;
+      }
+      const decoder = createWindowsStreamDecoder({ platform: "win32", windowsEncoding: "gbk" });
+      // 第一个 chunk：合法 UTF-8 中文，触发提交为 "utf8" 模式。
+      expect(decoder.decode(Buffer.from("完成", "utf8"))).toBe("完成");
+      // 第二个 chunk：货真价实的 GBK 字节（"测试"），但解码器已经提交为 UTF-8，
+      // 不会重新判定——非 fatal 的 UTF-8 解码器会把这些字节当无效序列，
+      // 逐字节吐出 U+FFFD 替换符，而不是正确的 "测试"。这是已知、已接受的限制。
+      const mangled = decoder.decode(Buffer.from([0xb2, 0xe2, 0xca, 0xd4]));
+      expect(mangled).not.toBe("测试");
+      expect(mangled).toContain("�");
     });
 
     // 对应修复过程中发现的真实设计缺陷（不是假设性风险）：如果直接复用 fatal:true

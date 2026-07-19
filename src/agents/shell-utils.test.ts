@@ -3,7 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { captureEnv } from "../test-utils/env.js";
-import { getShellConfig, resolvePowerShellPath, resolveShellFromPath } from "./shell-utils.js";
+import {
+  getShellConfig,
+  resetPowerShellPathCacheForTests,
+  resolveAllShellMatchesFromPath,
+  resolvePowerShellPath,
+  resolveShellFromPath,
+} from "./shell-utils.js";
 
 const isWin = process.platform === "win32";
 
@@ -178,6 +184,25 @@ describe("resolveShellFromPath — PATHEXT 兼容性（Windows Fix A，与真实
     expect(resolveShellFromPath("pwsh")).toBe(bareShimPath);
   });
 
+  // code review Minor#1：process.env.PATHEXT ?? 默认值 用的是空值合并（??），
+  // 只在 null/undefined 时才回退默认值，PATHEXT 显式设成空字符串这个合法但反常
+  // 的环境状态不会触发回退。已改用 ||（假值兜底），这条测试锁死修复后的行为。
+  it("win32：PATHEXT 显式设为空字符串时仍回退默认扩展名列表（Minor#1）", () => {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-pwsh-emptypathext-"));
+    tempDirs.push(binDir);
+    const pwshExePath = path.join(binDir, "pwsh.exe");
+    fs.writeFileSync(pwshExePath, "");
+    fs.chmodSync(pwshExePath, 0o755);
+
+    process.env.PATH = binDir;
+    process.env.PATHEXT = "";
+
+    // 大小写不敏感比较，理由同上一条测试（PATHEXT 空字符串回退到内置默认值
+    // ".COM;.EXE;.BAT;.CMD"，拼出的候选串是大写 "pwsh.EXE"）。
+    expect(resolveShellFromPath("pwsh")?.toLowerCase()).toBe(pwshExePath.toLowerCase());
+  });
+
   it("非 win32：即使设置了 PATHEXT，也不补扩展名（跨平台行为必须逐字不变）", () => {
     Object.defineProperty(process, "platform", { value: "linux", configurable: true });
     const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-pwsh-posix-"));
@@ -199,6 +224,12 @@ describe("resolvePowerShellPath", () => {
   let envSnapshot: ReturnType<typeof captureEnv>;
   const tempDirs: string[] = [];
   const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  // 恒真的 verify()：这个 describe 块里大多数测试关心的是"哪个候选赢了"（优先级
+  // 逻辑），不是"verify 探针本身"（那部分在下方专门的 describe 块）。真实的
+  // verifyPwshExecutable 会对这里创建的 0 字节占位文件真的 spawn 一次——那必然
+  // 失败（不是合法可执行文件），会让这些"优先级"测试全部落到 PS 5.1，测不出
+  // 想验证的行为。所以默认注入一个恒真的 verify。
+  const alwaysVerify = () => true;
 
   beforeEach(() => {
     envSnapshot = captureEnv([
@@ -211,6 +242,10 @@ describe("resolvePowerShellPath", () => {
       "YUICLAW_BUNDLED_PWSH_PATH",
       "LOCALAPPDATA",
     ]);
+    // code review Important#1/#2/#3 回应：resolvePowerShellPath() 现在有模块级
+    // 缓存（见 shell-utils.ts 顶部注释），不重置的话上一条测试解析出的结果会
+    // 一直沿用到后面所有测试。每条测试开始前都必须重置。
+    resetPowerShellPathCacheForTests();
   });
 
   afterEach(() => {
@@ -237,7 +272,7 @@ describe("resolvePowerShellPath", () => {
     delete process.env.SystemRoot;
     delete process.env.WINDIR;
 
-    expect(resolvePowerShellPath()).toBe(pwsh7Path);
+    expect(resolvePowerShellPath({ verify: alwaysVerify })).toBe(pwsh7Path);
   });
 
   it("prefers ProgramW6432 PowerShell 7 when ProgramFiles lacks pwsh", () => {
@@ -255,7 +290,7 @@ describe("resolvePowerShellPath", () => {
     delete process.env.SystemRoot;
     delete process.env.WINDIR;
 
-    expect(resolvePowerShellPath()).toBe(pwsh7Path);
+    expect(resolvePowerShellPath({ verify: alwaysVerify })).toBe(pwsh7Path);
   });
 
   it("finds pwsh on PATH when not in standard install locations", () => {
@@ -272,7 +307,7 @@ describe("resolvePowerShellPath", () => {
     delete process.env.SystemRoot;
     delete process.env.WINDIR;
 
-    expect(resolvePowerShellPath()).toBe(pwshPath);
+    expect(resolvePowerShellPath({ verify: alwaysVerify })).toBe(pwshPath);
   });
 
   it("falls back to Windows PowerShell 5.1 path when pwsh is unavailable", () => {
@@ -336,7 +371,7 @@ describe("resolvePowerShellPath", () => {
     delete process.env.SystemRoot;
     delete process.env.WINDIR;
 
-    expect(resolvePowerShellPath()).toBe(systemPwsh7Path);
+    expect(resolvePowerShellPath({ verify: alwaysVerify })).toBe(systemPwsh7Path);
   });
 
   it("未设置 YUICLAW_BUNDLED_PWSH_PATH 时行为与改动前完全一致", () => {
@@ -354,64 +389,202 @@ describe("resolvePowerShellPath", () => {
     delete process.env.SystemRoot;
     delete process.env.WINDIR;
 
-    expect(resolvePowerShellPath()).toBe(systemPwsh7Path);
+    expect(resolvePowerShellPath({ verify: alwaysVerify })).toBe(systemPwsh7Path);
   });
 
-  // Yuiclaw 补丁（Windows 兼容性修复 Fix A 之二）：Microsoft Store / winget 版 pwsh7
-  // 装在 %LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe，不在 Program Files 下。
-  // 实测环境：Windows 10、中文（chcp=936）、Store 版 pwsh 7.6.3，此路径命中。
-  it("LOCALAPPDATA 下的 Store/winget 版 pwsh 优先于 PATH 搜索命中", () => {
+  // Yuiclaw 补丁：Microsoft Store / winget 版 pwsh7 装在
+  // %LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe，该目录本身就在系统 PATH 上。
+  //
+  // code review Important#1 回应：本 PR 最初版本在这里加过一条独立的
+  // "LOCALAPPDATA + fs.existsSync" 特判块，实测发现它是死代码——fs.existsSync
+  // 内部走 fs.statSync，而 statSync 对 App Execution Alias 目录里的条目会抛
+  // EACCES，existsSync 遇任何异常都按"不存在"处理，也就是说 existsSync 在这个
+  // 目录下恒为 false，即使别名已经指向一个真装好的 pwsh 也测不出来。已删除该
+  // 特判块——WindowsApps 目录本就在 PATH 上，Fix A 修好 PATHEXT 后，下面靠
+  // resolveAllShellMatchesFromPath + fs.accessSync(X_OK) 的 PATH 搜索分支
+  // 已经能找到它（accessSync 不受这个 EACCES-on-statSync 问题影响）。
+  it("WindowsApps 别名目录在 PATH 上时，PATH 搜索能找到并通过 verify 后采信", () => {
     const programFiles = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-pfiles-nopw-"));
-    const localAppData = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-localappdata-"));
-    const decoyBinDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-pwsh-decoy-"));
-    tempDirs.push(programFiles, localAppData, decoyBinDir);
+    const windowsAppsDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-windowsapps-"));
+    tempDirs.push(programFiles, windowsAppsDir);
 
-    const storeAppsDir = path.join(localAppData, "Microsoft", "WindowsApps");
-    fs.mkdirSync(storeAppsDir, { recursive: true });
-    const storePwshPath = path.join(storeAppsDir, "pwsh.exe");
+    const storePwshPath = path.join(windowsAppsDir, "pwsh.exe");
     fs.writeFileSync(storePwshPath, "");
-
-    // PATH 上也放一个"看起来能被搜到"的诱饵 pwsh.exe——用来证明 LOCALAPPDATA
-    // 候选确实排在 PATH 搜索（④）之前生效，而不是巧合命中同一个文件。
-    const decoyPwshPath = path.join(decoyBinDir, "pwsh.exe");
-    fs.writeFileSync(decoyPwshPath, "");
-    fs.chmodSync(decoyPwshPath, 0o755);
+    fs.chmodSync(storePwshPath, 0o755);
 
     process.env.ProgramFiles = programFiles; // 不含 PowerShell/7，跳过②③分支
-    process.env.PATH = decoyBinDir;
-    process.env.LOCALAPPDATA = localAppData;
+    process.env.PATH = windowsAppsDir;
     delete process.env.YUICLAW_BUNDLED_PWSH_PATH;
     delete process.env.ProgramW6432;
     delete process.env.SystemRoot;
     delete process.env.WINDIR;
 
-    expect(resolvePowerShellPath()).toBe(storePwshPath);
+    // 大小写不敏感比较，理由同 "resolveShellFromPath — PATHEXT 兼容性" describe
+    // 块里 "裸名搜索能命中 .exe" 测试的注释（PATHEXT 默认大写 ".EXE"，NTFS 大小写
+    // 不敏感但保留大小写，不影响 Windows 上的可执行文件路径解析）。
+    expect(resolvePowerShellPath({ verify: alwaysVerify })?.toLowerCase()).toBe(
+      storePwshPath.toLowerCase(),
+    );
   });
 
-  it("LOCALAPPDATA 未设置 / 指向的文件不存在时落回 PATH 搜索（降级不崩溃）", () => {
-    // 这条断言要走到 resolveShellFromPath("pwsh") 的 PATHEXT 分支（用 "pwsh.exe"
-    // 文件名验证 LOCALAPPDATA 缺失时端到端仍能落到修复后的 PATH 搜索），
-    // 显式 stub 成 win32 以保证在任何 CI 主机（ubuntu/mac/windows）上都确定性通过
-    // ——理由同上面 "resolveShellFromPath — PATHEXT 兼容性" describe 块的注释。
-    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-    const programFiles = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-pfiles-nopw2-"));
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-pwsh-onpath-"));
-    tempDirs.push(programFiles, binDir);
-    const pwshOnPathPath = path.join(binDir, "pwsh.exe");
-    fs.writeFileSync(pwshOnPathPath, "");
-    fs.chmodSync(pwshOnPathPath, 0o755);
+  // code review Important#1/#2 回应：候选存在（fs.existsSync / accessSync 都通过）
+  // 但真的 spawn 起来会失败——模拟"未安装的 App Execution Alias 占位符"或
+  // "损坏的安装"——不应该被直接采信，必须 continue 尝试下一个候选，而不是
+  // 直接返回一个跑不起来的路径（那样比改动前的 PS 5.1 兜底还差）。
+  describe("verify 失败时的降级行为（Important#1/#2：占位别名不应该被直接采信）", () => {
+    it("ProgramFiles 候选存在但 verify 失败时，continue 到 PATH 搜索", () => {
+      const programFiles = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-pfiles-stub-"));
+      const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-bin-real-"));
+      tempDirs.push(programFiles, binDir);
 
-    process.env.ProgramFiles = programFiles;
-    process.env.PATH = binDir;
-    delete process.env.LOCALAPPDATA;
-    delete process.env.YUICLAW_BUNDLED_PWSH_PATH;
-    delete process.env.ProgramW6432;
-    delete process.env.SystemRoot;
-    delete process.env.WINDIR;
+      const pwsh7Dir = path.join(programFiles, "PowerShell", "7");
+      fs.mkdirSync(pwsh7Dir, { recursive: true });
+      const stubPath = path.join(pwsh7Dir, "pwsh.exe");
+      fs.writeFileSync(stubPath, ""); // 存在，但下面的 verify 会判它为"跑不起来"
 
-    // 大小写不敏感比较，理由同上面 "resolveShellFromPath — PATHEXT 兼容性"
-    // describe 块里 "裸名搜索能命中 .exe" 测试的注释（PATHEXT 默认大写 ".EXE"，
-    // NTFS 大小写不敏感但保留大小写，不影响 Windows 上的可执行文件路径解析）。
-    expect(resolvePowerShellPath().toLowerCase()).toBe(pwshOnPathPath.toLowerCase());
+      const realPath = path.join(binDir, "pwsh.exe");
+      fs.writeFileSync(realPath, "");
+      fs.chmodSync(realPath, 0o755);
+
+      process.env.ProgramFiles = programFiles;
+      process.env.PATH = binDir;
+      delete process.env.ProgramW6432;
+      delete process.env.SystemRoot;
+      delete process.env.WINDIR;
+
+      // 只对 ProgramFiles 里那个"stub"路径判失败，PATH 上的候选判成功——
+      // 模拟"Program Files 装了个损坏/占位的 pwsh7，但 PATH 上还有个真身"。
+      // 大小写不敏感比较（PATHEXT 默认大写 ".EXE"，见上面同款注释）：PATH 分支
+      // 命中的候选串带 "pwsh.EXE"，若用严格 !== 比较 stubPath（"pwsh.exe"）
+      // 会永远不相等，等于两个候选都被判定"不是 stub"，测不出真正的降级行为。
+      const verify = (candidate: string) => candidate.toLowerCase() !== stubPath.toLowerCase();
+
+      expect(resolvePowerShellPath({ verify })?.toLowerCase()).toBe(realPath.toLowerCase());
+    });
+
+    it("唯一候选 verify 失败时，落回 PS 5.1（而不是直接返回一个跑不起来的路径）", () => {
+      const programFiles = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-pfiles-onlystub-"));
+      const sysRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-sysroot-fallback-"));
+      tempDirs.push(programFiles, sysRoot);
+
+      const pwsh7Dir = path.join(programFiles, "PowerShell", "7");
+      fs.mkdirSync(pwsh7Dir, { recursive: true });
+      const stubPath = path.join(pwsh7Dir, "pwsh.exe");
+      fs.writeFileSync(stubPath, "");
+
+      const ps51Dir = path.join(sysRoot, "System32", "WindowsPowerShell", "v1.0");
+      fs.mkdirSync(ps51Dir, { recursive: true });
+      const ps51Path = path.join(ps51Dir, "powershell.exe");
+      fs.writeFileSync(ps51Path, "");
+
+      process.env.ProgramFiles = programFiles;
+      process.env.SystemRoot = sysRoot;
+      process.env.PATH = "";
+      delete process.env.ProgramW6432;
+      delete process.env.WINDIR;
+
+      // 唯一候选（ProgramFiles 的 pwsh7）判失败——改动前的行为（existsSync 命中
+      // 就直接返回）会把这个跑不起来的路径当结果返回给调用方；修复后必须
+      // continue 并最终落到 PS 5.1，而不是"比改动前更差"。
+      expect(resolvePowerShellPath({ verify: () => false })).toBe(ps51Path);
+    });
+
+    // code review Important#4 回应：PATH 上可能同时存在一个占位符（比如
+    // WindowsApps 目录里未真正安装的别名）和另一个目录里真正能跑的 pwsh
+    // （比如用户手动解压的 portable 版）。resolveAllShellMatchesFromPath 返回
+    // 全部候选、resolvePowerShellPath 逐个 verify，这条测试证明"占位符排在
+    // PATH 更前面"时仍然能继续找到后面那个真身，而不是找到第一个就放弃。
+    it("PATH 上第一个候选是占位符（verify 失败）时，会继续尝试 PATH 上的下一个候选", () => {
+      const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-path-stub-"));
+      const realDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-path-real-"));
+      tempDirs.push(stubDir, realDir);
+
+      const stubPath = path.join(stubDir, "pwsh.exe");
+      fs.writeFileSync(stubPath, "");
+      fs.chmodSync(stubPath, 0o755);
+
+      const realPath = path.join(realDir, "pwsh.exe");
+      fs.writeFileSync(realPath, "");
+      fs.chmodSync(realPath, 0o755);
+
+      // stubDir 排在 realDir 前面：resolveAllShellMatchesFromPath 会先找到 stubPath。
+      process.env.PATH = [stubDir, realDir].join(path.delimiter);
+      delete process.env.ProgramFiles;
+      delete process.env.PROGRAMFILES;
+      delete process.env.ProgramW6432;
+      delete process.env.SystemRoot;
+      delete process.env.WINDIR;
+
+      // 先用 resolveAllShellMatchesFromPath 独立确认：两个候选都被找到了、
+      // 且顺序符合预期——这样下面 resolvePowerShellPath 选中 realPath 就确凿是
+      // "verify 失败后 continue 到下一个"生效了，不是巧合只找到一个候选。
+      // 大小写不敏感比较（PATHEXT 默认大写 ".EXE"，见上面同款注释）。
+      expect(resolveAllShellMatchesFromPath("pwsh").map((p) => p.toLowerCase())).toEqual([
+        stubPath.toLowerCase(),
+        realPath.toLowerCase(),
+      ]);
+
+      const verify = (candidate: string) => candidate.toLowerCase() !== stubPath.toLowerCase();
+      expect(resolvePowerShellPath({ verify })?.toLowerCase()).toBe(realPath.toLowerCase());
+    });
+  });
+
+  describe("结果缓存（code review Important#1/#2/#3 回应：spawn 探针实测耗时约 316ms，必须缓存）", () => {
+    it("解析结果会被缓存，同一进程内第二次调用不会重新执行 verify", () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-cache-"));
+      tempDirs.push(base);
+      const pwsh7Dir = path.join(base, "PowerShell", "7");
+      fs.mkdirSync(pwsh7Dir, { recursive: true });
+      const pwsh7Path = path.join(pwsh7Dir, "pwsh.exe");
+      fs.writeFileSync(pwsh7Path, "");
+
+      process.env.ProgramFiles = base;
+      process.env.PATH = "";
+      delete process.env.ProgramW6432;
+      delete process.env.SystemRoot;
+      delete process.env.WINDIR;
+
+      let verifyCallCount = 0;
+      const verify = () => {
+        verifyCallCount += 1;
+        return true;
+      };
+
+      const first = resolvePowerShellPath({ verify });
+      // 第二次调用即便传了一个不同的 verify（这里刻意传会返回 false 的版本），
+      // 缓存命中也应该直接短路返回第一次的结果，根本不会再调用它。
+      const second = resolvePowerShellPath({ verify: () => false });
+
+      expect(first).toBe(pwsh7Path);
+      expect(second).toBe(pwsh7Path);
+      expect(verifyCallCount).toBe(1);
+    });
+
+    it("resetPowerShellPathCacheForTests 后会重新解析（供测试用，不影响生产行为）", () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-cache-reset-"));
+      tempDirs.push(base);
+      const pwsh7Dir = path.join(base, "PowerShell", "7");
+      fs.mkdirSync(pwsh7Dir, { recursive: true });
+      const pwsh7Path = path.join(pwsh7Dir, "pwsh.exe");
+      fs.writeFileSync(pwsh7Path, "");
+
+      process.env.ProgramFiles = base;
+      process.env.PATH = "";
+      delete process.env.ProgramW6432;
+      delete process.env.SystemRoot;
+      delete process.env.WINDIR;
+
+      let verifyCallCount = 0;
+      const verify = () => {
+        verifyCallCount += 1;
+        return true;
+      };
+
+      resolvePowerShellPath({ verify });
+      resetPowerShellPathCacheForTests();
+      resolvePowerShellPath({ verify });
+
+      expect(verifyCallCount).toBe(2);
+    });
   });
 });

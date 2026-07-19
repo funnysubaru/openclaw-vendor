@@ -321,6 +321,15 @@ export function createWindowsStreamDecoder(params?: {
         if (bufferHasNonAscii(chunk)) {
           // 拿到了足以判别编码的信号（非 ASCII 字节 + 严格解码未报错）——
           // 之后全程按 UTF-8 处理，不再走代码页分支，utf8Validator 不再需要。
+          //
+          // code review Minor#3：这个提交是**单向、不可逆**的 deliberate trade-off
+          // ——一旦某个 chunk 含非 ASCII 字节且通过严格 UTF-8 校验，后续所有
+          // chunk 都会被当作 UTF-8 处理，即使后面来的其实是货真价实的 GBK 字节
+          // 也不会被重新识别、切回 GBK 解码（会被非 fatal 的 utf8Real 当无效
+          // 序列解出 U+FFFD 替换符，见 windows-encoding.test.ts 的 Minor#3/#4
+          // 回归测试）。不做"中途切换检测"是有意为之：真实场景里同一个子进程
+          // 中途切换输出编码本身就极其反常，不值得为这种边缘情况增加状态机
+          // 复杂度（可能引入新的误判/抖动）。
           resolvedMode = "utf8";
         }
         // 纯 ASCII chunk：resolvedMode 保持 unresolved，但 decoded 本身已经

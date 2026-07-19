@@ -1,8 +1,32 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { captureEnv } from "../test-utils/env.js";
+
+// code review Round2 Important#2 回应：resolvePowerShellPath 落到 PS 5.1 兜底时
+// 会打日志（warn=候选存在但全部验证失败/debug=压根没找到候选），用同款
+// vi.hoisted + vi.mock("../logging/subsystem.js") 约定捕获调用（参照
+// src/infra/restart-stale-pids.test.ts 的写法）——只在这个文件里 mock，不影响
+// 其它测试文件；本文件里其余不关心日志的测试完全不受影响（mock 只是把真实
+// I/O 换成可断言的 spy，不改变 shell-utils.ts 本身的控制流）。
+const mockShellUtilsLogWarn = vi.hoisted(() => vi.fn());
+const mockShellUtilsLogDebug = vi.hoisted(() => vi.fn());
+
+vi.mock("../logging/subsystem.js", () => ({
+  createSubsystemLogger: vi.fn(() => ({
+    warn: (...args: unknown[]) => mockShellUtilsLogWarn(...args),
+    debug: (...args: unknown[]) => mockShellUtilsLogDebug(...args),
+    info: vi.fn(),
+    error: vi.fn(),
+    trace: vi.fn(),
+    fatal: vi.fn(),
+    raw: vi.fn(),
+    isEnabled: vi.fn(() => true),
+    child: vi.fn(),
+  })),
+}));
+
 import {
   getShellConfig,
   resetPowerShellPathCacheForTests,
@@ -246,6 +270,10 @@ describe("resolvePowerShellPath", () => {
     // 缓存（见 shell-utils.ts 顶部注释），不重置的话上一条测试解析出的结果会
     // 一直沿用到后面所有测试。每条测试开始前都必须重置。
     resetPowerShellPathCacheForTests();
+    // code review Round2 Important#2 回应：清空日志 spy 的调用记录，避免上一条
+    // 测试残留的调用次数污染这一条的断言。
+    mockShellUtilsLogWarn.mockClear();
+    mockShellUtilsLogDebug.mockClear();
   });
 
   afterEach(() => {
@@ -526,6 +554,53 @@ describe("resolvePowerShellPath", () => {
 
       const verify = (candidate: string) => candidate.toLowerCase() !== stubPath.toLowerCase();
       expect(resolvePowerShellPath({ verify })?.toLowerCase()).toBe(realPath.toLowerCase());
+    });
+  });
+
+  // code review Round2 Important#2 回应：全部候选失败静默落回 PS 5.1、且结果
+  // 被缓存到整个进程生命周期，排查困难——用日志弥补"静默"这一点。这里验证
+  // 两种场景分别打对了日志级别：真的有候选但验证失败（warn，值得关注）vs
+  // 压根没找到候选（debug，机器上就是没装 pwsh7 的正常状态）。
+  describe("静默退化的日志留痕（code review Round2 Important#2 回应）", () => {
+    it("有候选但全部验证失败时打 warn，日志带上具体失败的候选路径", () => {
+      const programFiles = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-log-warn-pfiles-"));
+      tempDirs.push(programFiles);
+      const pwsh7Dir = path.join(programFiles, "PowerShell", "7");
+      fs.mkdirSync(pwsh7Dir, { recursive: true });
+      const stubPath = path.join(pwsh7Dir, "pwsh.exe");
+      fs.writeFileSync(stubPath, "");
+
+      process.env.ProgramFiles = programFiles;
+      process.env.PATH = "";
+      delete process.env.ProgramW6432;
+      delete process.env.SystemRoot;
+      delete process.env.WINDIR;
+
+      resolvePowerShellPath({ verify: () => false });
+
+      expect(mockShellUtilsLogWarn).toHaveBeenCalledTimes(1);
+      const [, meta] = mockShellUtilsLogWarn.mock.calls[0] as [
+        string,
+        { failedCandidates: string[] },
+      ];
+      expect(meta.failedCandidates).toEqual([stubPath]);
+      expect(mockShellUtilsLogDebug).not.toHaveBeenCalled();
+    });
+
+    it("压根没找到任何候选时打 debug（正常状态，不算异常），不打 warn", () => {
+      const programFiles = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-log-debug-pfiles-"));
+      tempDirs.push(programFiles); // 故意不创建 PowerShell/7 子目录——没有任何候选可找
+
+      process.env.ProgramFiles = programFiles;
+      process.env.PATH = "";
+      delete process.env.ProgramW6432;
+      delete process.env.SystemRoot;
+      delete process.env.WINDIR;
+
+      resolvePowerShellPath({ verify: alwaysVerify });
+
+      expect(mockShellUtilsLogDebug).toHaveBeenCalledTimes(1);
+      expect(mockShellUtilsLogWarn).not.toHaveBeenCalled();
     });
   });
 

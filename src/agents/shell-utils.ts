@@ -1,6 +1,9 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+
+const log = createSubsystemLogger("agents/shell-utils");
 
 // Yuiclaw 补丁（Windows 兼容性修复 code review Important#1/#2 回应）：
 // resolvePowerShellPath() 现在会真的 spawn 一次候选二进制做可执行性验证（见下方
@@ -45,12 +48,56 @@ export function resetPowerShellPathCacheForTests(): void {
 // 全部失败才落回 Windows 自带的 PowerShell 5.1——那是系统内置组件、不是别名，
 // 作为终极兜底不需要再验证。YUICLAW_BUNDLED_PWSH_PATH（Yuiclaw 自己校验过随
 // 安装包分发的真身二进制，不是 App Execution Alias）同样不需要验证。
+//
+// code review Round2 Important#1（性能/阻塞成本必须写明具体数字，不能只写
+// "若干"）：
+// - verifyPwshExecutable 用的是**同步** spawnSync，会阻塞 Node 事件循环，
+//   不是后台异步跑的——调用期间整个进程（包括其他并发的 gateway/IPC 处理）
+//   都会被冻结，直到子进程退出或超时。
+// - 单次调用最长阻塞 PWSH_VERIFY_TIMEOUT_MS = 3000ms（见下方常量）。
+// - 当前实现里固定有 2 个会触发 verify() 的候选位置：Program Files 的
+//   pwsh7、ProgramW6432 的 pwsh7Alt；此外 PATH 搜索分支
+//   （resolveAllShellMatchesFromPath 返回的每一个匹配）也会各 verify 一次，
+//   这一步在代码结构上**没有硬编码的数量上限**，实际次数取决于用户 PATH
+//   环境变量里有多少个目录、其中又有多少个能通过 PATHEXT 匹配到 "pwsh" 的
+//   候选（结构性无绝对上限，但现实中一台机器同时装多个相互冲突的 pwsh 极少见）。
+// - **最坏情况的具体算式**：总 verify 调用次数 = 2（固定）+ N（PATH 命中数），
+//   每次最长 3000ms，即 worst_case_ms = (2 + N) × 3000。以本次实测复现环境为例
+//   （PATH 上只有 WindowsApps 这一个 pwsh 候选，N=1）：全部候选都验证失败时，
+//   最坏总阻塞时长 = (2 + 1) × 3000ms = 9000ms ≈ 9 秒——且只发生在**首次**
+//   resolvePowerShellPath() 调用时（下面的模块级缓存保证之后不会重复付出这
+//   笔成本）。常见的单一候选场景（比如系统只装了 Store 版 pwsh、没有其他
+//   冲突安装）通常只触发 1 次 verify，最坏 ≈ 3 秒。
+//
+// code review Round2 Important#2（首次 verify 失败——含瞬时超时——会被永久
+// 缓存为 PS 5.1，静默退化，排查困难）：
+// - 已评估两种方案：① 把"全部候选失败"这个结果也照常写入缓存（当前选择）；
+//   ② 只缓存成功结果，失败不缓存，让下一次 exec 重新走一遍探测。
+// - **选了①，理由**：这台机器上大概率有相当比例是"确实没装 pwsh7、只有
+//   PS 5.1"的真实稳态（而不是瞬时抖动）——如果选②，这些机器会在**每一次**
+//   exec 调用上都重新付出上面算出来的最坏 (2+N)×3000ms 阻塞成本，这比"一次
+//   瞬时超时误判后，整个进程生命周期都停留在 PS 5.1（但至少能跑、有日志可查）"
+//   更差：前者是对最常见场景（真的没装 pwsh）的持续性能伤害，后者是对少见
+//   场景（AV 扫描/慢盘导致的一次性超时）的一次性、可诊断的体验降级。
+// - 用日志弥补"静默"这个真正的问题（见 resolvePowerShellPathUncached 里落到
+//   PS 5.1 分支时的 log.warn/log.debug）：全部候选存在但验证失败时打 warn
+//   （这是真正的"退化"信号，值得关注）；压根没找到任何候选时打 debug（这是
+//   机器上确实没装 pwsh7 的正常状态，不算异常）。这样即使结果被缓存，用户/
+//   开发者也能从日志里查到"为什么这个进程生命周期里 && 一直不能用"，而不是
+//   完全没有排查线索。
+// - 没有做"缓存加 TTL 到期重试"这类折中方案：为了保持这次修复的改动面
+//   最小（Karpathy 式"最少代码"原则），且 review 本身也明确说"非必须加重试"
+//   ——如果未来发现瞬时超时误判确实是高频问题，再单独评估要不要引入 TTL。
 const PWSH_VERIFY_TIMEOUT_MS = 3000;
 
 /**
  * 真的 spawn 一次候选路径，确认它是一个能正常跑起来的 PowerShell，而不是
  * Microsoft Store 的占位别名。跑一个几乎零成本的表达式，只关心进程能否以
  * 0 退出码结束——不关心具体输出内容（stdio: "ignore"）。
+ *
+ * ⚠️ 阻塞警告：内部用的是**同步** spawnSync，会阻塞 Node 事件循环直到子进程
+ * 退出或超时（最长 PWSH_VERIFY_TIMEOUT_MS = 3000ms）——具体成本核算与"为什么
+ * 接受这个代价"见上方模块级注释（Round2 Important#1）。
  *
  * stdio: "ignore"：占位别名被 spawn 时可能弹出 Store 安装向导 UI，我们既不需要
  * 也不想捕获它的输出。
@@ -81,9 +128,16 @@ function verifyPwshExecutable(candidatePath: string): boolean {
   }
 }
 
+/**
+ * code review Round2 Minor：`params.verify` 只在**缓存未命中**时才会被使用——
+ * 一旦模块级缓存里已经有解析结果（见 cachedResolvedPowerShellPath），本函数会
+ * 直接短路返回缓存值，完全不会调用这次传入的 `verify`，即使传了自定义实现也
+ * 一样。测试如果需要每次都重新走 verify 逻辑，必须先调用
+ * resetPowerShellPathCacheForTests()。
+ */
 export function resolvePowerShellPath(params?: {
   /** 测试注入用：跳过真实 spawn，模拟"候选可执行 / 是占位符"。生产代码不传，
-   * 用真正的 verifyPwshExecutable。 */
+   * 用真正的 verifyPwshExecutable。缓存命中时本参数会被忽略，见函数级注释。 */
   verify?: (candidatePath: string) => boolean;
 }): string {
   if (cachedResolvedPowerShellPath !== undefined) {
@@ -112,21 +166,32 @@ function resolvePowerShellPathUncached(verify: (candidatePath: string) => boolea
     return bundledPwsh;
   }
 
+  // code review Round2 Important#2 回应：记录"存在但 verify 失败"的候选路径，
+  // 只有这个列表非空时，落到 PS 5.1 兜底才算是"真的发生了降级"（而不是这台
+  // 机器压根没装 pwsh7 的正常状态）——日志级别据此区分，见函数末尾。
+  const failedCandidates: string[] = [];
+
   // Prefer PowerShell 7 when available; PS 5.1 lacks "&&" support.
   // 以下每个候选找到后都先 verify() 过一遍才采信——见上方模块注释：只凭
   // fs.existsSync 找到文件不代表它真能跑（可能是占位别名 / 损坏的安装），
   // 验证失败就 continue 尝试下一个候选，而不是直接采信或直接放弃。
   const programFiles = process.env.ProgramFiles || process.env.PROGRAMFILES || "C:\\Program Files";
   const pwsh7 = path.join(programFiles, "PowerShell", "7", "pwsh.exe");
-  if (fs.existsSync(pwsh7) && verify(pwsh7)) {
-    return pwsh7;
+  if (fs.existsSync(pwsh7)) {
+    if (verify(pwsh7)) {
+      return pwsh7;
+    }
+    failedCandidates.push(pwsh7);
   }
 
   const programW6432 = process.env.ProgramW6432;
   if (programW6432 && programW6432 !== programFiles) {
     const pwsh7Alt = path.join(programW6432, "PowerShell", "7", "pwsh.exe");
-    if (fs.existsSync(pwsh7Alt) && verify(pwsh7Alt)) {
-      return pwsh7Alt;
+    if (fs.existsSync(pwsh7Alt)) {
+      if (verify(pwsh7Alt)) {
+        return pwsh7Alt;
+      }
+      failedCandidates.push(pwsh7Alt);
     }
   }
 
@@ -142,24 +207,40 @@ function resolvePowerShellPathUncached(verify: (candidatePath: string) => boolea
     if (verify(candidate)) {
       return candidate;
     }
+    failedCandidates.push(candidate);
   }
 
   const systemRoot = process.env.SystemRoot || process.env.WINDIR;
-  if (systemRoot) {
-    const candidate = path.join(
-      systemRoot,
-      "System32",
-      "WindowsPowerShell",
-      "v1.0",
-      "powershell.exe",
-    );
-    if (fs.existsSync(candidate)) {
-      // 终极兜底：Windows 系统内置组件，不是别名，不存在"装了别名但没装真身"
-      // 的问题，不需要再 verify。
-      return candidate;
-    }
+  const ps51Candidate = systemRoot
+    ? path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    : "powershell.exe";
+  const ps51Exists = systemRoot ? fs.existsSync(ps51Candidate) : false;
+  // 终极兜底：Windows 系统内置组件，不是别名，不存在"装了别名但没装真身"
+  // 的问题，不需要再 verify。ps51Exists 为 false 时（SystemRoot 未设或系统
+  // 目录下确实没有这个文件——极端环境）沿用改动前的行为，裸返回 "powershell.exe"
+  // 交给 PATH 解析，不视为额外的失败候选。
+  const resolvedFallback = ps51Exists ? ps51Candidate : "powershell.exe";
+
+  // code review Round2 Important#2 回应：全部候选验证失败、静默落回 PS 5.1 是
+  // 本次修复要解决的"排查困难"问题本身——用日志弥补"结果被缓存导致后续完全
+  // 看不出来"这一点（缓存决策与为什么不做失败重试的完整论证见上方模块注释）。
+  if (failedCandidates.length > 0) {
+    // 曾经找到过候选、但真的 spawn 起来全部失败——这是值得关注的真实退化
+    // （占位别名 / 损坏安装 / 瞬时超时），打 warn 并把具体候选路径带上，
+    // 方便用户或开发者排查"为什么这个进程里 && 一直用不了"。
+    log.warn('Windows PowerShell 7 候选全部验证失败，降级为 PowerShell 5.1（不支持 "&&"）', {
+      failedCandidates,
+      fallback: resolvedFallback,
+    });
+  } else {
+    // 压根没找到任何 pwsh7 候选——这台机器大概率就是只装了系统自带的 PS 5.1，
+    // 是预期内的正常状态，不算异常，用 debug 级别留痕即可（不打扰用户，但
+    // 仍然可查）。
+    log.debug('未找到任何 pwsh7 候选，使用 PowerShell 5.1（不支持 "&&"）', {
+      fallback: resolvedFallback,
+    });
   }
-  return "powershell.exe";
+  return resolvedFallback;
 }
 
 export function getShellConfig(): { shell: string; args: string[] } {

@@ -349,6 +349,38 @@ export async function runExecProcess(opts: {
     shellRuntimeEnv.OPENCLAW_MESSAGE_CHANNEL = normalizedMessageChannel;
   }
 
+  // Yuiclaw：把该 run 的 sessionKey 注入子进程 env（OPENCLAW_SESSION_KEY）。
+  //
+  // 业务意图：Yuiclaw 的 ppt-master 确认页做"事件驱动唤醒"——用户在确认页点击后，
+  // 页面本地 daemon 需要回调 Yuiclaw、经 gateway 唤醒"当初启动这次 exec 的那个会话"
+  // 去写下一阶段。daemon 只能靠读子进程 env 拿到目标会话，读不到就只能退回纯轮询。
+  // 刻意不做"从 sessions.json 猜最近活跃会话"的回退——那是推断不是事实，猜错会把
+  // 系统消息发进别人的会话，所以必须由这里给一个确定性的值。
+  //
+  // 已查上游（2026-07-19）：openclaw/openclaw 有多轮同类尝试（#68820 / #68859 / #72980 /
+  // #96104 均已关闭，理由是"被 #73349 取代"），当前唯一存活的是仍未合并的
+  // PR #73349（"waiting on author"，同时注入 OPENCLAW_SESSION_KEY 与
+  // OPENCLAW_AGENT_ID）。#73349 的语义与本仓库现有约定冲突——它选择"该 key 永远存在，
+  // 拿不到时写空串"（`opts.sessionKey ?? ""`），而本文件同一处 OPENCLAW_MESSAGE_CHANNEL
+  // 的既有实现（上方几行）与本次消费方（daemon 用 shell 的"key 是否存在"做判断，
+  // 见 bash-tools.exec.message-channel.test.ts 的 printChannelPresenceCmd 写法）都
+  // 要求"拿不到就该 key 彻底不存在"，写空串会被消费侧当成"有值"误用。因此不直接
+  // cherry-pick #73349（其也尚未合并、语义还可能再变），改为遵循本文件既有的
+  // delete-then-set 范式自实现，只覆盖 Yuiclaw 需要的 OPENCLAW_SESSION_KEY（不含
+  // #73349 一并做的 OPENCLAW_AGENT_ID，本次需求未涉及，不顺带引入）。
+  //
+  // 边界（delete-then-set 的原因，与 OPENCLAW_MESSAGE_CHANNEL 同款）：`...opts.env`
+  // 展开可能带进父进程继承残留、或 tool 调用 params.env 显式伪造的同名 key；若只在
+  // "拿得到时才赋值"，"拿不到"时会让这个残留/伪造值原样透传进子进程，daemon 可能把
+  // 系统消息误唤醒进错误会话。所以先无条件清掉，再仅在本 run 真有 sessionKey
+  // （trim 后非空）时写入 trim 后的值——空白串（如 "  "）按无效处理，与本文件
+  // emitExecSystemEvent 对 sessionKey 的既有 trim 判断一致。
+  delete shellRuntimeEnv.OPENCLAW_SESSION_KEY;
+  const trimmedSessionKey = opts.sessionKey?.trim();
+  if (trimmedSessionKey) {
+    shellRuntimeEnv.OPENCLAW_SESSION_KEY = trimmedSessionKey;
+  }
+
   const session: ProcessSession = {
     id: sessionId,
     command: opts.command,

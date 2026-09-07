@@ -66,7 +66,7 @@ describe("openai-codex implicit provider", () => {
     });
   });
 
-  it("resolves gpt-5.5 / gpt-5.4-mini at request time with no cfg (real-runtime gate)", async () => {
+  it("resolves patched Codex models at request time with no cfg (real-runtime gate)", async () => {
     await withModelsTempHome(async () => {
       await withTempEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS, async () => {
         unsetEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS);
@@ -81,7 +81,14 @@ describe("openai-codex implicit provider", () => {
         // "Unknown model"，因为 ModelRegistry.find() 只认 pi-ai 内置目录、
         // 不认 models.json 的 implicit 块。改用 pnpm patch 把两款补进 pi-ai
         // 内置目录后，find() 直接命中，这里必须转绿。
-        for (const modelId of ["gpt-5.5", "gpt-5.4-mini"]) {
+        for (const modelId of [
+          "gpt-6-astra",
+          "gpt-5.6-sol",
+          "gpt-5.6-terra",
+          "gpt-5.6-luna",
+          "gpt-5.5",
+          "gpt-5.4-mini",
+        ]) {
           const result = resolveModel("openai-codex", modelId, agentDir, undefined);
           expect(result.error).toBeUndefined();
           expect(result.model).toMatchObject({
@@ -95,7 +102,7 @@ describe("openai-codex implicit provider", () => {
     });
   });
 
-  it("surfaces gpt-5.5 / gpt-5.4-mini in the model-catalog layer (getAll)", async () => {
+  it("surfaces patched Codex models in the model-catalog layer (getAll)", async () => {
     // 可选补充验收（round 2/3 review Minor 项）：model-catalog.ts 的 loadModelCatalog()
     // 走的是真实 ModelRegistry.getAll()（picker/列表用），跟上面 resolveModel() 走的
     // find() 是两条不同代码路径。两条路径背后都依赖同一份 pi-ai patch 后的内置目录，
@@ -112,6 +119,10 @@ describe("openai-codex implicit provider", () => {
         const codexModelIds = new Set(
           catalog.filter((entry) => entry.provider === "openai-codex").map((entry) => entry.id),
         );
+        expect(codexModelIds.has("gpt-6-astra")).toBe(true);
+        expect(codexModelIds.has("gpt-5.6-sol")).toBe(true);
+        expect(codexModelIds.has("gpt-5.6-luna")).toBe(true);
+        expect(codexModelIds.has("gpt-5.6-terra")).toBe(true);
         expect(codexModelIds.has("gpt-5.5")).toBe(true);
         expect(codexModelIds.has("gpt-5.4-mini")).toBe(true);
       });

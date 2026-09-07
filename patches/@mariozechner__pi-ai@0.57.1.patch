@@ -1,11 +1,79 @@
 diff --git a/dist/models.generated.js b/dist/models.generated.js
-index e4398f4fa158bea689279b77d76f82ef3f4825e4..6dd746472813a64e690bfadd566ca1390db29ec9 100644
+index e4398f4fa158bea689279b77d76f82ef3f4825e4..227e8125cf5d08f2368c46cc4c1f75b205db9cf7 100644
 --- a/dist/models.generated.js
 +++ b/dist/models.generated.js
-@@ -5794,6 +5794,40 @@ export const MODELS = {
+@@ -5794,6 +5794,108 @@ export const MODELS = {
              contextWindow: 272000,
              maxTokens: 128000,
          },
++        "gpt-6-astra": {
++            id: "gpt-6-astra",
++            name: "GPT-6 Astra",
++            api: "openai-codex-responses",
++            provider: "openai-codex",
++            baseUrl: "https://chatgpt.com/backend-api",
++            reasoning: true,
++            input: ["text", "image"],
++            cost: {
++                input: 10,
++                output: 50,
++                cacheRead: 1,
++                cacheWrite: 12.5,
++            },
++            contextWindow: 1050000,
++            maxTokens: 128000,
++        },
++        "gpt-5.6-sol": {
++            id: "gpt-5.6-sol",
++            name: "GPT-5.6 Sol",
++            api: "openai-codex-responses",
++            provider: "openai-codex",
++            baseUrl: "https://chatgpt.com/backend-api",
++            reasoning: true,
++            input: ["text", "image"],
++            cost: {
++                input: 4,
++                output: 20,
++                cacheRead: 0.4,
++                cacheWrite: 0,
++            },
++            contextWindow: 1050000,
++            maxTokens: 128000,
++        },
++        "gpt-5.6-luna": {
++            id: "gpt-5.6-luna",
++            name: "GPT-5.6 Luna",
++            api: "openai-codex-responses",
++            provider: "openai-codex",
++            baseUrl: "https://chatgpt.com/backend-api",
++            reasoning: true,
++            input: ["text", "image"],
++            cost: {
++                input: 0.2,
++                output: 1.2,
++                cacheRead: 0.02,
++                cacheWrite: 0,
++            },
++            contextWindow: 1050000,
++            maxTokens: 128000,
++        },
++        "gpt-5.6-terra": {
++            id: "gpt-5.6-terra",
++            name: "GPT-5.6 Terra",
++            api: "openai-codex-responses",
++            provider: "openai-codex",
++            baseUrl: "https://chatgpt.com/backend-api",
++            reasoning: true,
++            input: ["text", "image"],
++            cost: {
++                input: 2,
++                output: 12,
++                cacheRead: 0.2,
++                cacheWrite: 0,
++            },
++            contextWindow: 1050000,
++            maxTokens: 128000,
++        },
 +        "gpt-5.5": {
 +            id: "gpt-5.5",
 +            name: "GPT-5.5",

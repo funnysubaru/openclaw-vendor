@@ -66,7 +66,7 @@ describe("openai-codex implicit provider", () => {
     });
   });
 
-  it("resolves gpt-5.5 / gpt-5.4-mini at request time with no cfg (real-runtime gate)", async () => {
+  it("resolves patched Codex models at request time with no cfg (real-runtime gate)", async () => {
     await withModelsTempHome(async () => {
       await withTempEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS, async () => {
         unsetEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS);
@@ -79,9 +79,16 @@ describe("openai-codex implicit provider", () => {
         // （run.ts:364 传的是用户 openclaw.json，其中并没有生成的 providers 块）。
         // 之前 buildOpenAICodexProvider 塞静态模型的机制在这一场景会报
         // "Unknown model"，因为 ModelRegistry.find() 只认 pi-ai 内置目录、
-        // 不认 models.json 的 implicit 块。改用 pnpm patch 把两款补进 pi-ai
+        // 不认 models.json 的 implicit 块。改用 pnpm patch 把订阅目录补进 pi-ai
         // 内置目录后，find() 直接命中，这里必须转绿。
-        for (const modelId of ["gpt-5.5", "gpt-5.4-mini"]) {
+        for (const modelId of [
+          "gpt-6-astra",
+          "gpt-5.6-sol",
+          "gpt-5.6-terra",
+          "gpt-5.6-luna",
+          "gpt-5.5",
+          "gpt-5.4-mini",
+        ]) {
           const result = resolveModel("openai-codex", modelId, agentDir, undefined);
           expect(result.error).toBeUndefined();
           expect(result.model).toMatchObject({
@@ -91,11 +98,25 @@ describe("openai-codex implicit provider", () => {
             baseUrl: "https://chatgpt.com/backend-api",
           });
         }
+        // Standard short-context USD per million tokens; metadata for usage estimates.
+        for (const [modelId, cost] of Object.entries({
+          "gpt-6-astra": { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+          "gpt-5.6-sol": { input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5 },
+          "gpt-5.6-terra": { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 2.5 },
+          "gpt-5.6-luna": { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 },
+        })) {
+          const { model } = resolveModel("openai-codex", modelId, agentDir, undefined);
+          expect(model, modelId).toMatchObject({
+            contextWindow: 1_050_000,
+            maxTokens: 128_000,
+            cost,
+          });
+        }
       });
     });
   });
 
-  it("surfaces gpt-5.5 / gpt-5.4-mini in the model-catalog layer (getAll)", async () => {
+  it("surfaces patched Codex models in the model-catalog layer (getAll)", async () => {
     // 可选补充验收（round 2/3 review Minor 项）：model-catalog.ts 的 loadModelCatalog()
     // 走的是真实 ModelRegistry.getAll()（picker/列表用），跟上面 resolveModel() 走的
     // find() 是两条不同代码路径。两条路径背后都依赖同一份 pi-ai patch 后的内置目录，
@@ -112,6 +133,10 @@ describe("openai-codex implicit provider", () => {
         const codexModelIds = new Set(
           catalog.filter((entry) => entry.provider === "openai-codex").map((entry) => entry.id),
         );
+        expect(codexModelIds.has("gpt-6-astra")).toBe(true);
+        expect(codexModelIds.has("gpt-5.6-sol")).toBe(true);
+        expect(codexModelIds.has("gpt-5.6-luna")).toBe(true);
+        expect(codexModelIds.has("gpt-5.6-terra")).toBe(true);
         expect(codexModelIds.has("gpt-5.5")).toBe(true);
         expect(codexModelIds.has("gpt-5.4-mini")).toBe(true);
       });

@@ -393,17 +393,56 @@ export function resolveWorkspaceSkillPromptEntries(
 // 改成 fs.promises.access 后交给 libuv 线程池，主线程不再被阻塞。
 // #146373 的其余部分（resolveWorkspaceSkillPromptEntries 改 async 等 50 个文件）没搬，
 // 那些调用方仍走同步 loadWorkspaceSkills / hasBinary，行为与 pin 一致。
-async function prepareSkillBinaryProbe(entries: SkillEntry[], assertCurrent?: () => void) {
-  const bins = entries.flatMap((entry) => [
-    ...(entry.metadata?.requires?.bins ?? []),
-    ...(entry.metadata?.requires?.anyBins ?? []),
-  ]);
-  for (;;) {
-    const facts = await prepareBinaryAvailability(bins, assertCurrent);
-    if (facts.isCurrent()) {
-      return facts.hasBinary;
+// prepareSkillBinaryProbe 再叠上游 #147359（af40e11dda8）：只探「除了缺程序以外都满足条件」
+// 的技能所需程序（os 不符 / 被禁用 / 不在 allowlist 的技能不再白扫 PATH）；判定时若用到了
+// 没预先探过的程序（条件在探测期间变了）就整轮重来，不用半旧结果。
+async function prepareSkillBinaryProbe(
+  entries: SkillEntry[],
+  opts?: Pick<WorkspaceSkillLoadOptions, "config" | "eligibility">,
+  assertCurrent?: () => void,
+) {
+  const bins = new Set<string>();
+  const bundledAllowlist = resolveBundledAllowlist(opts?.config);
+  let needsBinaries: boolean;
+  const recordBinaryRequirement = () => {
+    needsBinaries = true;
+    return true;
+  };
+  for (const entry of entries) {
+    const requires = entry.metadata?.requires;
+    if (!requires?.bins?.length && !requires?.anyBins?.length) {
+      continue;
+    }
+    needsBinaries = false;
+    shouldIncludeSkill({
+      entry,
+      config: opts?.config,
+      bundledAllowlist,
+      eligibility: opts?.eligibility,
+      hasBin: recordBinaryRequirement,
+    });
+    if (needsBinaries) {
+      for (const bin of entry.metadata?.requires?.bins ?? []) {
+        bins.add(bin);
+      }
+      for (const bin of entry.metadata?.requires?.anyBins ?? []) {
+        bins.add(bin);
+      }
     }
   }
+  const facts = await prepareBinaryAvailability(bins, assertCurrent);
+  let unprepared = false;
+  return {
+    hasBin: (bin: string) => {
+      // Eligibility can change while probing; prepare newly requested facts before publishing.
+      if (!bins.has(bin)) {
+        unprepared = true;
+        return false;
+      }
+      return facts.hasBinary(bin);
+    },
+    needsRetry: () => unprepared || !facts.isCurrent(),
+  };
 }
 
 function resolveWorkspaceSkillLoad(workspaceDir: string, opts?: WorkspaceSkillLoadOptions) {
@@ -440,19 +479,24 @@ export async function prepareWorkspaceSkills(
     if (!shouldFilter) {
       return entries;
     }
-    const hasBin = await prepareSkillBinaryProbe(entries, assertCurrent);
-    // 异步探测期间技能目录变了（安装/删除技能）就重来，避免用旧条目配新探测结果。
-    if (getSkillsSnapshotVersion(workspaceDir) !== sourceVersion) {
+    const probe = await prepareSkillBinaryProbe(entries, opts, assertCurrent);
+    // 异步探测期间技能目录变了（安装/删除技能）或探测条件失效，就重来，避免用旧条目配新探测结果。
+    if (probe.needsRetry() || getSkillsSnapshotVersion(workspaceDir) !== sourceVersion) {
       continue;
     }
-    return filterSkillEntries(
+    const eligible = filterSkillEntries(
       entries,
       opts?.config,
       effectiveSkillFilter,
       opts?.skillOverrides,
       opts?.eligibility,
-      hasBin,
+      probe.hasBin,
     );
+    assertCurrent?.();
+    if (probe.needsRetry()) {
+      continue;
+    }
+    return eligible;
   }
 }
 

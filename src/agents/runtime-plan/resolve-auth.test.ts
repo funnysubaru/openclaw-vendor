@@ -1,5 +1,7 @@
 import type { Model } from "openclaw/plugin-sdk/llm";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, aroundEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createPluginMetadataSnapshotFixture } from "../../plugins/plugin-metadata.test-support.js";
+import { withPluginRuntimeGenerationScope } from "../../plugins/runtime/generation-scope.js";
 import { SecretSurfaceUnavailableError } from "../../secrets/runtime-degraded-state.js";
 import type { AuthProfileStore } from "../auth-profiles.js";
 import { OAuthRefreshFailureError } from "../auth-profiles/oauth-refresh-failure.js";
@@ -50,6 +52,17 @@ function authStore(profiles: AuthProfileStore["profiles"]): AuthProfileStore {
 }
 
 describe("resolvePreparedRuntimeModelAuth", () => {
+  aroundEach((runTest) =>
+    withPluginRuntimeGenerationScope(
+      {
+        metadataSnapshot: createPluginMetadataSnapshotFixture({
+          plugins: [{ id: "openai", providers: ["openai"] }],
+        }),
+      },
+      runTest,
+    ),
+  );
+
   beforeEach(() => {
     vi.stubEnv("OPENCLAW_TEST_MISSING_PREPARED_AUTH", "");
     vi.stubEnv("OPENCLAW_TEST_MISSING_BOUND_AUTH", "");

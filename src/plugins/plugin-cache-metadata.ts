@@ -2,7 +2,7 @@ import type { BundledStaticCatalogState } from "../agents/embedded-agent-runner/
 import type { BundledChannelCatalogEntry } from "../channels/bundled-channel-catalog.types.js";
 import type { ManifestChannelPlugin } from "../channels/plugins/manifest-channel-plugin.types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import type { PluginDiscoveryResult } from "./discovery.types.js";
+import type { PluginCandidate, PluginDiscoveryResult } from "./discovery.types.js";
 import type {
   InstalledPluginIndex,
   InstalledPluginIndexFacts,
@@ -44,6 +44,13 @@ export type PluginCacheMetadata = {
     current: CurrentPluginMetadataCacheState;
     snapshots: Map<string, PluginMetadataSnapshot>;
     discovery: Map<string, PluginDiscoveryResult>;
+    sharedDiscovery: Map<
+      string,
+      {
+        candidates: ReadonlyArray<{ candidate: PluginCandidate; usesWorkspace: boolean }>;
+        diagnostics: PluginDiscoveryResult["diagnostics"];
+      }
+    >;
     discoveryMountPoints?: ReadonlySet<string>;
     projections: WeakMap<PluginMetadataSnapshot, Map<string, PluginMetadataSnapshot>>;
     projectionSources: WeakMap<PluginMetadataSnapshot, PluginMetadataSnapshot>;
@@ -96,6 +103,7 @@ export function createPluginCacheMetadata(): PluginCacheMetadata {
       },
       snapshots: new Map(),
       discovery: new Map(),
+      sharedDiscovery: new Map(),
       projections: new WeakMap(),
       projectionSources: new WeakMap(),
       completions: new WeakMap(),

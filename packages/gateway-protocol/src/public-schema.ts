@@ -290,6 +290,7 @@ export {
   SessionsPatchManyResultSchema,
   SessionsPluginPatchParamsSchema,
   SessionsResetParamsSchema,
+  SessionsRefreshBootstrapParamsSchema,
   SessionsDeleteParamsSchema,
   SessionsAssignOwnerParamsSchema,
   SessionsAssignOwnerResultSchema,

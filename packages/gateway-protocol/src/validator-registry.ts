@@ -303,6 +303,10 @@ export const validateSessionsGoalClearParams = compile(S.SessionsGoalClearParams
 export const validateSessionsPatchManyParams = compile(S.SessionsPatchManyParamsSchema);
 export const validateSessionsPluginPatchParams = compile(S.SessionsPluginPatchParamsSchema);
 export const validateSessionsResetParams = compile(S.SessionsResetParamsSchema);
+// Yuiclaw fork（回搬自 #26/#67，2026-09-15 移植到 v2026.9.4 基线）。
+export const validateSessionsRefreshBootstrapParams = compile(
+  S.SessionsRefreshBootstrapParamsSchema,
+);
 export const validateSessionsDeleteParams = compile(S.SessionsDeleteParamsSchema);
 export const validateSessionsAssignOwnerParams = compile(S.SessionsAssignOwnerParamsSchema);
 export const validateSessionsGroupsListParams = compile(S.SessionsGroupsListParamsSchema);

@@ -61,6 +61,8 @@ export const SessionLifecycleProtocolSchemas = {
   SessionsPluginPatchParams: sessions.SessionsPluginPatchParamsSchema,
   SessionsPluginPatchResult: sessions.SessionsPluginPatchResultSchema,
   SessionsResetParams: sessions.SessionsResetParamsSchema,
+  // Yuiclaw fork（回搬自 #26/#67，2026-09-15 移植到 v2026.9.4 基线）：软刷新 bootstrap 缓存。
+  SessionsRefreshBootstrapParams: sessions.SessionsRefreshBootstrapParamsSchema,
   SessionsDeleteParams: sessions.SessionsDeleteParamsSchema,
   WorktreePreservationReason: sessions.WorktreePreservationReasonSchema,
   PreservedSessionWorktree: sessions.PreservedSessionWorktreeSchema,

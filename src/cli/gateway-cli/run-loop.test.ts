@@ -3900,11 +3900,11 @@ describe("runGatewayLoop", () => {
         await withIsolatedSignals(async () => {
           const { close, runtime, exited } = await createSignaledLoopHarness();
           expect(capturedParentPortListener).toBeTypeOf("function");
-          // run-loop.ts 的接收端对 message 事件做归一化："data" in event 就取
+          // run-loop.ts 的接收端对 message 事件做归一化：event.data != null 就取
           // event.data，否则把 event 本身当 payload（防御 Electron 版本间字段位置
           // 差异）。上面那条用例覆盖了 { data: {...} } 包一层的常见形态，这里补覆盖
-          // 裸 payload（不含 data 字段）走的回退分支，确保两条路径都能触发同样完整
-          // 的优雅关闭。
+          // 裸 payload（根本没有 data 字段）走的回退分支；下面还有一条覆盖「有 data
+          // 字段但值为 undefined」的回退，三条路径都必须触发同样完整的优雅关闭。
           const barePayload = {
             type: "__openclaw_parentport_shutdown__",
           } as unknown as { data?: unknown };

@@ -57,9 +57,9 @@ const HARD_EXIT_WATCHDOG_GRACE_MS = 2_000;
 // 优雅关闭通道的暗号。Windows 上 Node 子进程收不到父进程发来的 POSIX 信号（taskkill /F
 // 是无信号强杀），所以上面的 SIGTERM→request("stop") 优雅路径够不着。父进程（Yuiclaw
 // launcher）改从 stdin 写一行暗号来触发同一条路径。暗号常量必须与 Yuiclaw 侧
-// packages/gateway/src/launcher.ts 的 STDIN_SHUTDOWN_SENTINEL 保持一致——改一侧必须同改
-// 另一侧。仅当父进程显式设置 OPENCLAW_STDIN_CONTROL=1 才装监听，默认不装，对上游及其它
-// 运行方式零影响。
+// packages/gateway/src/process-tree.ts 的 STDIN_SHUTDOWN_SENTINEL 保持一致（与下面
+// parentPort 三个常量同一个权威文件）——改一侧必须同改另一侧。仅当父进程显式设置
+// OPENCLAW_STDIN_CONTROL=1 才装监听，默认不装，对上游及其它运行方式零影响。
 const STDIN_SHUTDOWN_SENTINEL = "__openclaw_stdin_shutdown__";
 
 // Yuiclaw fork（回搬自 openclaw-vendor #102，2026-09-15 移植到 v2026.9.4 基线）：Electron
@@ -75,12 +75,11 @@ interface ElectronParentPort {
   removeListener(event: "message", listener: (event: { data?: unknown }) => void): void;
 }
 
-declare global {
-  namespace NodeJS {
-    interface Process {
-      parentPort?: ElectronParentPort;
-    }
-  }
+// 故意不用 `declare global` 往 NodeJS.Process 上扩增 parentPort：全局扩增会漏到整个编译
+// 单元，将来 Electron / @types/node 若也给 Process 长出形状不同的同名字段，同时引用两边的
+// 工程就会打架（PR #121 review）。改为本文件内的局部窄化读取，影响面只在这一处。
+function getElectronParentPort(): ElectronParentPort | undefined {
+  return (process as NodeJS.Process & { parentPort?: ElectronParentPort }).parentPort;
 }
 
 // Yuiclaw fork（回搬自 #102）：parentPort 优雅关闭协议常量。utilityProcess.fork() 派生的
@@ -282,7 +281,7 @@ export async function runGatewayLoop(params: {
     stdinControl?.close();
     stdinControl = null;
     if (parentPortListener) {
-      process.parentPort?.removeListener("message", parentPortListener);
+      getElectronParentPort()?.removeListener("message", parentPortListener);
       parentPortListener = null;
     }
   };
@@ -1267,10 +1266,12 @@ export async function runGatewayLoop(params: {
         request("stop", "stdin");
       }
     });
-    // stdin 不单独 ref 住事件循环（gateway 靠 server 保活），进程该退还是退。可选链：
-    // 某些执行环境（如 worker_threads/vmThreads 池，vitest 的 pool: "threads" 跑测试时
-    // 命中过）暴露的 process.stdin 不是真实 socket/tty，没有 unref 方法；真实 Node 主
-    // 进程（我们唯一关心的运行时目标）始终有这个方法，可选链对它零影响。
+    // unref 只是「不挡退出」，不是「停读」：readline 照常收行、暗号照常生效，只是 stdin
+    // 这个句柄不再单独 ref 住事件循环（gateway 靠 server 保活），关停后进程该退就退。
+    // 可选链：某些执行环境（如 worker_threads/vmThreads 池，vitest 的 pool: "threads" 跑
+    // 测试时命中过）暴露的 process.stdin 不是真实 socket/tty，没有 unref 方法；跳过 unref
+    // 的后果只是「stdin 可能 ref 住进程晚一点退」，不会丢数据。真实 Node 主进程（我们唯一
+    // 关心的运行时目标）始终有这个方法，可选链对它零影响。
     process.stdin.unref?.();
   }
 
@@ -1280,13 +1281,16 @@ export async function runGatewayLoop(params: {
   // OPENCLAW_PARENTPORT_CONTROL === "1" 显式开关（类比上面 OPENCLAW_STDIN_CONTROL，即使
   // 将来某天 Node 原生 process 也长出了同名字段，没有这个显式开关也不会误装）。两个条件
   // 缺一都不装，对上游 openclaw、对 Server Mode（走 child_process，没有 parentPort）零副作用。
-  if (process.parentPort && process.env.OPENCLAW_PARENTPORT_CONTROL === "1") {
+  const parentPort = getElectronParentPort();
+  if (parentPort && process.env.OPENCLAW_PARENTPORT_CONTROL === "1") {
     parentPortListener = (event) => {
       // Electron parentPort 的 message 事件 payload 挂在 event.data 上（同 MessageEvent
       // 语义），不是事件对象本身；这里防御性地同时接受 { data: {...} } 与裸对象，避免
-      // Electron 版本间字段位置差异导致悄悄失灵。
+      // Electron 版本间字段位置差异导致悄悄失灵。判据用 `data != null` 而不是
+      // `"data" in event`：若某版 Electron 给出「带 data 字段但值为 undefined、type 在
+      // 顶层」的对象，前者会静默丢掉关闭暗号、父进程只能超时强杀（PR #121 review）。
       const payload = (
-        event && typeof event === "object" && "data" in event
+        event && typeof event === "object" && (event as { data?: unknown }).data != null
           ? (event as { data?: unknown }).data
           : event
       ) as { type?: unknown } | undefined;
@@ -1299,7 +1303,7 @@ export async function runGatewayLoop(params: {
         request("stop", "parentport");
       }
     };
-    process.parentPort.on("message", parentPortListener);
+    parentPort.on("message", parentPortListener);
     // 启动握手：装好监听后立刻主动上报「新关闭通道已就绪」，附带协议版本号。父进程
     // （Yuiclaw GatewayLauncher）收到这条消息才能确认可以安全地改用 postMessage 触发关闭，
     // 而不是继续走旧的强杀路径；协议版本号让父进程在未来协议变更时能做兼容性判断。
@@ -1315,7 +1319,7 @@ export async function runGatewayLoop(params: {
       // 该 lint 规则按浏览器 window.postMessage 语义要求 targetOrigin，误报此处
       // 的 Node MessagePort 调用；规则在闭合括号 `});` 那一行报告，故 disable 注释
       // 加在那一行而不是调用起始行。
-      process.parentPort.postMessage({
+      parentPort.postMessage({
         type: GATEWAY_CONTROL_READY_TYPE,
         protocolVersion: GATEWAY_CONTROL_PROTOCOL_VERSION,
       }); // oxlint-disable-line unicorn/require-post-message-target-origin -- Node MessagePort 无 targetOrigin

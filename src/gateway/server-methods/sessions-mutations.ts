@@ -18,6 +18,7 @@ import {
 // 签名都未变，直接复用。
 import { clearBootstrapSnapshot } from "../../agents/bootstrap-cache.js";
 import { assignSessionOwner } from "../../config/sessions/session-accessor.js";
+import { formatErrorMessage } from "../../infra/errors.js";
 import { patchPluginSessionExtension } from "../../plugins/host-hook-state.js";
 import { isPluginJsonValue } from "../../plugins/host-hooks.js";
 import { ADMIN_SCOPE } from "../operator-scopes.js";
@@ -434,9 +435,21 @@ export const sessionMutationHandlers: GatewayRequestHandlers = {
       return;
     }
     const cfg = context.getRuntimeConfig();
-    const { target } = resolveGatewaySessionTargetFromKey(key, cfg);
-    clearBootstrapSnapshot(target.canonicalKey);
-    respond(true, { ok: true, key: target.canonicalKey }, undefined);
+    // PR #121 review 追加：resolver 在 session store 出现重复行 / canonical 校验失败等异常
+    // 时会 throw，而 gateway 的 handleGatewayRequest 对未捕获异常是原样 rethrow，不会替我们
+    // 收成结构化错误——调用方（Yuiclaw /apply-soul soft 模式按 key 逐个调）拿到的就是
+    // 「整次 RPC 失败」而不是「这个 key 刷新失败」。对齐同文件 sessions.reset 的失败形态：
+    // 收成 INVALID_REQUEST 的 respond(false, …)。未知 / 坏 key 本身不会 throw（resolver 会
+    // 合成 canonical key，这是 #26 的幂等设计），这里兜的是 store 异常这类真错误。
+    let canonicalKey: string;
+    try {
+      canonicalKey = resolveGatewaySessionTargetFromKey(key, cfg).target.canonicalKey;
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, formatErrorMessage(err)));
+      return;
+    }
+    clearBootstrapSnapshot(canonicalKey);
+    respond(true, { ok: true, key: canonicalKey }, undefined);
   },
   "sessions.reset": async ({ params, respond, context, client, sessionMutationAuthorization }) => {
     if (!assertValidParams(params, validateSessionsResetParams, "sessions.reset", respond)) {

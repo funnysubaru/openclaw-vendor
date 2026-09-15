@@ -3726,71 +3726,81 @@ describe("runGatewayLoop", () => {
   // 上父进程管不了子进程的 POSIX 信号，改用 stdin 暗号触发同一条 request("stop") 优雅
   // 关闭路径。下面四个用例覆盖：①暗号生效 ②非暗号行不触发 ③env 未开启时压根不装
   // readline ④env 非严格 "1" 值同样不装 readline（对上游/其它运行方式零影响）。
-  it("shuts down on stdin sentinel when OPENCLAW_STDIN_CONTROL=1", async () => {
-    vi.clearAllMocks();
-    process.env.OPENCLAW_STDIN_CONTROL = "1";
-    capturedLineHandler = null;
-    try {
-      await withIsolatedSignals(async () => {
-        const { close, runtime, exited } = await createSignaledLoopHarness();
-        expect(capturedLineHandler).toBeTypeOf("function");
-        capturedLineHandler!("__openclaw_stdin_shutdown__");
-        await expect(exited).resolves.toBe(0);
-        expect(close).toHaveBeenCalledWith({
-          reason: "gateway stopping",
-          restartExpectedMs: null,
-        });
-        expect(runtime.exit).toHaveBeenCalledWith(0);
-        // cleanupSignals 应把 stdin readline 一并拆掉，避免退出后悬挂监听。
-        expect(fakeRl.close).toHaveBeenCalled();
-      });
-    } finally {
+  describe("stdin graceful shutdown channel", () => {
+    afterEach(() => {
+      // PR #121 review 追加：与下面 parentPort 组对称，兜底清 env + 捕获的 line handler，
+      // 防止某个用例提前 throw 漏执行 finally，让 OPENCLAW_STDIN_CONTROL 泄漏到后续既有
+      // 用例误装 readline。各用例自身的 finally 仍保留作双保险。
       delete process.env.OPENCLAW_STDIN_CONTROL;
-    }
-  });
-
-  it("ignores non-sentinel stdin lines", async () => {
-    vi.clearAllMocks();
-    process.env.OPENCLAW_STDIN_CONTROL = "1";
-    capturedLineHandler = null;
-    try {
-      await withIsolatedSignals(async () => {
-        const { close } = await createSignaledLoopHarness();
-        capturedLineHandler!("hello");
-        await new Promise<void>((resolve) => {
-          setImmediate(resolve);
-        });
-        expect(close).not.toHaveBeenCalled();
-      });
-    } finally {
-      delete process.env.OPENCLAW_STDIN_CONTROL;
-    }
-  });
-
-  it("does not install stdin control when env unset", async () => {
-    vi.clearAllMocks();
-    delete process.env.OPENCLAW_STDIN_CONTROL;
-    const readline = await import("node:readline");
-    await withIsolatedSignals(async () => {
-      await createSignaledLoopHarness();
-      expect(readline.createInterface).not.toHaveBeenCalled();
+      capturedLineHandler = null;
     });
-  });
 
-  it("does not install stdin control for non-'1' env value", async () => {
-    vi.clearAllMocks();
-    // 严格 === "1" 判定：不能把任何 truthy 字符串（如 "0" / "true"）都当开启，
-    // 防止环境变量误传非 "1" 值时意外装上 stdin 控制通道。
-    process.env.OPENCLAW_STDIN_CONTROL = "0";
-    const readline = await import("node:readline");
-    try {
+    it("shuts down on stdin sentinel when OPENCLAW_STDIN_CONTROL=1", async () => {
+      vi.clearAllMocks();
+      process.env.OPENCLAW_STDIN_CONTROL = "1";
+      capturedLineHandler = null;
+      try {
+        await withIsolatedSignals(async () => {
+          const { close, runtime, exited } = await createSignaledLoopHarness();
+          expect(capturedLineHandler).toBeTypeOf("function");
+          capturedLineHandler!("__openclaw_stdin_shutdown__");
+          await expect(exited).resolves.toBe(0);
+          expect(close).toHaveBeenCalledWith({
+            reason: "gateway stopping",
+            restartExpectedMs: null,
+          });
+          expect(runtime.exit).toHaveBeenCalledWith(0);
+          // cleanupSignals 应把 stdin readline 一并拆掉，避免退出后悬挂监听。
+          expect(fakeRl.close).toHaveBeenCalled();
+        });
+      } finally {
+        delete process.env.OPENCLAW_STDIN_CONTROL;
+      }
+    });
+
+    it("ignores non-sentinel stdin lines", async () => {
+      vi.clearAllMocks();
+      process.env.OPENCLAW_STDIN_CONTROL = "1";
+      capturedLineHandler = null;
+      try {
+        await withIsolatedSignals(async () => {
+          const { close } = await createSignaledLoopHarness();
+          capturedLineHandler!("hello");
+          await new Promise<void>((resolve) => {
+            setImmediate(resolve);
+          });
+          expect(close).not.toHaveBeenCalled();
+        });
+      } finally {
+        delete process.env.OPENCLAW_STDIN_CONTROL;
+      }
+    });
+
+    it("does not install stdin control when env unset", async () => {
+      vi.clearAllMocks();
+      delete process.env.OPENCLAW_STDIN_CONTROL;
+      const readline = await import("node:readline");
       await withIsolatedSignals(async () => {
         await createSignaledLoopHarness();
         expect(readline.createInterface).not.toHaveBeenCalled();
       });
-    } finally {
-      delete process.env.OPENCLAW_STDIN_CONTROL;
-    }
+    });
+
+    it("does not install stdin control for non-'1' env value", async () => {
+      vi.clearAllMocks();
+      // 严格 === "1" 判定：不能把任何 truthy 字符串（如 "0" / "true"）都当开启，
+      // 防止环境变量误传非 "1" 值时意外装上 stdin 控制通道。
+      process.env.OPENCLAW_STDIN_CONTROL = "0";
+      const readline = await import("node:readline");
+      try {
+        await withIsolatedSignals(async () => {
+          await createSignaledLoopHarness();
+          expect(readline.createInterface).not.toHaveBeenCalled();
+        });
+      } finally {
+        delete process.env.OPENCLAW_STDIN_CONTROL;
+      }
+    });
   });
 
   // Yuiclaw fork（回搬自 openclaw-vendor #102，2026-09-15 移植到 v2026.9.4 基线）：
@@ -3905,6 +3915,31 @@ describe("runGatewayLoop", () => {
             restartExpectedMs: null,
           });
           expect(runtime.exit).toHaveBeenCalledWith(0);
+        });
+      } finally {
+        delete process.env.OPENCLAW_PARENTPORT_CONTROL;
+      }
+    });
+
+    it("falls back to the event itself when data is present but undefined", async () => {
+      vi.clearAllMocks();
+      process.env.OPENCLAW_PARENTPORT_CONTROL = "1";
+      (process as { parentPort?: unknown }).parentPort = fakeParentPort;
+      try {
+        await withIsolatedSignals(async () => {
+          const { close, exited } = await createSignaledLoopHarness();
+          // PR #121 review 追加：对象带 data 字段但值为 undefined、type 在顶层。若接收端
+          // 用 `"data" in event` 判定会取到 undefined 而静默忽略暗号；必须回退到 event 本身。
+          const eventWithUndefinedData = {
+            data: undefined,
+            type: "__openclaw_parentport_shutdown__",
+          } as unknown as { data?: unknown };
+          capturedParentPortListener!(eventWithUndefinedData);
+          await expect(exited).resolves.toBe(0);
+          expect(close).toHaveBeenCalledWith({
+            reason: "gateway stopping",
+            restartExpectedMs: null,
+          });
         });
       } finally {
         delete process.env.OPENCLAW_PARENTPORT_CONTROL;

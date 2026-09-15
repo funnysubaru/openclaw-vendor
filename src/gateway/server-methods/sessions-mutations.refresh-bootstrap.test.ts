@@ -6,6 +6,10 @@
 //   2. 幂等性 + 语义：清掉 canonical key 对应的 bootstrap 缓存并返回 ok:true。
 //   3. canonical key 解析（#67 回归）：调用方传 alias（如 "main"）时，必须清掉解析后的
 //      canonical key，而不是原始 alias —— 否则真实缓存（按 canonical key 存储）不会被清。
+//      同时断言 resolver 是按 9.4 签名 (key, cfg) 被调用的——否则漏传 cfg / 改成清 raw key
+//      时，只要 mock 返回值不变测试仍绿（PR #121 review 指出的盲区）。
+//   4. resolver 抛错（store 重复行 / canonical 校验失败）：必须收成 respond(false, INVALID_REQUEST)
+//      而不是让异常冒泡成「整次 RPC 失败」，且缓存不能被动到（PR #121 review 追加）。
 //
 // 这里 mock 掉 clearBootstrapSnapshot（真实缓存行为已由
 // src/agents/bootstrap-cache.test.ts 覆盖）与 resolveGatewaySessionTargetFromKey（canonical
@@ -80,19 +84,55 @@ describe("sessions.refreshBootstrap", () => {
 
   it("clears the resolved canonical key, not the raw alias, and responds ok:true", async () => {
     const respond = vi.fn() as unknown as RespondFn;
+    // cfg 用一个有身份的对象：下面按引用断言 resolver 收到的就是 context.getRuntimeConfig()
+    // 返回的那份，防止 handler 漏传 cfg 或传了别的东西。
+    const cfg = { agents: {} } as unknown as OpenClawConfig;
     // 调用方传 alias "main"；mock 解析出 canonical "agent:main:main"（回归 #67）。
     await sessionMutationHandlers["sessions.refreshBootstrap"]!({
       params: { key: "main" },
       respond,
-      context: fakeContext({} as OpenClawConfig),
+      context: fakeContext(cfg),
       req: {} as never,
       client: null,
       isWebchatConnect: () => false,
     });
 
+    // 9.4 签名：resolver 必须拿到 raw key + 运行时 cfg，才能把 alias 解析成 canonical。
+    expect(resolveGatewaySessionTargetFromKey).toHaveBeenCalledTimes(1);
+    expect(resolveGatewaySessionTargetFromKey).toHaveBeenCalledWith("main", cfg);
     expect(clearBootstrapSnapshot).toHaveBeenCalledWith("agent:main:main");
     expect(clearBootstrapSnapshot).not.toHaveBeenCalledWith("main");
     expect(respond).toHaveBeenCalledWith(true, { ok: true, key: "agent:main:main" }, undefined);
+  });
+
+  it("responds INVALID_REQUEST (not throw) when canonical key resolution fails, without touching the cache", async () => {
+    const respond = vi.fn() as unknown as RespondFn;
+    // 模拟 resolver 在 store 异常（重复行 / canonical 校验失败）时抛错。
+    resolveGatewaySessionTargetFromKey.mockImplementation(() => {
+      throw new Error("duplicate session store rows for key");
+    });
+    // handler 是同步的：这里不 await，直接断言它不抛——抛了就是异常冒泡到 gateway 层。
+    expect(() =>
+      sessionMutationHandlers["sessions.refreshBootstrap"]!({
+        params: { key: "main" },
+        respond,
+        context: fakeContext({} as OpenClawConfig),
+        req: {} as never,
+        client: null,
+        isWebchatConnect: () => false,
+      }),
+    ).not.toThrow();
+
+    expect(respond).toHaveBeenCalledTimes(1);
+    expect(respond).toHaveBeenCalledWith(
+      false,
+      undefined,
+      expect.objectContaining({
+        code: "INVALID_REQUEST",
+        message: expect.stringContaining("duplicate session store rows"),
+      }),
+    );
+    expect(clearBootstrapSnapshot).not.toHaveBeenCalled();
   });
 
   it("is idempotent when the target key has no cached bootstrap snapshot yet", async () => {

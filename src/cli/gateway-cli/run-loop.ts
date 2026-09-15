@@ -1310,10 +1310,15 @@ export async function runGatewayLoop(params: {
     // （如对端 MessagePort 已提前关闭）抛错，绝不能让异常冒泡砸穿 runGatewayLoop 的启动
     // 流程，只需记一条 warn 日志留痕、继续正常启动。
     try {
+      // Electron utilityProcess 的 MessagePort.postMessage 是 Node worker_threads 语义
+      // （进程内单一对端管道），不是浏览器 window.postMessage 的跨源广播，没有 targetOrigin 参数。
+      // 该 lint 规则按浏览器 window.postMessage 语义要求 targetOrigin，误报此处
+      // 的 Node MessagePort 调用；规则在闭合括号 `});` 那一行报告，故 disable 注释
+      // 加在那一行而不是调用起始行。
       process.parentPort.postMessage({
         type: GATEWAY_CONTROL_READY_TYPE,
         protocolVersion: GATEWAY_CONTROL_PROTOCOL_VERSION,
-      });
+      }); // oxlint-disable-line unicorn/require-post-message-target-origin -- Node MessagePort 无 targetOrigin
     } catch (err) {
       gatewayLog.warn(`parentport ready handshake postMessage failed: ${formatErrorMessage(err)}`);
     }

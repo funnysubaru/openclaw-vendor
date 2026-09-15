@@ -3757,7 +3757,9 @@ describe("runGatewayLoop", () => {
       await withIsolatedSignals(async () => {
         const { close } = await createSignaledLoopHarness();
         capturedLineHandler!("hello");
-        await new Promise<void>((resolve) => setImmediate(resolve));
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
         expect(close).not.toHaveBeenCalled();
       });
     } finally {
@@ -3917,7 +3919,9 @@ describe("runGatewayLoop", () => {
         await withIsolatedSignals(async () => {
           const { close } = await createSignaledLoopHarness();
           capturedParentPortListener!({ data: { type: "some-other-message" } });
-          await new Promise<void>((resolve) => setImmediate(resolve));
+          await new Promise<void>((resolve) => {
+            setImmediate(resolve);
+          });
           expect(close).not.toHaveBeenCalled();
         });
       } finally {

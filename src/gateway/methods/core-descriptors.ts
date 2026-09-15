@@ -666,6 +666,14 @@ const CORE_GATEWAY_METHOD_SPECS = [
     "2026.9",
     { startup: true, controlPlaneWrite: true },
   ],
+  // Yuiclaw fork（回搬自 openclaw-vendor #26/#67，2026-09-15 移植到 v2026.9.4 基线）：
+  // sessions.refreshBootstrap 软刷新 bootstrap 缓存（SOUL.md 等），非破坏性，与
+  // sessions.reset 同档 admin scope。追加在数组末尾，保持既有 advertised method 顺序稳定
+  // （同上面 "Public sharing appends" 注释的约定）。
+  // since 填本基线所在车次 "2026.9"：这是 fork-only 方法，不表示上游在 2026.9 发布了它；
+  // 之所以不写成未来车次（如 "2026.10"），是避免有客户端 / 文档按「since ≤ 当前产品版本」
+  // 过滤时把它当成「尚未发布」而漏掉（PR #121 review）。日后 sync 上游时别把这行当上游 API。
+  ["sessions.refreshBootstrap", "sessions-mutations", "operator.admin", "2026.9"],
 ] as const satisfies readonly CoreGatewayMethodSpecRow[];
 
 export type CoreGatewayHandlerFamily = Exclude<(typeof CORE_GATEWAY_METHOD_SPECS)[number][1], null>;

@@ -9,9 +9,16 @@ import {
   validateSessionsPatchManyParams,
   validateSessionsPatchParams,
   validateSessionsPluginPatchParams,
+  validateSessionsRefreshBootstrapParams,
   validateSessionsResetParams,
 } from "../../../packages/gateway-protocol/src/index.js";
+// Yuiclaw fork（回搬自 openclaw-vendor #26/#67，2026-09-15 移植到 v2026.9.4 基线）：
+// clearBootstrapSnapshot 清掉 sessions.refreshBootstrap 目标 sessionKey 的 bootstrap
+// workspace-files 缓存（SOUL.md / context-files 等）。函数本身在 v2026.9.4 基线上路径/
+// 签名都未变，直接复用。
+import { clearBootstrapSnapshot } from "../../agents/bootstrap-cache.js";
 import { assignSessionOwner } from "../../config/sessions/session-accessor.js";
+import { formatErrorMessage } from "../../infra/errors.js";
 import { patchPluginSessionExtension } from "../../plugins/host-hook-state.js";
 import { isPluginJsonValue } from "../../plugins/host-hooks.js";
 import { ADMIN_SCOPE } from "../operator-scopes.js";
@@ -36,7 +43,11 @@ import { startSessionPatchDiagnostics } from "./sessions-patch-diagnostics.js";
 import { executeSessionPatchMutations } from "./sessions-patch-engine.js";
 import { createCommitGuard } from "./sessions-patch-errors.js";
 import { sessionPatchTargetIdentity } from "./sessions-patch-expectations.js";
-import { loadSessionsRuntimeModule, requireSessionKey } from "./sessions-shared.js";
+import {
+  loadSessionsRuntimeModule,
+  requireSessionKey,
+  resolveGatewaySessionTargetFromKey,
+} from "./sessions-shared.js";
 import type { GatewayRequestHandlers } from "./types.js";
 import { assertValidParams } from "./validation.js";
 
@@ -382,6 +393,63 @@ export const sessionMutationHandlers: GatewayRequestHandlers = {
       agentId: requestedAgent.agentId,
       reason: "plugin-patch",
     });
+  },
+  // Yuiclaw fork（回搬自 openclaw-vendor #26/#67，2026-09-15 移植到 v2026.9.4 基线）：
+  // sessions.refreshBootstrap —— 软刷新：仅清掉指定 sessionKey 的 bootstrap workspace-files
+  // 缓存（SOUL.md / context-files 等），让下一轮回复重新装载磁盘上的最新内容。
+  //
+  // 与 sessions.reset 的关键差别：
+  //   reset            = 归档 transcript + 起新 sessionId + 清 bootstrap 缓存
+  //                      （破坏性，丢对话上下文）
+  //   refreshBootstrap = 仅清 bootstrap 缓存
+  //                      （非破坏性，对话上下文保留）
+  //
+  // 适用场景：
+  //   用户在 Yuiclaw 面板里改完 SOUL.md，希望下一轮回复立刻用新版 SOUL，但又不想丢
+  //   当前的对话上下文。Yuiclaw 侧 /apply-soul 端点的 "soft" 模式调用此 RPC。
+  //
+  // 幂等性：即便指定 key 的缓存当前为空（首次访问还没装载过），也返回 ok:true。
+  //
+  // 不做的事：不归档 transcript、不切 sessionId、不动长期记忆（MEMORY.md / USER.md /
+  // IDENTITY.md / memory/）、不触发 sessionUnbound lifecycle 事件、不调用
+  // executeSyncNow（workspace 文件 sync 是上游链路的事，应在调用方先做）。
+  //
+  // canonical key 解析（回搬自 #67 的修复）：bootstrap 缓存按 canonical key 存储，
+  // 必须先把 RPC 传入的 raw key（可能是 alias，如 "main"）解析成 canonical 再清，
+  // 否则会返回 ok:true 但实际缓存（canonical key）没被清掉。对齐 sessions.patch /
+  // sessions.reset 的 canonical 解析方式（v2026.9.4 基线上落点是
+  // resolveGatewaySessionTargetFromKey，语义与旧基线一致，只是签名多要求传 cfg）。
+  "sessions.refreshBootstrap": ({ params, respond, context }) => {
+    if (
+      !assertValidParams(
+        params,
+        validateSessionsRefreshBootstrapParams,
+        "sessions.refreshBootstrap",
+        respond,
+      )
+    ) {
+      return;
+    }
+    const key = requireSessionKey(params.key, respond);
+    if (!key) {
+      return;
+    }
+    const cfg = context.getRuntimeConfig();
+    // PR #121 review 追加：resolver 在 session store 出现重复行 / canonical 校验失败等异常
+    // 时会 throw，而 gateway 的 handleGatewayRequest 对未捕获异常是原样 rethrow，不会替我们
+    // 收成结构化错误——调用方（Yuiclaw /apply-soul soft 模式按 key 逐个调）拿到的就是
+    // 「整次 RPC 失败」而不是「这个 key 刷新失败」。对齐同文件 sessions.reset 的失败形态：
+    // 收成 INVALID_REQUEST 的 respond(false, …)。未知 / 坏 key 本身不会 throw（resolver 会
+    // 合成 canonical key，这是 #26 的幂等设计），这里兜的是 store 异常这类真错误。
+    let canonicalKey: string;
+    try {
+      canonicalKey = resolveGatewaySessionTargetFromKey(key, cfg).target.canonicalKey;
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, formatErrorMessage(err)));
+      return;
+    }
+    clearBootstrapSnapshot(canonicalKey);
+    respond(true, { ok: true, key: canonicalKey }, undefined);
   },
   "sessions.reset": async ({ params, respond, context, client, sessionMutationAuthorization }) => {
     if (!assertValidParams(params, validateSessionsResetParams, "sessions.reset", respond)) {

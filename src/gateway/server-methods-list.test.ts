@@ -185,6 +185,9 @@ describe("listGatewayMethods", () => {
       ...pluginDiscoveryMethods,
       "tasks.history",
       "environments.prepare",
+      // Yuiclaw fork（回搬自 #26/#67，2026-09-15 移植到 v2026.9.4 基线）：追加在末尾，
+      // 保持既有 advertised method 顺序稳定。
+      "sessions.refreshBootstrap",
     ];
     expect(listGatewayMethods().slice(-expectedSuffix.length)).toEqual(expectedSuffix);
     const methods = listGatewayMethods();
@@ -210,6 +213,9 @@ describe("listGatewayMethods", () => {
       ...pluginDiscoveryMethods,
       "tasks.history",
       "environments.prepare",
+      // Yuiclaw fork（回搬自 #26/#67，2026-09-15 移植到 v2026.9.4 基线）：追加在末尾，
+      // 保持既有 advertised method 顺序稳定。
+      "sessions.refreshBootstrap",
     ]);
   });
 
@@ -362,6 +368,9 @@ describe("listGatewayMethods", () => {
       ...pluginDiscoveryMethods,
       "tasks.history",
       "environments.prepare",
+      // Yuiclaw fork（回搬自 #26/#67，2026-09-15 移植到 v2026.9.4 基线）：追加在末尾，
+      // 保持既有 advertised method 顺序稳定。
+      "sessions.refreshBootstrap",
     ];
     expect(coreMethods.slice(-expectedCoreSuffix.length)).toEqual(expectedCoreSuffix);
     expect(methods.indexOf("approval.get")).toBeGreaterThan(methods.indexOf("tts.speak"));

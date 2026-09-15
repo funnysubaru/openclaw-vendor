@@ -535,6 +535,22 @@ export const SessionsResetParamsSchema = closedObject({
   reason: Type.Optional(Type.Union([Type.Literal("new"), Type.Literal("reset")])),
 });
 
+// Yuiclaw fork（回搬自 openclaw-vendor #26/#67，2026-09-15 移植到 v2026.9.4 基线）：
+// sessions.refreshBootstrap —— 软刷新：仅清掉指定 sessionKey 的 bootstrap workspace-files
+// 缓存（SOUL.md / context-files 等），让下一轮回复重新装载磁盘上的最新内容。
+//
+// 与 sessions.reset 的关键差别：
+//   reset            = 归档 transcript + 起新 sessionId + 清 bootstrap 缓存
+//                      （破坏性，丢对话上下文）
+//   refreshBootstrap = 仅清 bootstrap 缓存
+//                      （非破坏性，对话上下文保留）
+//
+// 适用场景：Yuiclaw 面板编辑 SOUL.md 后，希望新版立刻在下一轮回复生效，但又不想丢
+// 当前的对话上下文。Yuiclaw 侧 /apply-soul 端点的 "soft" 模式会调用此 RPC。
+export const SessionsRefreshBootstrapParamsSchema = closedObject({
+  key: NonEmptyString,
+});
+
 /** Reassigns mutable session responsibility without changing provenance or sharing authority. */
 export const SessionsAssignOwnerParamsSchema = closedObject({
   key: NonEmptyString,
@@ -847,6 +863,7 @@ export type SessionsAbortParams = Static<typeof SessionsAbortParamsSchema>;
 export type SessionsPluginPatchParams = Static<typeof SessionsPluginPatchParamsSchema>;
 export type SessionsPluginPatchResult = Static<typeof SessionsPluginPatchResultSchema>;
 export type SessionsResetParams = Static<typeof SessionsResetParamsSchema>;
+export type SessionsRefreshBootstrapParams = Static<typeof SessionsRefreshBootstrapParamsSchema>;
 export type SessionsAssignOwnerParams = Static<typeof SessionsAssignOwnerParamsSchema>;
 export type SessionsAssignOwnerResult = Static<typeof SessionsAssignOwnerResultSchema>;
 export type SessionGroup = Static<typeof SessionGroupSchema>;

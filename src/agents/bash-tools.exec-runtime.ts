@@ -636,6 +636,52 @@ function wrapPosixCommandWithPathPrepend(
   return `export PATH="\${OPENCLAW_PREPEND_PATH}\${PATH:+:$PATH}"; unset OPENCLAW_PREPEND_PATH; ${command}`;
 }
 
+/** 注入这次 exec 的消息渠道用的 env key（规范大写形式）。 */
+const MESSAGE_CHANNEL_ENV_KEY = "OPENCLAW_MESSAGE_CHANNEL";
+
+/**
+ * Yuiclaw fork（回搬自 openclaw-vendor #101，族 M-③）：把本次 run 的归一化消息渠道写进
+ * 这次 exec 子进程的 env，并先清掉调用方 / 父进程带进来的同名残留。
+ *
+ * delete-then-set 的业务意图：`env` 是 `{ ...opts.env }` 展开来的，父进程 `process.env` 的
+ * 继承残留、或 tool 调用方在 `params.env` 里伪造的同名 key 都会混在里面。若只在「本次 run
+ * 拿得到渠道」时赋值、拿不到时不清理，残留值会原样透传进子进程，被下游当成真实渠道 ——
+ * 例如 ppt-master 的 preview 硬闸对 bot 渠道豁免、对未知渠道默认拦截，残留一个 `line` 就把
+ * 「默认拦截」变成「豁免」。所以该 key 的最终值只可能来自这里，或彻底不存在。
+ *
+ * Windows 大小写坑（PR #122 review 追加）：Windows 的环境变量名**不区分大小写**（Node
+ * child_process 文档明确写了），子进程读 `OPENCLAW_MESSAGE_CHANNEL` 时，传进去的
+ * `openclaw_message_channel` 同样会被读到。而这里的 `env` 只是普通 JS 对象，删规范大写 key
+ * 删不掉小写 / 混合大小写变体 —— 于是「本次 run 没有真实渠道」这条分支上，小写残留会活着
+ * 进子进程，安全闸被绕过。所以 win32 上按不区分大小写清掉所有变体。
+ *
+ * POSIX 上不做这件事：那里大小写是两个互不相干的变量，下游读不到小写那个，多删反而会吃掉
+ * 调用方自己的同名小写变量。
+ *
+ * @param env 本次 run 局部组装的子进程环境（按 run 隔离，不是全局 `process.env`）
+ * @param rawMessageChannel 本次 run 的原始渠道名，未归一化；拿不到就只清理不写入
+ * @param platform 覆盖平台判定，仅供测试注入（生产恒用当前进程平台）
+ */
+export function applyExecMessageChannelEnv(
+  env: Record<string, string>,
+  rawMessageChannel?: string,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  const caseInsensitiveEnvNames = platform === "win32";
+  for (const key of Object.keys(env)) {
+    if (
+      key === MESSAGE_CHANNEL_ENV_KEY ||
+      (caseInsensitiveEnvNames && key.toUpperCase() === MESSAGE_CHANNEL_ENV_KEY)
+    ) {
+      delete env[key];
+    }
+  }
+  const normalized = normalizeMessageChannel(rawMessageChannel);
+  if (normalized) {
+    env[MESSAGE_CHANNEL_ENV_KEY] = normalized;
+  }
+}
+
 /** Starts a host or sandbox exec process and registers it for polling/backgrounding. */
 export async function runExecProcess({
   startupSignal: initialStartupSignal,
@@ -704,17 +750,8 @@ export async function runExecProcess({
   // (如 ppt-master 的 preview 硬闸:面板必须强制、bot 才豁免)。shellRuntimeEnv 是每次
   // runExecProcess 调用各自的局部变量,天然按 run 隔离,不存在跨 run 共享状态。
   //
-  // delete-then-set:上面 `...opts.env` 展开时,若父进程 process.env 或 tool 调用的
-  // params.env 里本来就带了 OPENCLAW_MESSAGE_CHANNEL(继承残留,或被 tool 层伪造),而
-  // 本次 run 又拿不到真实 channel(normalizeMessageChannel 结果为空)——若只在"拿得到"
-  // 时才赋值、"拿不到"时不清理,残留/伪造的旧值会原样透传进子进程,被下游误判成真实
-  // channel 从而绕过安全闸。先无条件清掉展开进来的值,再仅在本 run 真有 channel 时
-  // 写入 runtime 计算出的值——该 key 的最终值只可能来自这里,或彻底不存在。
-  delete shellRuntimeEnv.OPENCLAW_MESSAGE_CHANNEL;
-  const normalizedMessageChannel = normalizeMessageChannel(opts.messageChannel);
-  if (normalizedMessageChannel) {
-    shellRuntimeEnv.OPENCLAW_MESSAGE_CHANNEL = normalizedMessageChannel;
-  }
+  // delete-then-set 的细节与 Windows 大小写坑见 applyExecMessageChannelEnv。
+  applyExecMessageChannelEnv(shellRuntimeEnv, opts.messageChannel);
 
   const session: ProcessSession = {
     id: sessionId,

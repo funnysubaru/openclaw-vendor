@@ -25,6 +25,19 @@ function createArgvShellConfig(shell: string, args: string[]): ShellConfig {
 }
 
 function resolvePowerShellPath(): string {
+  // Yuiclaw fork（回搬自 openclaw-vendor #101/#108，族 M-①）：优先读 Yuiclaw
+  // Windows 安装包 bundle 进来的 pwsh7 路径。Windows 10/11 出厂只有 PS 5.1
+  // （不支持 "&&"），我们把 pwsh7 打进安装包分发，必须让引擎认得这个候选
+  // ——纯粹把 bundle 目录塞进子进程 PATH 对 Windows 无效，必须是一条显式
+  // 指向完整可执行文件路径的候选（CLAUDE.md §0.7 环境基线铁律）。
+  // YUICLAW_BUNDLED_PWSH_PATH 由 apps/desktop 的 main.ts 仅在 win32 且文件
+  // 确实存在时设置，mac/Linux 不会设置该 env，对非 Windows 平台无副作用；
+  // env 未设置或指向的文件不存在（bundle 缺失/裁剪）时落回下面的原有逻辑。
+  const bundledPwsh = process.env.YUICLAW_BUNDLED_PWSH_PATH;
+  if (bundledPwsh && fs.existsSync(bundledPwsh)) {
+    return bundledPwsh;
+  }
+
   // Prefer PowerShell 7 when available; PS 5.1 lacks "&&" support.
   const programFiles = process.env.ProgramFiles || process.env.PROGRAMFILES || "C:\\Program Files";
   const pwsh7 = path.join(programFiles, "PowerShell", "7", "pwsh.exe");

@@ -36,6 +36,7 @@ import {
   normalizeDeliveryContext,
   type DeliveryContext,
 } from "../utils/delivery-context.shared.js";
+import { normalizeMessageChannel } from "../utils/message-channel.js";
 import { resolveSafeTimeoutDelayMs } from "../utils/timer-delay.js";
 import { captureAgentToolSourceExecutionGuard } from "./agent-tool-source-execution-guard.js";
 import type { ProcessSession } from "./bash-process-registry.js";
@@ -649,6 +650,12 @@ export async function runExecProcess({
   execCommand?: string;
   workdir: string;
   env: Record<string, string>;
+  // Yuiclaw fork（回搬自 openclaw-vendor #101,族 M-③）：该 run 的原始(未归一化)消息渠道,
+  // 如 "webchat"(面板)、"line"/"telegram"/"mobile-chat"(bot channel)等。透传自调用方
+  // 已有的 messageProvider/turnSourceChannel(与其它 exec 路径的 turnSourceChannel 同源,
+  // 不新造一套 channel 语义)。可选——拿不到就不注入下面的 OPENCLAW_MESSAGE_CHANNEL,
+  // 下游(如 ppt-master 的 preview 硬闸)读不到时按默认拦处理。
+  messageChannel?: string;
   /** Host-selected managed profile; never inferred from the requested environment. */
   githubProfileDir?: string;
   pathPrepend?: string[];
@@ -689,6 +696,25 @@ export async function runExecProcess({
     ...opts.env,
     OPENCLAW_SHELL: "exec",
   };
+  // Yuiclaw fork（回搬自 openclaw-vendor #101,族 M-③,方案 B——按 run 隔离）：把该 run 的
+  // 归一化消息渠道注入这次 exec 的子进程 env。刻意选择"每次 exec 调用独立组装
+  // shellRuntimeEnv 时注入"(方案 B),而不是在 run 开始时改全局 process.env(方案 A)——
+  // 后者在多 run 并发(比如面板会话与 bot 会话同时各自触发一次 exec)时共享同一个
+  // process.env,面板 run 有概率读到 bot run 写入的 channel 值,从而绕过下游安全闸
+  // (如 ppt-master 的 preview 硬闸:面板必须强制、bot 才豁免)。shellRuntimeEnv 是每次
+  // runExecProcess 调用各自的局部变量,天然按 run 隔离,不存在跨 run 共享状态。
+  //
+  // delete-then-set:上面 `...opts.env` 展开时,若父进程 process.env 或 tool 调用的
+  // params.env 里本来就带了 OPENCLAW_MESSAGE_CHANNEL(继承残留,或被 tool 层伪造),而
+  // 本次 run 又拿不到真实 channel(normalizeMessageChannel 结果为空)——若只在"拿得到"
+  // 时才赋值、"拿不到"时不清理,残留/伪造的旧值会原样透传进子进程,被下游误判成真实
+  // channel 从而绕过安全闸。先无条件清掉展开进来的值,再仅在本 run 真有 channel 时
+  // 写入 runtime 计算出的值——该 key 的最终值只可能来自这里,或彻底不存在。
+  delete shellRuntimeEnv.OPENCLAW_MESSAGE_CHANNEL;
+  const normalizedMessageChannel = normalizeMessageChannel(opts.messageChannel);
+  if (normalizedMessageChannel) {
+    shellRuntimeEnv.OPENCLAW_MESSAGE_CHANNEL = normalizedMessageChannel;
+  }
 
   const session: ProcessSession = {
     id: sessionId,

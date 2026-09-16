@@ -422,6 +422,7 @@ describe("getShellConfig on Windows", () => {
       "SystemRoot",
       "WINDIR",
       "PATH",
+      "YUICLAW_BUNDLED_PWSH_PATH",
     ]);
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
   });
@@ -432,6 +433,50 @@ describe("getShellConfig on Windows", () => {
     for (const dir of tempDirs.splice(0)) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  // Yuiclaw fork（回搬自 openclaw-vendor #101，族 M-①）：验证 bundle 进安装包
+  // 的 pwsh7 候选优先级最高，即使系统 Program Files 里也装了一份 pwsh7。
+  it("prefers YUICLAW_BUNDLED_PWSH_PATH over system PowerShell 7", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-pfiles-"));
+    tempDirs.push(base);
+    const pwsh7Dir = path.join(base, "PowerShell", "7");
+    fs.mkdirSync(pwsh7Dir, { recursive: true });
+    const pwsh7Path = path.join(pwsh7Dir, "pwsh.exe");
+    fs.writeFileSync(pwsh7Path, "");
+
+    const bundleDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-bundled-pwsh-"));
+    tempDirs.push(bundleDir);
+    const bundledPwshPath = path.join(bundleDir, "pwsh.exe");
+    fs.writeFileSync(bundledPwshPath, "");
+
+    process.env.ProgramFiles = base;
+    process.env.PATH = "";
+    process.env.YUICLAW_BUNDLED_PWSH_PATH = bundledPwshPath;
+    delete process.env.ProgramW6432;
+    delete process.env.SystemRoot;
+    delete process.env.WINDIR;
+
+    expect(getShellConfig().shell).toBe(bundledPwshPath);
+  });
+
+  // 未安装（bundle 缺失/裁剪）或 env 未设置时不影响原有解析，落回系统候选。
+  it("falls back to system PowerShell 7 when bundled pwsh path is missing", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-pfiles-"));
+    tempDirs.push(base);
+    const pwsh7Dir = path.join(base, "PowerShell", "7");
+    fs.mkdirSync(pwsh7Dir, { recursive: true });
+    const pwsh7Path = path.join(pwsh7Dir, "pwsh.exe");
+    fs.writeFileSync(pwsh7Path, "");
+
+    process.env.ProgramFiles = base;
+    process.env.PATH = "";
+    process.env.YUICLAW_BUNDLED_PWSH_PATH = path.join(os.tmpdir(), "does-not-exist-pwsh.exe");
+    delete process.env.ProgramW6432;
+    delete process.env.SystemRoot;
+    delete process.env.WINDIR;
+
+    expect(getShellConfig().shell).toBe(pwsh7Path);
   });
 
   it("prefers PowerShell 7 in ProgramFiles", () => {

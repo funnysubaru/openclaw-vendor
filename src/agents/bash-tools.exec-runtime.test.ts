@@ -53,6 +53,7 @@ let getActiveBackgroundExecSessionCount: typeof import("./bash-process-registry.
 let listRunningSessions: typeof import("./bash-process-registry.js").listRunningSessions;
 let resetProcessRegistryForTests: typeof import("./bash-process-registry.test-support.js").resetProcessRegistryForTests;
 let runExecProcess: typeof import("./bash-tools.exec-runtime.js").runExecProcess;
+let applyExecMessageChannelEnv: typeof import("./bash-tools.exec-runtime.js").applyExecMessageChannelEnv;
 let prepareGatewaySuspend: typeof import("../infra/gateway-suspend-coordinator.js").prepareGatewaySuspend;
 let resetGatewaySuspendCoordinatorForLifecycleRestart: typeof import("../infra/gateway-suspend-coordinator.js").resetGatewaySuspendCoordinatorForLifecycleRestart;
 let resumeGatewaySuspend: typeof import("../infra/gateway-suspend-coordinator.js").resumeGatewaySuspend;
@@ -61,7 +62,7 @@ beforeAll(async () => {
   ({ getActiveBackgroundExecSessionCount, listRunningSessions, markBackgrounded } =
     await import("./bash-process-registry.js"));
   ({ resetProcessRegistryForTests } = await import("./bash-process-registry.test-support.js"));
-  ({ runExecProcess } = await import("./bash-tools.exec-runtime.js"));
+  ({ runExecProcess, applyExecMessageChannelEnv } = await import("./bash-tools.exec-runtime.js"));
   ({
     prepareGatewaySuspend,
     resetGatewaySuspendCoordinatorForLifecycleRestart,
@@ -1018,5 +1019,62 @@ describe("runExecProcess PTY fallback", () => {
     } finally {
       unsubscribe();
     }
+  });
+});
+
+// Yuiclaw fork（族 M-③，PR #122 review 追加）：渠道 env 的清理 / 写入契约。
+// 走导出的纯函数而不是真实 spawn —— Windows 分支在 macOS CI 上没法用真子进程验证
+// （真的把 platform 打桩成 win32，整条 exec 链会去找 PowerShell），而这条分支恰恰是
+// review 指出的安全缺口所在。真实 spawn 的端到端注入由
+// bash-tools.exec.message-channel.test.ts 覆盖，两者互补。
+describe("applyExecMessageChannelEnv", () => {
+  it("writes the normalized channel under the canonical key", () => {
+    const env: Record<string, string> = {};
+    applyExecMessageChannelEnv(env, "  WebChat  ", "linux");
+    expect(env).toEqual({ OPENCLAW_MESSAGE_CHANNEL: "webchat" });
+  });
+
+  it("drops an inherited or forged canonical key when this run has no channel", () => {
+    const env: Record<string, string> = { OPENCLAW_MESSAGE_CHANNEL: "line", PATH: "/usr/bin" };
+    applyExecMessageChannelEnv(env, undefined, "linux");
+    expect(env).toEqual({ PATH: "/usr/bin" });
+  });
+
+  // review 复现的缺口：Windows 环境变量名不区分大小写，小写残留会被子进程读成规范大写，
+  // 未知渠道的默认拦截会被下游误判成 bot 豁免。
+  it("purges every case variant on win32 when this run has no channel", () => {
+    const env: Record<string, string> = {
+      openclaw_message_channel: "line",
+      Openclaw_Message_Channel: "telegram",
+      OPENCLAW_MESSAGE_CHANNEL: "line",
+      OPENCLAW_SHELL: "exec",
+    };
+    applyExecMessageChannelEnv(env, undefined, "win32");
+    expect(env).toEqual({ OPENCLAW_SHELL: "exec" });
+  });
+
+  it("leaves only the runtime value on win32 when this run has a channel", () => {
+    const env: Record<string, string> = {
+      openclaw_message_channel: "line",
+      OPENCLAW_MESSAGE_CHANNEL: "line",
+    };
+    applyExecMessageChannelEnv(env, "webchat", "win32");
+    expect(env).toEqual({ OPENCLAW_MESSAGE_CHANNEL: "webchat" });
+  });
+
+  // POSIX 上大小写是两个不同变量，下游读不到小写那个；多删会吃掉调用方自己的变量。
+  it("keeps a lowercase variable untouched on posix", () => {
+    const env: Record<string, string> = {
+      openclaw_message_channel: "line",
+      OPENCLAW_MESSAGE_CHANNEL: "line",
+    };
+    applyExecMessageChannelEnv(env, undefined, "darwin");
+    expect(env).toEqual({ openclaw_message_channel: "line" });
+  });
+
+  it("defaults to the current process platform when no override is given", () => {
+    const env: Record<string, string> = { OPENCLAW_MESSAGE_CHANNEL: "line" };
+    applyExecMessageChannelEnv(env, "webchat");
+    expect(env.OPENCLAW_MESSAGE_CHANNEL).toBe("webchat");
   });
 });

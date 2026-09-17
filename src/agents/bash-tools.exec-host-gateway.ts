@@ -1605,6 +1605,11 @@ export async function processGatewayAllowlist(
               execCommand: approvalDecision.execCommandOverride,
               workdir: params.workdir,
               env: params.env,
+              // Yuiclaw fork（回搬自 openclaw-vendor #101,族 M-③）：gateway allowlist 路径
+              // 也带上该 run 的原始渠道(已有的 params.turnSourceChannel,与主 exec 路径
+              // 同源),保持两个 runExecProcess 调用点行为一致,不留下"只有一条路径注入了
+              // channel"的死角。
+              messageChannel: params.turnSourceChannel,
               githubProfileDir: params.githubProfileDir,
               pathPrepend: params.pathPrepend,
               sandbox: undefined,

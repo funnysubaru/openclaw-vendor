@@ -592,6 +592,10 @@ export function createExecTool(
           execCommand: execCommandOverride,
           workdir,
           env,
+          // Yuiclaw fork（回搬自 openclaw-vendor #101,族 M-③）：defaults.messageProvider
+          // 就是这个 run 的原始渠道(与本文件其它 turnSourceChannel: defaults?.messageProvider
+          // 用法同源),透传给 runExecProcess 去注入 OPENCLAW_MESSAGE_CHANNEL。
+          messageChannel: defaults?.messageProvider,
           githubProfileDir,
           pathPrepend: defaultPathPrepend,
           sandbox,

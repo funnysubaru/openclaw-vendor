@@ -750,21 +750,38 @@ describe("resolvePowerShellPath — verify-then-fallback（Microsoft Store 占�
     fs.writeFileSync(realPath, "");
     fs.chmodSync(realPath, 0o755);
 
-    // stubDir 排在 realDir 前面：resolveAllShellMatchesFromPath 会先找到 stubPath。
-    process.env.PATH = [stubDir, realDir].join(path.delimiter);
-    delete process.env.ProgramFiles;
+    // 标准安装目录也必须隔离到受控夹具（PR #123 review）：只删 ProgramFiles 不够——
+    // 解析器会回落到默认 "C:\Program Files"，真实 Windows 机器 / runner 若在那装了
+    // pwsh7，下面的 verify（只拒 stubPath）会接受系统 pwsh，解析器在走到临时 PATH
+    // 之前就返回，测试结果取决于机器安装状态。指向一个不含 PowerShell/7/pwsh.exe 的
+    // 空临时目录，让这条测试只考察 PATH 上的两个候选。
+    // 顺序有讲究：Windows 环境变量名不区分大小写，先删大写别名 PROGRAMFILES 再设
+    // ProgramFiles；反过来的话，删别名会把刚设好的值一起删掉。
+    const emptyProgramFiles = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-path-nopfiles-"));
+    tempDirs.push(emptyProgramFiles);
     delete process.env.PROGRAMFILES;
+    process.env.ProgramFiles = emptyProgramFiles;
     delete process.env.ProgramW6432;
     delete process.env.SystemRoot;
     delete process.env.WINDIR;
+
+    // stubDir 排在 realDir 前面：resolveAllShellMatchesFromPath 会先找到 stubPath。
+    process.env.PATH = [stubDir, realDir].join(path.delimiter);
 
     // 先用 resolveAllShellMatchesFromPath 独立确认：两个候选都被找到了、
     // 且顺序符合预期——这样下面 resolvePowerShellPath 选中 realPath 就确凿是
     // "verify 失败后 continue 到下一个"生效了，不是巧合只找到一个候选。
     expect(resolveAllShellMatchesFromPath("pwsh")).toEqual([stubPath, realPath]);
 
-    const verify = (candidate: string) => candidate !== stubPath;
+    const verifiedCandidates: string[] = [];
+    const verify = (candidate: string) => {
+      verifiedCandidates.push(candidate);
+      return candidate !== stubPath;
+    };
     expect(resolvePowerShellPath({ verify })).toBe(realPath);
+    // 被验证过的只能是 PATH 上这两个候选、且按顺序：证明解析器没有碰到夹具之外的
+    // 任何标准目录候选，是「stub 失败后 continue 到下一个」选中了 realPath。
+    expect(verifiedCandidates).toEqual([stubPath, realPath]);
   });
 
   // code review Round2 Important#2 回应：全部候选失败静默落回 PS 5.1、且结果

@@ -26,6 +26,8 @@ type ProviderPolicyRegistryLike = { plugins: readonly PluginManifestRegistry["pl
 type ProviderPolicyMetadata = {
   manifestRegistry?: ProviderPolicyRegistryLike;
   loadManifestRegistry?: () => ProviderPolicyRegistryLike | undefined;
+  /** Direct result from this synchronous resolution; null records an observed miss. */
+  directSurface?: BundledProviderPolicySurface | null;
 };
 
 // 回搬自上游 #144290/#145921/#146123/#149528/#155241/#155250（ADR-0033 任务 72/84）：
@@ -61,7 +63,15 @@ export function resolveBundledProviderPolicySurface(
   if (!normalizedProviderId) {
     return null;
   }
-  const directSurface = resolveDirectBundledProviderPolicySurface(normalizedProviderId);
+  // 回搬上游 #155241（任务99 热点②）：调用方（provider-model-routes.ts 的
+  // resolveProviderModelPolicySurface）刚按同一个 provider id 查过一次直接策略、结果为空才走到这里，
+  // 把那次结果带进来就不用再查一遍。之前任务 72 回搬这一批时漏了这处，导致每个模型查两遍；
+  // Windows 上每查一次要读好几次环境变量（本机实测一次 3.6～6.7 微秒），模型多时被放大成秒级。
+  // 不带 directSurface 的调用方行为不变。
+  const directSurface =
+    options.directSurface === undefined
+      ? resolveDirectBundledProviderPolicySurface(normalizedProviderId)
+      : options.directSurface;
   if (directSurface) {
     return directSurface;
   }
@@ -83,7 +93,10 @@ export function resolveBundledProviderPolicySurface(
 /** Resolves provider policy hooks from bundled or trusted official plugin artifacts. */
 export function resolveProviderPolicySurface(
   providerId: string,
-  options: { manifestRegistry?: ProviderPolicyRegistryLike } = {},
+  options: {
+    manifestRegistry?: ProviderPolicyRegistryLike;
+    directSurface?: BundledProviderPolicySurface | null;
+  } = {},
 ): ProviderPolicySurface | null {
   const bundledSurface = resolveBundledProviderPolicySurface(providerId, options);
   if (bundledSurface) {

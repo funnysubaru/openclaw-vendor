@@ -52,7 +52,14 @@ export function resolveProviderModelPolicySurface(
   // metadata（getCurrentPluginMetadataSnapshotRequiredRuntime 的返回值）本身就是 Gateway 运行期间
   // 稳定不变的当前快照引用（见 plugins/CLAUDE.md「Gateway plugin metadata is stable while the
   // Gateway running」），直接传它过去即可，不需要再包一层。
-  return metadata ? resolveProviderPolicySurface(provider, { manifestRegistry: metadata }) : null;
+  // 回搬上游 #155241（任务99 热点②）：上面刚查过的直接策略结果（这里必为 null）一并传过去，
+  // 免得 resolveBundledProviderPolicySurface 按同一个 provider id 再查一遍。
+  return metadata
+    ? resolveProviderPolicySurface(provider, {
+        manifestRegistry: metadata,
+        directSurface: bundled,
+      })
+    : null;
 }
 
 /** Binds one provider's identity facts for an authored-row lookup. */

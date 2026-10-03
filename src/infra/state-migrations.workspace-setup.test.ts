@@ -79,7 +79,9 @@ describe("legacy workspace Doctor migration", () => {
   it("imports the legacy onboarding completion alias", async () => {
     const context = setup();
     const completedAt = "2026-07-15T10:01:00.000Z";
-    const setupPath = path.join(context.workspaceDir, ".openclaw", "workspace-state.json");
+    // 164399 起只扫描根级 openclaw-workspace-state.json，嵌套的 .openclaw/ 布局不再被
+    // Doctor 发现/导入，fixture 改用根级文件位置以继续验证 onboardingCompletedAt 别名本身的导入逻辑。
+    const setupPath = path.join(context.workspaceDir, "openclaw-workspace-state.json");
     await fsp.mkdir(path.dirname(setupPath), { recursive: true });
     await fsp.writeFile(setupPath, JSON.stringify({ onboardingCompletedAt: completedAt }), "utf8");
 
@@ -665,30 +667,9 @@ describe("legacy workspace Doctor migration", () => {
     ).not.toThrow();
   });
 
-  it("rejects a setup source beneath a symlinked workspace subdirectory", async () => {
-    const context = setup();
-    const externalDir = path.join(context.homeDir, "external-workspace-state");
-    const externalSource = path.join(externalDir, "workspace-state.json");
-    await fsp.mkdir(externalDir, { recursive: true });
-    await fsp.writeFile(externalSource, JSON.stringify({ version: 1 }), "utf8");
-    await fsp.symlink(externalDir, path.join(context.workspaceDir, ".openclaw"));
-
-    expect(detect(context).hasLegacy).toBe(true);
-    const result = await migrate(context);
-
-    expect(result.warnings[0]).toMatch(/legacy workspace/i);
-    await expect(fsp.readFile(externalSource, "utf8")).resolves.toBe(
-      JSON.stringify({ version: 1 }),
-    );
-    expect(fs.existsSync(`${externalSource}.doctor-importing`)).toBe(false);
-    const identity = resolveWorkspaceStateIdentity(context.workspaceDir);
-    expect(
-      openOpenClawStateDatabase({ env: context.env })
-        .db.prepare("SELECT workspace_key FROM workspace_setup_state WHERE workspace_key = ?")
-        .get(identity.workspaceKey),
-    ).toBeUndefined();
-  });
-
+  // 164399 起不再扫描/导入嵌套的 <workspace>/.openclaw/workspace-state.json 布局，
+  // 原「rejects a setup source beneath a symlinked workspace subdirectory」用例
+  // 测的正是这个已退休路径下的符号链接拒绝行为，已失去意义，随上游一并删除。
   it("rejects attestations beneath a symlinked state subdirectory", async () => {
     const context = setup();
     const identity = resolveWorkspaceStateIdentity(context.workspaceDir);
@@ -922,8 +903,9 @@ describe("legacy workspace Doctor migration", () => {
   it("cleans receipt-covered superseded setup markers after an interrupted delete", async () => {
     const context = setup();
     const rootPath = path.join(context.workspaceDir, "openclaw-workspace-state.json");
-    const nestedPath = path.join(context.workspaceDir, ".openclaw", "workspace-state.json");
-    await fsp.mkdir(path.dirname(nestedPath), { recursive: true });
+    // 164399 起只扫描根级 setup 文件，嵌套 .openclaw/workspace-state.json 不再是 Doctor
+    // 来源，所以这里只保留根级标记，第一轮只会命中 1 个 superseded marker（原为 2 个）。
+    await fsp.mkdir(context.workspaceDir, { recursive: true });
     await fsp.writeFile(
       rootPath,
       JSON.stringify({
@@ -931,11 +913,6 @@ describe("legacy workspace Doctor migration", () => {
         bootstrapSeededAt: "2026-07-15T10:00:00.000Z",
         setupCompletedAt: "2026-07-15T10:01:00.000Z",
       }),
-      "utf8",
-    );
-    await fsp.writeFile(
-      nestedPath,
-      JSON.stringify({ version: 1, bootstrapSeededAt: "2026-07-14T09:00:00.000Z" }),
       "utf8",
     );
     const first = await migrateLegacyWorkspaceState({
@@ -946,13 +923,12 @@ describe("legacy workspace Doctor migration", () => {
         throw new Error("simulated unlink failure");
       },
     });
-    expect(first.warnings).toHaveLength(2);
+    expect(first.warnings).toHaveLength(1);
 
     const retry = await migrate(context);
 
     expect(retry.warnings).toEqual([]);
     expect(fs.existsSync(`${rootPath}.doctor-importing`)).toBe(false);
-    expect(fs.existsSync(`${nestedPath}.doctor-importing`)).toBe(false);
   });
 
   it("retains a receipt-covered attestation when only its modification time changed", async () => {

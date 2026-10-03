@@ -42,7 +42,6 @@ import { readWorkspaceFileCache, writeWorkspaceFileCache } from "./workspace-fil
 import {
   assertNoUnmigratedWorkspaceState,
   LEGACY_WORKSPACE_STATE_CURRENT_FILENAME,
-  LEGACY_WORKSPACE_STATE_DIRNAME,
 } from "./workspace-legacy-state.js";
 import { WorkspaceVanishedError } from "./workspace-state-identity.js";
 import {
@@ -448,7 +447,7 @@ async function hasSkipBootstrapWorkspaceContentEvidence(dir: string): Promise<bo
     for (const entry of entries) {
       if (
         entry.name === ".DS_Store" ||
-        entry.name === LEGACY_WORKSPACE_STATE_DIRNAME ||
+        entry.name === ".openclaw" ||
         entry.name === LEGACY_WORKSPACE_STATE_CURRENT_FILENAME
       ) {
         continue;

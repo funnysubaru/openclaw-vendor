@@ -1591,7 +1591,7 @@ process.stdout.write(sessionDir + "\\n");
         execFileSync(process.execPath, [ASSERTIONS_PATH, "seed"], { env, stdio: "pipe" });
 
         expect(existsSync(join(workspace, "IDENTITY.md"))).toBe(true);
-        expect(existsSync(join(workspace, ".openclaw", "workspace-state.json"))).toBe(true);
+        expect(existsSync(join(workspace, "openclaw-workspace-state.json"))).toBe(true);
         for (const relative of [
           "sessions/sessions.json",
           "agents/main/sessions/legacy-session.json",

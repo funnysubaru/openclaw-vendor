@@ -15,8 +15,6 @@ import {
   resolveWorkspaceStateIdentity,
 } from "./workspace-state-identity.js";
 
-export const LEGACY_WORKSPACE_STATE_DIRNAME = ".openclaw";
-const LEGACY_WORKSPACE_STATE_FILENAME = "workspace-state.json";
 export const LEGACY_WORKSPACE_STATE_CURRENT_FILENAME = "openclaw-workspace-state.json";
 export const LEGACY_WORKSPACE_ATTESTATION_DIRNAME = "workspace-attestations";
 const LEGACY_WORKSPACE_ATTESTATION_SUFFIX = ".attested";
@@ -89,14 +87,7 @@ export function resolveLegacyWorkspaceSourcePaths(
   ];
   return {
     workspacePath,
-    setupStatePaths: [
-      path.join(canonicalDirectoryPath, LEGACY_WORKSPACE_STATE_CURRENT_FILENAME),
-      path.join(
-        canonicalDirectoryPath,
-        LEGACY_WORKSPACE_STATE_DIRNAME,
-        LEGACY_WORKSPACE_STATE_FILENAME,
-      ),
-    ],
+    setupStatePaths: [path.join(canonicalDirectoryPath, LEGACY_WORKSPACE_STATE_CURRENT_FILENAME)],
     stateDirAttestationPaths: [...new Set(stateDirs)].flatMap((stateDir) =>
       [...new Set(workspaceKeys)].map((workspaceKey) =>
         path.join(
@@ -236,9 +227,7 @@ export function prepareLegacyWorkspaceStateReset(
   const sources = resolveLegacyWorkspaceSourcePaths(workspaceDir, options);
   const candidates = [
     ...sources.setupStatePaths.map((sourcePath) => ({
-      rootDir: sourcePath.endsWith(LEGACY_WORKSPACE_STATE_CURRENT_FILENAME)
-        ? path.dirname(sourcePath)
-        : path.dirname(path.dirname(sourcePath)),
+      rootDir: path.dirname(sourcePath),
       sourcePath,
       requireAttestationHeader: false,
     })),

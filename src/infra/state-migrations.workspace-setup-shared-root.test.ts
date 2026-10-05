@@ -12,7 +12,9 @@ describe("shared-root workspace Doctor migration", () => {
   const { detect, migrate, setup } = useWorkspaceMigrationTestFixture();
 
   it.each(["implicit agent", "explicit fleet"])(
-    "imports both shared-root setup markers without moving workspace content: %s",
+    // 164399 起只扫描根级 openclaw-workspace-state.json，嵌套 .openclaw/workspace-state.json
+    // 不再是 Doctor 来源，用例随上游一并收窄为单一根级标记。
+    "imports the shared-root setup marker without moving workspace content: %s",
     async (roster) => {
       const context = setup();
       const cfg = {
@@ -38,10 +40,9 @@ describe("shared-root workspace Doctor migration", () => {
       );
       const identity = resolveWorkspaceStateIdentity(context.workspaceDir);
       const rootPath = path.join(context.workspaceDir, "openclaw-workspace-state.json");
-      const nestedPath = path.join(context.workspaceDir, ".openclaw", "workspace-state.json");
       const rootSeededAt = "2026-07-15T10:00:00.000Z";
       const completedAt = "2026-07-15T10:01:00.000Z";
-      await fsp.mkdir(path.dirname(nestedPath), { recursive: true });
+      await fsp.mkdir(context.workspaceDir, { recursive: true });
       await fsp.writeFile(
         rootPath,
         JSON.stringify({
@@ -49,11 +50,6 @@ describe("shared-root workspace Doctor migration", () => {
           bootstrapSeededAt: rootSeededAt,
           setupCompletedAt: completedAt,
         }),
-        "utf8",
-      );
-      await fsp.writeFile(
-        nestedPath,
-        JSON.stringify({ version: 1, bootstrapSeededAt: "2026-07-14T09:00:00.000Z" }),
         "utf8",
       );
 
@@ -70,12 +66,11 @@ describe("shared-root workspace Doctor migration", () => {
           .filter((source) => source.kind === "setup")
           .map((source) => source.sourcePath)
           .toSorted(),
-      ).toEqual([rootPath, nestedPath].map((filePath) => fs.realpathSync(filePath)).toSorted());
+      ).toEqual([rootPath].map((filePath) => fs.realpathSync(filePath)).toSorted());
       const result = await migrate({ ...context, cfg });
 
       expect(result.warnings).toEqual([]);
       expect(fs.existsSync(rootPath)).toBe(false);
-      expect(fs.existsSync(nestedPath)).toBe(false);
       expect(
         openOpenClawStateDatabase({ env: context.env })
           .db.prepare(

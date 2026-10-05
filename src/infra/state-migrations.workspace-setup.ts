@@ -8,7 +8,6 @@ import { root, type Root } from "@openclaw/fs-safe";
 import {
   LEGACY_WORKSPACE_ATTESTATION_DIRNAME,
   LEGACY_WORKSPACE_ATTESTATION_MAX_BYTES,
-  LEGACY_WORKSPACE_STATE_CURRENT_FILENAME,
   WORKSPACE_DOCTOR_CLAIM_SUFFIX,
   legacyWorkspaceSiblingAttestationMayExist,
   resolveLegacyWorkspaceSourcePaths,
@@ -250,9 +249,9 @@ function addLegacyWorkspaceSources(params: {
       params.add(
         createLegacySource({
           kind: "setup",
-          rootDir: sourcePath.endsWith(LEGACY_WORKSPACE_STATE_CURRENT_FILENAME)
-            ? path.dirname(sourcePath)
-            : path.dirname(path.dirname(sourcePath)),
+          // 164399 起 setupStatePaths 只剩根级 openclaw-workspace-state.json 一项，
+          // 不再需要按文件名区分"根级 vs 嵌套 .openclaw/ 子目录"取 rootDir 的那层判断。
+          rootDir: path.dirname(sourcePath),
           sourcePath,
           workspaceKey: identity.workspaceKey,
           workspaceDir: identity.workspacePath,

@@ -15,7 +15,6 @@ import {
 import {
   LEGACY_WORKSPACE_ATTESTATION_HEADER,
   LEGACY_WORKSPACE_STATE_CURRENT_FILENAME,
-  LEGACY_WORKSPACE_STATE_DIRNAME,
 } from "./workspace-legacy-state.js";
 import { resetLegacyWorkspaceStateCheckForTest } from "./workspace-legacy-state.test-support.js";
 import { resolveWorkspaceStateIdentity } from "./workspace-state-identity.js";
@@ -100,11 +99,6 @@ describe("resolveDefaultAgentWorkspaceDir", () => {
   });
 });
 
-const LEGACY_WORKSPACE_STATE_PATH_SEGMENTS = [
-  LEGACY_WORKSPACE_STATE_DIRNAME,
-  "workspace-state.json",
-] as const;
-
 async function readWorkspaceState(dir: string): Promise<{
   version: number;
   bootstrapSeededAt?: string;
@@ -114,11 +108,7 @@ async function readWorkspaceState(dir: string): Promise<{
 }
 
 async function writeLegacyWorkspaceState(dir: string, state: unknown): Promise<void> {
-  await fs.mkdir(path.join(dir, LEGACY_WORKSPACE_STATE_PATH_SEGMENTS[0]), { recursive: true });
-  await fs.writeFile(
-    path.join(dir, ...LEGACY_WORKSPACE_STATE_PATH_SEGMENTS),
-    `${JSON.stringify(state)}\n`,
-  );
+  await fs.writeFile(path.join(dir, "openclaw-workspace-state.json"), `${JSON.stringify(state)}\n`);
 }
 
 async function expectBootstrapSeeded(dir: string) {
@@ -144,7 +134,6 @@ async function expectNoLegacyWorkspaceStateWrites(dir: string): Promise<void> {
   const { workspaceKey } = resolveWorkspaceStateIdentity(dir);
   const paths = [
     path.join(dir, LEGACY_WORKSPACE_STATE_CURRENT_FILENAME),
-    path.join(dir, ...LEGACY_WORKSPACE_STATE_PATH_SEGMENTS),
     `${dir}.attested`,
     path.join(testState?.stateDir ?? "", "workspace-attestations", `${workspaceKey}.attested`),
   ];
@@ -222,7 +211,7 @@ describe("ensureAgentWorkspace", () => {
       ensureAgentWorkspace({ dir: tempDir, ensureBootstrapFiles: true }),
     ).rejects.toThrow(/run openclaw doctor --fix/u);
     await expect(
-      fs.access(path.join(tempDir, ...LEGACY_WORKSPACE_STATE_PATH_SEGMENTS)),
+      fs.access(path.join(tempDir, LEGACY_WORKSPACE_STATE_CURRENT_FILENAME)),
     ).resolves.toBeUndefined();
     expect(readWorkspaceStateSnapshot(tempDir).setupExists).toBe(false);
   });
@@ -240,7 +229,7 @@ describe("ensureAgentWorkspace", () => {
       ensureAgentWorkspace({ dir: tempDir, ensureBootstrapFiles: true }),
     ).rejects.toThrow(/run openclaw doctor --fix/u);
     await expect(
-      fs.access(path.join(tempDir, ...LEGACY_WORKSPACE_STATE_PATH_SEGMENTS)),
+      fs.access(path.join(tempDir, LEGACY_WORKSPACE_STATE_CURRENT_FILENAME)),
     ).resolves.toBeUndefined();
     expect(readWorkspaceStateSnapshot(tempDir).setup).toEqual({
       version: 1,

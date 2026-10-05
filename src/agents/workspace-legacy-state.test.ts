@@ -149,6 +149,28 @@ describe("legacy workspace reset cleanup", () => {
     ).not.toThrow();
   });
 
+  it("ignores a nested .openclaw/workspace-state.json sidecar (164399 retired it)", async () => {
+    // 回归用例（PR #124 review Minor 2）：164399 起 setupStatePaths 只剩根级
+    // openclaw-workspace-state.json，嵌套的 .openclaw/workspace-state.json 不再
+    // 被 findUnmigratedWorkspaceSource 看见，assertNoUnmigratedWorkspaceState
+    // 不应该因为它的存在而抛 exit 78——这是之前只在"根级文件仍会拦"那个方向
+    // 验证过、从未反向锁住的行为。
+    const context = setup();
+    const nestedStatePath = path.join(context.workspaceDir, ".openclaw", "workspace-state.json");
+    await fs.mkdir(path.dirname(nestedStatePath), { recursive: true });
+    await fs.writeFile(
+      nestedStatePath,
+      JSON.stringify({ version: 1, bootstrapSeededAt: "2026-03-11T07:29:46.972Z" }),
+      "utf8",
+    );
+
+    expect(() =>
+      assertNoUnmigratedWorkspaceState({ workspaceDir: context.workspaceDir }),
+    ).not.toThrow();
+    // 文件本身也原样保留——退休含义是"不扫描"，不是"扫描后删除"。
+    await expect(fs.readFile(nestedStatePath, "utf8")).resolves.toContain("bootstrapSeededAt");
+  });
+
   it("checks lexical legacy markers separately for aliases of one workspace", async () => {
     const context = setup();
     const targetDir = path.join(context.homeDir, "workspace-target");

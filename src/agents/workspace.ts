@@ -447,6 +447,10 @@ async function hasSkipBootstrapWorkspaceContentEvidence(dir: string): Promise<bo
     for (const entry of entries) {
       if (
         entry.name === ".DS_Store" ||
+        // 跳过只是不把 .openclaw 目录算作"已有内容证据"，不代表还会去扫描它里面的
+        // sidecar 文件——164399 起嵌套的 .openclaw/workspace-state.json 已经退出
+        // Doctor 扫描名单（见 workspace-legacy-state.ts 的 setupStatePaths），这里
+        // 单纯是历史目录名的内容判定豁免，两者是独立的两件事。
         entry.name === ".openclaw" ||
         entry.name === LEGACY_WORKSPACE_STATE_CURRENT_FILENAME
       ) {

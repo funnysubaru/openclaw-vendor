@@ -2,12 +2,16 @@
 // 回搬自上游 #144290/#145921/#146123/#149528/#155241/#155250（ADR-0033 任务 72/84）。
 //
 // 背景：旧实现每次调用都把插件清单重新排序、重建 Set（CPU profile 实测单进程首轮约占 30 秒）。
-// 本文件用业务可观察的方式证明这个修复生效——不直接 mock 内部排序函数（太脆），而是验证
-// 「同一份 registry 引用被反复查询时结果保持稳定且正确」与「registry 引用一旦更换就会重新计算」，
-// 这正是缓存按对象身份失效的预期行为契约，也是写这个缓存时最容易踩的两个坑：
-//   1. 用内容做 key（比如序列化插件 id 列表）——registry 稍微变动就命中不到，缓存等于白做。
-//   2. 完全不做失效——plugin 重装/卸载后旧归属结果会一直残留。
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+// 本文件分两类断言：
+//   - 结果正确性：同一份 registry 反复查询结果稳定、换 registry 后按新内容重算（不残留旧结果）。
+//   - 缓存复用（可观察计数）：建索引时会对 `registry.plugins` 调一次 `toSorted`，这里在 fixture 的
+//     plugins 数组实例上挂 spy 计数——同一 registry 无论查多少次只建一次索引（计数 1），换一个新的
+//     registry 对象才重建。只断言结果的话，把缓存整个去掉（每次重建索引）也照样全绿，防不住本修复
+//     要解决的性能回退（code review P3 指出），所以必须有这条计数断言；不依赖耗时阈值。
+// 写这个缓存时最容易踩的两个坑也由上面两类断言覆盖：
+//   1. 用内容做 key 或调用方每次新包一层对象——命中不到，缓存等于白做（计数断言会变红）。
+//   2. 完全不做失效——plugin 重装/卸载后旧归属结果会一直残留（换 registry 的用例会变红）。
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPluginCache, resetPluginCache, withPluginCache } from "./plugin-cache.js";
 import {
   listTrustedExternalProviderPolicyOwners,
@@ -39,7 +43,7 @@ describe("provider-policy-owners 缓存契约", () => {
     resetPluginCache();
   });
 
-  it("同一份 registry 引用重复查询，结果保持一致（证明走了缓存命中而非每次重算）", () => {
+  it("同一份 registry 引用重复查询，结果保持一致", () => {
     const registry = {
       plugins: [
         makePlugin({ id: "zed-provider", origin: "bundled", providers: ["zed"] }),
@@ -52,6 +56,64 @@ describe("provider-policy-owners 缓存契约", () => {
       expect(resolveBundledProviderPolicyOwner("zed", registry)?.id).toBe("zed-provider");
       // 再查一次同一个 providerId，必须仍是同一个结果（索引是懒建一次、不是每次新算）。
       expect(resolveBundledProviderPolicyOwner("acme", registry)?.id).toBe("acme-provider");
+    });
+  });
+
+  it("同一份 registry 多次查询只建一次索引，换新 registry 对象才重建（缓存复用可观察）", () => {
+    const pluginsA = [
+      makePlugin({ id: "zed-provider", origin: "bundled", providers: ["zed"] }),
+      makePlugin({ id: "acme-provider", origin: "bundled", providers: ["acme"] }),
+      makePlugin({
+        id: "trusted-ext",
+        origin: "installed",
+        trustedOfficialInstall: true,
+        providers: ["shared"],
+      }),
+    ];
+    // 在数组实例上挂 spy：建索引时对 registry.plugins 只调一次 toSorted，计数 = 建索引次数。
+    const sortA = vi.spyOn(pluginsA, "toSorted");
+    const registryA = { plugins: pluginsA };
+    withPluginCache(createPluginCache(), () => {
+      // bundled / trusted 两个入口、命中与未命中的 providerId 混着查，都应复用同一份索引。
+      for (let i = 0; i < 5; i += 1) {
+        expect(resolveBundledProviderPolicyOwner("acme", registryA)?.id).toBe("acme-provider");
+        expect(resolveBundledProviderPolicyOwner("zed", registryA)?.id).toBe("zed-provider");
+        expect(resolveBundledProviderPolicyOwner("missing", registryA)).toBeNull();
+        expect(
+          listTrustedExternalProviderPolicyOwners("shared", registryA).map((owner) => owner.id),
+        ).toEqual(["trusted-ext"]);
+      }
+      expect(sortA).toHaveBeenCalledTimes(1);
+
+      // 内容相同但是新对象（例如调用方每次 `{ plugins: [...metadata.plugins] }` 重新包一层）
+      // 必然重建——这正是 provider-model-routes.ts 修掉的「缓存零命中」形态，调用方必须传稳定引用。
+      const pluginsB = [...pluginsA];
+      const sortB = vi.spyOn(pluginsB, "toSorted");
+      const registryB = { plugins: pluginsB };
+      expect(resolveBundledProviderPolicyOwner("acme", registryB)?.id).toBe("acme-provider");
+      expect(resolveBundledProviderPolicyOwner("acme", registryB)?.id).toBe("acme-provider");
+      expect(sortB).toHaveBeenCalledTimes(1);
+      expect(sortA).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("trusted 查询返回副本，调用方修改返回数组不会污染缓存", () => {
+    const registry = {
+      plugins: [
+        makePlugin({
+          id: "trusted-ext",
+          origin: "installed",
+          trustedOfficialInstall: true,
+          providers: ["shared"],
+        }),
+      ],
+    };
+    withPluginCache(createPluginCache(), () => {
+      const first = listTrustedExternalProviderPolicyOwners("shared", registry);
+      first.length = 0;
+      expect(
+        listTrustedExternalProviderPolicyOwners("shared", registry).map((owner) => owner.id),
+      ).toEqual(["trusted-ext"]);
     });
   });
 

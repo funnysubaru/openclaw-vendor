@@ -31,7 +31,6 @@ import {
   loadVisibleSkills,
   loadWorkspaceSkills,
   prepareWorkspaceSkills,
-  resolveWorkspaceSkillPromptEntries,
 } from "./workspace-skill-loader.js";
 
 vi.mock("../../plugins/manifest-registry.js", async () => {
@@ -67,9 +66,17 @@ vi.mock("../../plugins/manifest-registry.js", async () => {
   };
 });
 
-describe.each(["prompt", "runtime"] as const)("%s asynchronous binary preparation", (caller) => {
+// Yuiclaw：上游这组用例同时测 prompt / runtime 两条路径。我们只部分回搬了 #146373，
+// resolveWorkspaceSkillPromptEntries 仍是同步版（走同步 hasBinary，不经过 prepareSkillBinaryProbe），
+// 所以 prompt 变体测的是没搬的行为，这里只保留 runtime（gateway 准备技能命令走的路径），
+// 上游的 describe.each(["prompt","runtime"]) 相应收成单个 describe。
+describe("runtime asynchronous binary preparation", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    // Yuiclaw：restoreAllMocks 会连文件级 beforeAll 里 setMockSkillsHomeEnv 设的 os.homedir 模拟一起撤掉。
+    // Windows 的临时目录在真实用户目录下，撤掉后告警路径会被缩写成 ~/...，导致后面
+    // loadWorkspaceSkills 的告警用例失败（Linux 临时目录不在 home 下，上游 CI 看不出）。这里补回来。
+    vi.spyOn(os, "homedir").mockReturnValue(fakeHome);
     vi.unstubAllEnvs();
     setActiveDegradedSecretOwners([]);
   });
@@ -107,11 +114,7 @@ describe.each(["prompt", "runtime"] as const)("%s asynchronous binary preparatio
       }),
     };
     const resolve = async (assertCurrent?: () => void) => {
-      const entries =
-        caller === "prompt"
-          ? (await resolveWorkspaceSkillPromptEntries(workspaceDir, { ...options, assertCurrent }))
-              .eligible
-          : await prepareWorkspaceSkills(workspaceDir, options, assertCurrent);
+      const entries = await prepareWorkspaceSkills(workspaceDir, options, assertCurrent);
       return entries.map((entry) => entry.skill.name);
     };
     return { binDir, config, eligibility, resolve };

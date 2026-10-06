@@ -25,13 +25,39 @@ type PublicSurfaceLocation = {
   boundaryRoot: string;
 };
 
+// ADR-0033 任务72第二批本地等价修复（已查上游 src/plugin-sdk/facade-resolution-shared.ts 的
+// createFacadeResolutionKey——上游当前实现与我们这里的旧写法同构，同样每次调用都对
+// bundledPluginsDir 重新 path.resolve 一次再拼模板字符串，并未解决这处冗余，所以这里不搬
+// 上游、自己写最小修复）。createResolutionKey 是 resolvePublicSurfaceLocation 的缓存键计算
+// 函数本身，哪怕命中缓存也会被调用一次（见下方 resolvePublicSurfaceLocation），CPU profile
+// 实测 path.resolve 这一步单独占 2.7 秒 self time。resolveBundledPluginsDir() 已经被
+// #145226 改成命中缓存时返回同一个字符串引用（见 bundled-dir.ts），但 path.resolve 不认
+// "同一个引用"这件事、每次都会重新规范化。这里补一层 size-1 的"上一次输入/输出"记忆化：
+// 只要 resolveBundledPluginsDir() 这次返回的字符串和上次完全相同（绝大多数调用都是这种
+// 情况——它在一次 Gateway 生命周期内几乎不变），直接复用上次 path.resolve 的结果，不重算。
+// 安全性：path.resolve 对一条已经是绝对路径的输入是纯函数（resolveBundledPluginsDir 的
+// 每条返回路径都已经是绝对路径，详见 bundled-dir.ts），所以按输入字符串严格相等做缓存
+// 不会因为 cwd / env 变化产生假命中——一旦 bundledPluginsDir 的值真的变了（override、
+// disabled、cwd 等任何会影响它的输入变了），字符串不相等，直接走回 path.resolve 重算。
+let lastResolvedBundledPluginsDirInput: string | undefined;
+let lastResolvedBundledPluginsDirOutput: string | undefined;
+function resolveBundledPluginsDirAbsoluteMemoized(bundledPluginsDir: string): string {
+  if (bundledPluginsDir === lastResolvedBundledPluginsDirInput) {
+    return lastResolvedBundledPluginsDirOutput as string;
+  }
+  const resolved = path.resolve(bundledPluginsDir);
+  lastResolvedBundledPluginsDirInput = bundledPluginsDir;
+  lastResolvedBundledPluginsDirOutput = resolved;
+  return resolved;
+}
+
 function createResolutionKey(params: {
   dirName: string;
   artifactBasename: string;
   env?: NodeJS.ProcessEnv;
 }): string {
   const bundledPluginsDir = resolveBundledPluginsDir(params.env);
-  return `${params.dirName}::${params.artifactBasename}::${areBundledPluginsDisabled(params.env)}::${bundledPluginsDir ? path.resolve(bundledPluginsDir) : "<default>"}`;
+  return `${params.dirName}::${params.artifactBasename}::${areBundledPluginsDisabled(params.env)}::${bundledPluginsDir ? resolveBundledPluginsDirAbsoluteMemoized(bundledPluginsDir) : "<default>"}`;
 }
 
 function resolvePublicSurfaceLocationUncached(params: {

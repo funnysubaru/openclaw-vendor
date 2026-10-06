@@ -17,9 +17,15 @@ import {
   type ProviderPolicySurface,
 } from "./provider-policy-surface.js";
 
+// 这里特意用 readonly 而不是 Pick<PluginManifestRegistry, "plugins">（mutable 数组）：
+// 调用方（如 provider-model-routes.ts）要传的是当前插件元数据快照本身（其 plugins 字段是
+// readonly，Gateway 运行期间稳定不变、可按引用缓存），不该为了凑类型再 spread 复制一份——
+// 复制出的新数组每次调用都是新对象，会让 provider-policy-owners.ts 的按引用缓存全部失效。
+type ProviderPolicyRegistryLike = { plugins: readonly PluginManifestRegistry["plugins"][number][] };
+
 type ProviderPolicyMetadata = {
-  manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
-  loadManifestRegistry?: () => Pick<PluginManifestRegistry, "plugins"> | undefined;
+  manifestRegistry?: ProviderPolicyRegistryLike;
+  loadManifestRegistry?: () => ProviderPolicyRegistryLike | undefined;
 };
 
 // 回搬自上游 #144290/#145921/#146123/#149528/#155241/#155250（ADR-0033 任务 72/84）：
@@ -77,7 +83,7 @@ export function resolveBundledProviderPolicySurface(
 /** Resolves provider policy hooks from bundled or trusted official plugin artifacts. */
 export function resolveProviderPolicySurface(
   providerId: string,
-  options: { manifestRegistry?: Pick<PluginManifestRegistry, "plugins"> } = {},
+  options: { manifestRegistry?: ProviderPolicyRegistryLike } = {},
 ): ProviderPolicySurface | null {
   const bundledSurface = resolveBundledProviderPolicySurface(providerId, options);
   if (bundledSurface) {
@@ -115,7 +121,7 @@ export function loadTrustedExternalProviderPolicyArtifacts(
 /** Lists trusted installed plugins that own a provider policy reference. */
 export function listTrustedExternalProviderPolicyOwners(
   providerId: string,
-  manifestRegistry: Pick<PluginManifestRegistry, "plugins">,
+  manifestRegistry: ProviderPolicyRegistryLike,
 ) {
   return listTrustedExternalProviderPolicyOwnersIndexed(providerId, manifestRegistry);
 }

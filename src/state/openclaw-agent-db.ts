@@ -42,6 +42,7 @@ import {
   registerAgentDeletionDatabaseCleanup,
 } from "./agent-deletion-cleanup.js";
 import { readAgentDeletionJournal } from "./agent-deletion-journal.js";
+import { waitForAgentStartupAdmission } from "./agent-startup-admission.js";
 import { createOpenClawAgentDatabaseAdmissionOwner } from "./openclaw-agent-db-admission.js";
 import type {
   OpenClawAgentDatabase,
@@ -187,8 +188,30 @@ export function openOpenClawAgentDatabase(
 }
 
 export type { OpenClawAgentDatabaseWriteAdmission } from "./openclaw-agent-db-admission.js";
-export const { withOpenClawAgentDatabaseAsync, withOpenClawAgentDatabaseAdmission } =
-  createOpenClawAgentDatabaseAdmissionOwner(openOpenClawAgentDatabaseSteps);
+const {
+  withOpenClawAgentDatabaseAsync: withOpenClawAgentDatabaseAsyncAfterOpenAdmission,
+  withOpenClawAgentDatabaseAdmission,
+} = createOpenClawAgentDatabaseAdmissionOwner(openOpenClawAgentDatabaseSteps);
+export { withOpenClawAgentDatabaseAdmission };
+
+/**
+ * ADR-0033 任务84(c)：所有异步打开员工库的调用方都走这一个函数（包括真正发请求的
+ * 时候），所以在真正开库之前先在这里插一刀——如果这个 agentId 的后台启动准入还没
+ * 完成，就先等它（或者如果它已经失败，直接把同一个失败原因抛给这次调用）。这样
+ * "请求打到还没准备好的员工时等待其准入完成"这条规则只用改这一处，不用在每个调用
+ * withOpenClawAgentDatabaseAsync 的业务代码里分别加等待逻辑。
+ */
+export async function withOpenClawAgentDatabaseAsync<T>(
+  options: OpenClawAgentDatabaseOptions,
+  operation: (database: OpenClawAgentDatabase) => T | Promise<T>,
+  assertCurrent?: () => void,
+): Promise<T> {
+  const pending = waitForAgentStartupAdmission(options.agentId);
+  if (pending) {
+    await pending;
+  }
+  return withOpenClawAgentDatabaseAsyncAfterOpenAdmission(options, operation, assertCurrent);
+}
 
 function* openOpenClawAgentDatabaseSteps(
   options: OpenClawAgentDatabaseOptions,

@@ -494,10 +494,15 @@ export function loadPluginRegistrySnapshotWithMetadata(
       ),
     );
   if (persistedIndex && contentMatches) {
-    const packageMetadataMatches = isDeepStrictEqual(
-      resolvePluginRegistryContent(persistedIndex, true),
-      resolvePluginRegistryContent(derived.index, true),
-    );
+    // 任务84第二批（上游 #147893）：comparePackageJsonPath 为真时，上面 contentMatches 的比较
+    // 本就带了 package 路径、且 excludedMissingDisabledPlugins 必为空（二者互斥，见下方赋值条件），
+    // 与这里要做的比较完全同构，直接复用结果，省一次 isDeepStrictEqual。
+    const packageMetadataMatches =
+      comparePackageJsonPath ||
+      isDeepStrictEqual(
+        resolvePluginRegistryContent(persistedIndex, true),
+        resolvePluginRegistryContent(derived.index, true),
+      );
     return {
       snapshot: persistedIndex,
       source: "persisted",

@@ -9,7 +9,8 @@ import {
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { testing } from "./server-startup-bootstrap.js";
 
-const { publishGatewayPluginRuntimeConfigAtStartup } = testing;
+const { publishGatewayPluginRuntimeConfigAtStartup, buildStartupDatabaseSchemaPreflightOptions } =
+  testing;
 
 afterEach(() => {
   resetConfigRuntimeState();
@@ -38,5 +39,36 @@ describe("Gateway startup runtime config publication", () => {
 
     expect(getRuntimeConfigSnapshot()).toBe(pluginRuntimeConfig);
     expect(getRuntimeConfigSourceSnapshot()).toBe(sourceConfig);
+  });
+});
+
+describe("ADR-0033 任务84(a): state.schema-preflight 只查全局状态库", () => {
+  it("把 scope 固定为 state，不重复查员工库", () => {
+    const signal = new AbortController().signal;
+    const env = { FAKE: "1" } as unknown as NodeJS.ProcessEnv;
+
+    const options = buildStartupDatabaseSchemaPreflightOptions({
+      signal,
+      env,
+      stateSchemaVersion: 7,
+      agentSchemaVersion: 3,
+    });
+
+    // 这是本次改动的核心断言：去掉 `scope: "state"` 或把它改成别的值，这条测试就会红。
+    expect(options.scope).toBe("state");
+    expect(options.signal).toBe(signal);
+    expect(options.env).toBe(env);
+    expect(options.supportedVersions).toEqual({ state: 7, agent: 3 });
+  });
+
+  it("signal 缺省时透传 undefined，不强塞一个假 signal", () => {
+    const options = buildStartupDatabaseSchemaPreflightOptions({
+      env: {} as NodeJS.ProcessEnv,
+      stateSchemaVersion: 1,
+      agentSchemaVersion: 1,
+    });
+
+    expect(options.signal).toBeUndefined();
+    expect(options.scope).toBe("state");
   });
 });

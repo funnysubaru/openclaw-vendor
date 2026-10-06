@@ -170,7 +170,18 @@ describe("OpenClaw database schema preflight", () => {
         config: { session: { store } },
       }),
     ).rejects.toThrow("belongs to agent beta; requested agent alpha");
-    expect(snapshotPreflightSourceManifest(root)).toEqual(before);
+    // ADR-0033 任务84(b)：gateway-startup 这一遍现在直接对活文件开一个普通只读连接读
+    // 版本号/元数据（不再整库拷贝到临时目录），这会让 SQLite 按 WAL 读者的正常行为补上
+    // -wal/-shm 这两个协调文件——在它们原本不存在的地方新建出来。这不是数据损坏（下次
+    // 任何人正常打开这个库都能正确处理），只是「活文件只读也会留下协调文件」这个
+    // SQLite 固有特性，与整库拷贝方案相比是刻意接受的新副作用（PR 描述里有数据安全
+    // 论证）。这条用例原本在验证"被拒绝的员工库完全不碰原文件"，放宽到"除了这两个
+    // 协调文件之外没有其它改动"。
+    const after = snapshotPreflightSourceManifest(root);
+    const ignoredNewSidecars = new Set(
+      [`${agentPath}-wal`, `${agentPath}-shm`].map((p) => path.relative(root, p)),
+    );
+    expect(after.filter(([name]: [string]) => !ignoredNewSidecars.has(name))).toEqual(before);
   });
 
   it("admits supported forward state migration after the Doctor-owned audit repair", async () => {

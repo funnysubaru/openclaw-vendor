@@ -103,8 +103,11 @@ export function resolveControlPlaneRegistryParams<T extends LoadInstalledPluginI
   };
 }
 
-function canReuseCurrentPluginMetadataSnapshot(params: LoadPluginRegistryParams): boolean {
+// 任务84第二批（上游 #153452）：导出并补 index 判据，供 plugin-metadata-snapshot.ts 的
+// loadPluginMetadataSnapshotForRegistry 复用——传了显式 index 时不能走「当前快照」捷径。
+export function canReusePluginRegistrySnapshot(params: LoadPluginRegistryParams): boolean {
   return (
+    params.index === undefined &&
     params.allowCurrent !== false &&
     params.preferPersisted !== false &&
     params.stateDir === undefined &&
@@ -118,17 +121,24 @@ function canReuseCurrentPluginMetadataSnapshot(params: LoadPluginRegistryParams)
   );
 }
 
-function loadCurrentPluginRegistrySnapshotResult(
-  params: LoadPluginRegistryParams,
-): PluginRegistrySnapshotResult | undefined {
-  if (!canReuseCurrentPluginMetadataSnapshot(params)) {
+// 任务84第二批（上游 #153452）：从 loadCurrentPluginRegistrySnapshotResult 里拆出来单独导出，
+// 让 plugin-metadata-snapshot.ts 的 contributions 路径也能直接拿「当前快照」，不必走完整的
+// loadPluginRegistrySnapshotWithMetadata。
+export function getCurrentPluginMetadataSnapshotForRegistry(params: LoadPluginRegistryParams) {
+  if (!canReusePluginRegistrySnapshot(params)) {
     return undefined;
   }
-  const current = getCurrentPluginMetadataSnapshot({
+  return getCurrentPluginMetadataSnapshot({
     config: params.config,
     env: params.env ?? process.env,
     ...(params.workspaceDir !== undefined ? { workspaceDir: params.workspaceDir } : {}),
   });
+}
+
+function loadCurrentPluginRegistrySnapshotResult(
+  params: LoadPluginRegistryParams,
+): PluginRegistrySnapshotResult | undefined {
+  const current = getCurrentPluginMetadataSnapshotForRegistry(params);
   if (!current) {
     return undefined;
   }

@@ -17,7 +17,10 @@ import {
   listPluginManifestContributionIds,
   type PluginMetadataContributionKey,
 } from "./plugin-metadata-contributions.js";
-import { resolvePluginMetadataSnapshot } from "./plugin-metadata-snapshot.js";
+import {
+  loadPluginMetadataSnapshotForRegistry,
+  resolvePluginMetadataSnapshot,
+} from "./plugin-metadata-snapshot.js";
 import type { PluginMetadataSnapshot } from "./plugin-metadata-snapshot.types.js";
 import type { PluginOrigin } from "./plugin-origin.types.js";
 import {
@@ -143,7 +146,7 @@ function listContributionManifestPlugins(
     const includePlugin = createContributionPluginFilter(params, lookUpTable.index);
     return lookUpTable.plugins.filter((plugin) => includePlugin(plugin.id));
   }
-  const { snapshot: index, manifestRegistry } = loadPluginRegistrySnapshotWithMetadata(params);
+  const { snapshot: index, manifestRegistry } = loadContributionRegistrySnapshot(params);
   const pluginIds = index.plugins.map((plugin) => plugin.pluginId);
   return loadPluginManifestRegistryForInstalledIndex({
     index,
@@ -158,10 +161,22 @@ function listContributionManifestPlugins(
   }).plugins;
 }
 
+// 任务84第二批（上游 #153452）：contributions 只读列表场景优先复用「当前」元数据快照，
+// 没有已发布快照（或带了 bundledChannelConfigCollector 这种一次性收集器参数）才退回
+// 完整的 loadPluginRegistrySnapshotWithMetadata。
+function loadContributionRegistrySnapshot(params: LoadPluginRegistryManifestParams) {
+  const metadata = params.bundledChannelConfigCollector
+    ? undefined
+    : loadPluginMetadataSnapshotForRegistry(params);
+  return metadata
+    ? { snapshot: metadata.index, manifestRegistry: metadata.manifestRegistry }
+    : loadPluginRegistrySnapshotWithMetadata(params);
+}
+
 export function loadPluginManifestRegistryForPluginRegistry(
   params: LoadPluginRegistryManifestParams = {},
 ): PluginManifestRegistry {
-  const { snapshot: index, manifestRegistry } = loadPluginRegistrySnapshotWithMetadata(params);
+  const { snapshot: index, manifestRegistry } = loadContributionRegistrySnapshot(params);
   return loadPluginManifestRegistryForInstalledIndex({
     index,
     ...(manifestRegistry ? { manifestRegistry } : {}),

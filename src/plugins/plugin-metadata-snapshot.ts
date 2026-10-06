@@ -46,7 +46,12 @@ import type {
   ResolvePluginMetadataSnapshotParams,
 } from "./plugin-metadata-snapshot.types.js";
 import { createPluginRegistryIdNormalizer } from "./plugin-registry-id-normalizer.js";
-import { loadPluginRegistrySnapshotWithMetadata } from "./plugin-registry-snapshot.js";
+import {
+  canReusePluginRegistrySnapshot,
+  getCurrentPluginMetadataSnapshotForRegistry,
+  loadPluginRegistrySnapshotWithMetadata,
+  type LoadPluginRegistryParams,
+} from "./plugin-registry-snapshot.js";
 import { normalizePluginIdScope, serializePluginIdScope } from "./plugin-scope.js";
 import { buildDeclaredProviderOwnerIndex } from "./provider-owner-index.js";
 
@@ -369,6 +374,32 @@ export function loadPluginMetadataSnapshot(
       );
     }
   }
+  return loadCachedPluginMetadataSnapshot(params);
+}
+
+// 任务84第二批（上游 #153452）：contributions 读取路径（channels/providers 清单等）只要列表，
+// 不需要 loadPluginMetadataSnapshot 的完整发布/兼容性判定；这里直接复用已发布的「当前快照」，
+// 没有就退回一次不带注册表专属参数（candidates/discovery/...)的缓存加载，避免重复跑一遍
+// loadPluginRegistrySnapshotWithMetadata 的发现与比较逻辑。
+export function loadPluginMetadataSnapshotForRegistry(
+  params: LoadPluginRegistryParams,
+): PluginMetadataSnapshot | undefined {
+  if (!canReusePluginRegistrySnapshot(params) || params.artifactPreservingReadOnly !== undefined) {
+    return undefined;
+  }
+  return (
+    getCurrentPluginMetadataSnapshotForRegistry(params) ??
+    loadCachedPluginMetadataSnapshot({
+      config: params.config,
+      env: params.env,
+      workspaceDir: params.workspaceDir,
+    })
+  );
+}
+
+function loadCachedPluginMetadataSnapshot(
+  params: LoadPluginMetadataSnapshotParams,
+): PluginMetadataSnapshot {
   const cache = getPluginCache();
   const key = resolvePluginMetadataSnapshotCacheKey(params);
   const cached = cache.metadata.snapshots.get(key);

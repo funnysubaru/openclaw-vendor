@@ -1,16 +1,21 @@
 // Verifies current plugin registry contribution snapshots.
 import fs from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { getCurrentPluginMetadataSnapshot } from "./current-plugin-metadata-snapshot.js";
 import {
   makeEmptyPluginMetadataOwners,
   setCurrentPluginMetadataSnapshot,
 } from "./current-plugin-metadata.test-support.js";
 import { resolveInstalledPluginIndexPolicyHash } from "./installed-plugin-index-policy.js";
 import type { InstalledPluginIndex } from "./installed-plugin-index.js";
+import * as installedIndex from "./installed-plugin-index.js";
 import { loadManifestMetadataSnapshot } from "./manifest-contract-eligibility.js";
 import type { PluginManifestRecord } from "./manifest-registry.js";
 import { clearPluginMetadataLifecycleCaches } from "./plugin-metadata-lifecycle.js";
+import { loadPluginMetadataSnapshot } from "./plugin-metadata-snapshot.js";
 import type { PluginMetadataSnapshot } from "./plugin-metadata-snapshot.types.js";
 import {
   loadPluginManifestRegistryForPluginRegistry,
@@ -21,6 +26,9 @@ import {
 } from "./plugin-registry-contributions.js";
 import { loadPluginRegistrySnapshotWithMetadata } from "./plugin-registry-snapshot.js";
 import { buildDeclaredProviderOwnerIndex } from "./provider-owner-index.js";
+import { createColdPluginFixture } from "./test-helpers/cold-plugin-fixtures.js";
+
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -100,6 +108,77 @@ function createSnapshot(params: {
 }
 
 describe("loadPluginManifestRegistryForPluginRegistry current snapshot", () => {
+  // 任务84第二批（上游 #153452）：验证「已缓存但未显式 publish 为 current」的元数据快照也能被
+  // contributions 读取路径复用——只要 clearPluginMetadataLifecycleCaches() 没清掉缓存键，
+  // 二次调用不应再触发 loadInstalledPluginIndexWithDiscovery（真正的插件发现扫描）。
+  it("reuses unpublished metadata until explicit discovery or lifecycle invalidation", () => {
+    const root = tempDirs.make("openclaw-registry-metadata-reuse-");
+    const pluginRoot = path.join(root, "plugin");
+    fs.mkdirSync(pluginRoot);
+    const fixture = createColdPluginFixture({ rootDir: pluginRoot, pluginId: "reuse-fixture" });
+    const config: OpenClawConfig = {
+      plugins: {
+        allow: [fixture.pluginId],
+        load: { paths: [pluginRoot] },
+        entries: { [fixture.pluginId]: { enabled: true } },
+      },
+    };
+    const env = {
+      HOME: root,
+      OPENCLAW_HOME: root,
+      OPENCLAW_STATE_DIR: path.join(root, "state"),
+      OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
+    };
+    const params = { config, env };
+    // 第一次调用走正常冷加载，把结果缓存进 plugin-metadata-snapshot 的缓存 Map，但不发布为 current。
+    expect(loadPluginMetadataSnapshot(params).plugins.map((plugin) => plugin.id)).toEqual([
+      fixture.pluginId,
+    ]);
+    const derive = vi.spyOn(installedIndex, "loadInstalledPluginIndexWithDiscovery");
+
+    // 第二次经 contributions 读取路径(loadPluginManifestRegistryForPluginRegistry /
+    // listPluginContributionIds / resolvePluginContributionOwners)应该直接命中上面的缓存，
+    // 不重新跑插件发现。
+    expect(
+      loadPluginManifestRegistryForPluginRegistry(params).plugins.map((plugin) => plugin.id),
+    ).toEqual([fixture.pluginId]);
+    expect(listPluginContributionIds({ ...params, contribution: "channels" })).toEqual([
+      fixture.channelId,
+    ]);
+    expect(
+      resolvePluginContributionOwners({
+        ...params,
+        contribution: "channels",
+        matches: fixture.channelId,
+      }),
+    ).toEqual([fixture.pluginId]);
+    expect(derive).not.toHaveBeenCalled();
+    // 这份缓存是「已缓存」而非「已发布」——current-plugin-metadata-snapshot 里查不到它。
+    expect(getCurrentPluginMetadataSnapshot(params)).toBeUndefined();
+
+    // 显式传了 candidates 等注册表专属参数时，必须绕开缓存走真实发现（行为不能被这次优化掩盖）。
+    expect(
+      loadPluginManifestRegistryForPluginRegistry({
+        ...params,
+        preferPersisted: false,
+        candidates: [],
+      }).plugins,
+    ).toEqual([]);
+    expect(derive).toHaveBeenCalledOnce();
+
+    // 清掉生命周期缓存后，缓存键失效，下一次 contributions 读取应该重新走一次发现。
+    clearPluginMetadataLifecycleCaches();
+    expect(
+      loadPluginManifestRegistryForPluginRegistry(params).plugins.map((plugin) => plugin.id),
+    ).toEqual([fixture.pluginId]);
+    expect(listPluginContributionIds({ ...params, contribution: "channels" })).toEqual([
+      fixture.channelId,
+    ]);
+    expect(derive).toHaveBeenCalledTimes(2);
+    // 发现扫描只读元数据文件，绝不应该触发插件的运行时入口（见 cold-plugin-fixtures 的 runtime 守卫）。
+    expect(fs.existsSync(fixture.runtimeMarker)).toBe(false);
+  });
+
   it("reuses current manifests for contribution listing and owner lookup", () => {
     const config: OpenClawConfig = {
       plugins: { entries: { disabled: { enabled: false } } },

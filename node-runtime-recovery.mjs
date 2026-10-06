@@ -1,6 +1,6 @@
 // Startup-only recovery; this module cannot depend on dist or installed packages.
 import { spawn, spawnSync } from "node:child_process";
-import { lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { fstatSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -69,10 +69,57 @@ const respawnSignalExitGraceMs = 1_000;
 const respawnSignalForceKillGraceMs = 1_000;
 const respawnSignalHardExitGraceMs = 1_000;
 
+// Yuiclaw：Windows 优雅关闭控制通道（OPENCLAW_CONTROL_FD）在启动器层的转传。
+// Yuiclaw 在 Windows 上把「优雅退出暗号」走一根额外的 fd 3 管道（stdin 改 ignore，见
+// src/process/gateway-control-channel.ts）。openclaw.mjs 这一层在源码目录（关编译缓存）和正式包
+// （换编译缓存目录）两种情况下都会先自我重启一次再进 gateway，走的就是下面的 runRespawnedChild。
+// 原来写死 stdio:"inherit" 只转 0-2，fd 3 在里层是空位，随后被 gateway 自己打开的普通文件占掉，
+// run-loop 装控制通道时报「Unsupported fd type: FILE」，暗号送不到、关窗口只能 taskkill 强杀。
+// 本模块不能依赖 dist（见文件头），所以这里按 gateway-control-channel.ts 的
+// resolveRespawnStdioWithControlFd 原样复刻一份，两处改动需保持一致。
+const GATEWAY_CONTROL_FD_ENV = "OPENCLAW_CONTROL_FD";
+
+const isLauncherFdOpen = (fd) => {
+  try {
+    fstatSync(fd);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * 启动器自我重启时用的 stdio + env：
+ *   - 未带 OPENCLAW_CONTROL_FD → 与改造前完全一致（stdio:"inherit"、env 原样），对上游零影响；
+ *   - 值合法（≥3 的十进制整数）且本进程手上这个 fd 是开着的 → 0-2 inherit，控制 fd 原样转到里层
+ *     同一个 fd 号（中间空位填 ignore）；
+ *   - 值非法或 fd 没开 → 保持 "inherit"，并从里层 env 删掉该变量，免得里层去打开不相干的 fd。
+ *     拿不到控制通道只是优雅退出不可用（父进程会落到强杀兜底），绝不能因此让 gateway 起不来。
+ */
+export const resolveLauncherRespawnStdio = (env, fdIsOpen = isLauncherFdOpen) => {
+  const raw = env[GATEWAY_CONTROL_FD_ENV];
+  if (raw === undefined) {
+    return { stdio: "inherit", env };
+  }
+  const trimmed = String(raw).trim();
+  const fd = /^\d+$/.test(trimmed) ? Number(trimmed) : Number.NaN;
+  if (!Number.isSafeInteger(fd) || fd < 3 || !fdIsOpen(fd)) {
+    const { [GATEWAY_CONTROL_FD_ENV]: _dropped, ...rest } = env;
+    return { stdio: "inherit", env: rest };
+  }
+  const stdio = ["inherit", "inherit", "inherit"];
+  while (stdio.length < fd) {
+    stdio.push("ignore");
+  }
+  stdio.push(fd);
+  return { stdio, env };
+};
+
 export const runRespawnedChild = (command, args, env) => {
+  const spawnIo = resolveLauncherRespawnStdio(env);
   const child = spawn(command, args, {
-    stdio: "inherit",
-    env,
+    stdio: spawnIo.stdio,
+    env: spawnIo.env,
   });
   const listeners = new Map();
   // Keep signal forwarding and bounded shutdown in sync with src/entry.compile-cache.ts.

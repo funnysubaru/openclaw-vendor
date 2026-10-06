@@ -1,6 +1,7 @@
 // Respawn child runner restarts child processes after configured exits.
 import type { ChildProcess, spawn } from "node:child_process";
 import type { attachChildProcessBridge } from "./child-process-bridge.js";
+import { resolveRespawnStdioWithControlFd } from "./gateway-control-channel.js";
 import { signalProcessTree } from "./kill-tree.js";
 
 const RESPAWN_SIGNAL_EXIT_GRACE_MS = 1_000;
@@ -26,9 +27,12 @@ export function runRespawnChildWithSignalBridge(params: {
   const stdioIsTerminal = params.stdioIsTerminal ?? (process.stdin.isTTY || process.stdout.isTTY);
   const detachForProcessTree =
     params.detachForProcessTree === true && process.platform !== "win32" && !stdioIsTerminal;
+  // Yuiclaw fork：父进程（Yuiclaw launcher, Windows）开了优雅关闭控制管道时，把它转传给里层
+  // 真正跑 gateway 的进程；没开时 stdio / env 与上游完全一致。详见 gateway-control-channel.ts。
+  const spawnIo = resolveRespawnStdioWithControlFd(env);
   const child = runtime.spawn(command, args, {
-    stdio: "inherit",
-    env,
+    stdio: spawnIo.stdio,
+    env: spawnIo.env,
     detached: detachForProcessTree,
   });
 

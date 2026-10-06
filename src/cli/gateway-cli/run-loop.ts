@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import net from "node:net";
 import { performance } from "node:perf_hooks";
 // Yuiclaw fork（回搬自 openclaw-vendor #98，2026-09-15 移植到 v2026.9.4 基线）：
-// createInterface 用来装 Windows 优雅关闭的 stdin 控制通道，见下方 STDIN_SHUTDOWN_SENTINEL。
+// createInterface 用来按行读 Windows 优雅关闭的控制管道，见下方 CONTROL_SHUTDOWN_SENTINEL。
 import { createInterface, type Interface } from "node:readline";
 import { MessageChannel } from "node:worker_threads";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
@@ -38,6 +38,10 @@ import type { RuntimeEnv } from "../../runtime.js";
 import { AsyncWorkScope } from "../../shared/async-work-scope.js";
 import { drainGlobalSingletonLifecycleState } from "../../shared/global-singleton.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
+import {
+  openGatewayControlChannel,
+  parseGatewayControlFd,
+} from "../../process/gateway-control-channel.js";
 import { createGatewayHostLifecycle } from "./host-lifecycle.js";
 import {
   armShutdownHardExitWatchdog,
@@ -53,14 +57,15 @@ const UPDATE_RESPAWN_HEALTH_POLL_MS = 200;
 const LOG_FLUSH_EXIT_TIMEOUT_MS = 4_000;
 const HARD_EXIT_WATCHDOG_GRACE_MS = 2_000;
 
-// Yuiclaw fork（回搬自 openclaw-vendor #98，2026-09-15 移植到 v2026.9.4 基线）：Windows
-// 优雅关闭通道的暗号。Windows 上 Node 子进程收不到父进程发来的 POSIX 信号（taskkill /F
-// 是无信号强杀），所以上面的 SIGTERM→request("stop") 优雅路径够不着。父进程（Yuiclaw
-// launcher）改从 stdin 写一行暗号来触发同一条路径。暗号常量必须与 Yuiclaw 侧
-// packages/gateway/src/process-tree.ts 的 STDIN_SHUTDOWN_SENTINEL 保持一致（与下面
-// parentPort 三个常量同一个权威文件）——改一侧必须同改另一侧。仅当父进程显式设置
-// OPENCLAW_STDIN_CONTROL=1 才装监听，默认不装，对上游及其它运行方式零影响。
-const STDIN_SHUTDOWN_SENTINEL = "__openclaw_stdin_shutdown__";
+// Yuiclaw fork（回搬自 openclaw-vendor #98，2026-09-15 移植到 v2026.9.4 基线；2026-10 起
+// 通道从 stdin 换成专用 fd，原因见 src/process/gateway-control-channel.ts）：Windows 优雅关闭通道的暗号。
+// Windows 上 Node 子进程收不到父进程发来的 POSIX 信号（taskkill /F 是无信号强杀），所以
+// 上面的 SIGTERM→request("stop") 优雅路径够不着。父进程（Yuiclaw launcher）改从控制管道写
+// 一行暗号来触发同一条路径。暗号常量必须与 Yuiclaw 侧 packages/gateway/src/process-tree.ts
+// 的 CONTROL_SHUTDOWN_SENTINEL 保持一致（与下面 parentPort 三个常量同一个权威文件）——改一侧
+// 必须同改另一侧。暗号字面值沿用 #98 的历史值（含 "stdin" 字样，仅为不改协议值，与通道无关）。
+// 仅当父进程显式设置 OPENCLAW_CONTROL_FD 才装监听，默认不装，对上游及其它运行方式零影响。
+const CONTROL_SHUTDOWN_SENTINEL = "__openclaw_stdin_shutdown__";
 
 // Yuiclaw fork（回搬自 openclaw-vendor #102，2026-09-15 移植到 v2026.9.4 基线）：Electron
 // utilityProcess.fork() 派生的子进程会在全局 process 对象上挂一个 Electron 专有的
@@ -253,10 +258,11 @@ export async function runGatewayLoop(params: {
   let failureWork: { controller: AbortController; settled: Promise<void> } | undefined;
   // Yuiclaw fork（回搬自 #98/#102，2026-09-15 移植到 v2026.9.4 基线）：两条优雅关闭接收端，
   // 与既有 SIGTERM/SIGINT/SIGUSR1 信号通道并列共存（不是替换）：
-  //   - Windows child_process / Server Mode 回滚场景走 stdin（stdinControl）
+  //   - Windows child_process 场景走专用控制管道（controlSocket + controlReader，原 stdin 通道）
   //   - Electron utilityProcess 场景走 parentPort（parentPortListener）
   // 两条通道各自靠独立的 env 开关激活，互不干扰、互不依赖。
-  let stdinControl: Interface | null = null;
+  let controlSocket: net.Socket | null = null;
+  let controlReader: Interface | null = null;
   let parentPortListener: ((event: { data?: unknown }) => void) | null = null;
   const processInstanceId = randomUUID();
   const waitForHealthyChild = params.waitForHealthyChild ?? waitForHealthyGatewayChild;
@@ -276,10 +282,12 @@ export async function runGatewayLoop(params: {
     process.removeListener("SIGUSR1", onSigusr1);
     processLifetime?.port1.close();
     processLifetime?.port2.close();
-    // Yuiclaw fork（回搬自 #98/#102）：stdin / parentPort 控制通道随信号 handler 一起拆，
-    // 避免退出后悬挂 readline 监听 / MessagePort 监听拖着事件循环不退。
-    stdinControl?.close();
-    stdinControl = null;
+    // Yuiclaw fork（回搬自 #98/#102）：控制管道 / parentPort 控制通道随信号 handler 一起拆，
+    // 避免退出后悬挂 readline 监听 / 管道句柄 / MessagePort 监听拖着事件循环不退。
+    controlReader?.close();
+    controlReader = null;
+    controlSocket?.destroy();
+    controlSocket = null;
     if (parentPortListener) {
       getElectronParentPort()?.removeListener("message", parentPortListener);
       parentPortListener = null;
@@ -1253,32 +1261,47 @@ export async function runGatewayLoop(params: {
   process.on("SIGINT", onSigint);
   process.on("SIGUSR1", onSigusr1);
 
-  // Yuiclaw fork（回搬自 openclaw-vendor #98，2026-09-15 移植到 v2026.9.4 基线）：Windows
-  // 优雅关闭通道。仅当父进程（Yuiclaw launcher, Windows）显式开启才读 stdin，默认不装，
-  // 对上游及其它运行方式零影响。收到暗号行即复用现成 request("stop") 走完整优雅关闭
+  // Yuiclaw fork（回搬自 openclaw-vendor #98，2026-09-15 移植到 v2026.9.4 基线；2026-10 起
+  // 从 stdin 换成专用控制管道，原因见 src/process/gateway-control-channel.ts）：Windows 优雅关闭通道。仅当父
+  // 进程（Yuiclaw launcher, Windows）用 OPENCLAW_CONTROL_FD 显式指定 fd 才装，默认不装，对
+  // 上游及其它运行方式零影响。收到暗号行即复用现成 request("stop") 走完整优雅关闭
   // （drain / server.close / release lock / exit，与信号路径完全一致，含硬退出看门狗）。
-  if (process.env.OPENCLAW_STDIN_CONTROL === "1") {
-    // terminal:false 明确按非交互管道处理（父进程写一行就走，不需要 TTY 行编辑/回显）。
-    stdinControl = createInterface({ input: process.stdin, terminal: false });
-    stdinControl.on("line", (line) => {
-      if (line.trim() === STDIN_SHUTDOWN_SENTINEL) {
-        gatewayLog.info("received stdin shutdown request; shutting down");
-        request("stop", "stdin");
-      }
-    });
-    // unref 只是「不挡退出」，不是「停读」：readline 照常收行、暗号照常生效，只是 stdin
-    // 这个句柄不再单独 ref 住事件循环（gateway 靠 server 保活），关停后进程该退就退。
-    // 可选链：某些执行环境（如 worker_threads/vmThreads 池，vitest 的 pool: "threads" 跑
-    // 测试时命中过）暴露的 process.stdin 不是真实 socket/tty，没有 unref 方法；跳过 unref
-    // 的后果只是「stdin 可能 ref 住进程晚一点退」，不会丢数据。真实 Node 主进程（我们唯一
-    // 关心的运行时目标）始终有这个方法，可选链对它零影响。
-    process.stdin.unref?.();
+  const rawControlFd = process.env.OPENCLAW_CONTROL_FD;
+  const controlFd = parseGatewayControlFd(rawControlFd);
+  if (controlFd !== undefined) {
+    try {
+      const socket = openGatewayControlChannel(controlFd);
+      // 父进程先退 / 管道被关时 socket 会报错；不挂监听会冒成 uncaught exception 拖垮
+      // gateway。控制通道坏了只意味着「优雅退出不可用」，父进程会落到 taskkill 兜底。
+      socket.on("error", (error) => {
+        gatewayLog.warn(`gateway control channel error: ${formatErrorMessage(error)}`);
+      });
+      // terminal:false 明确按非交互管道处理（父进程写一行就走，不需要 TTY 行编辑/回显）。
+      const reader = createInterface({ input: socket, terminal: false });
+      reader.on("line", (line) => {
+        if (line.trim() === CONTROL_SHUTDOWN_SENTINEL) {
+          gatewayLog.info("received control channel shutdown request; shutting down");
+          request("stop", "control-channel");
+        }
+      });
+      // unref 只是「不挡退出」，不是「停读」：readline 照常收行、暗号照常生效，只是这根
+      // 管道句柄不再单独 ref 住事件循环（gateway 靠 server 保活），关停后进程该退就退。
+      socket.unref();
+      controlSocket = socket;
+      controlReader = reader;
+    } catch (error) {
+      gatewayLog.warn(
+        `gateway control channel unavailable on fd ${controlFd}: ${formatErrorMessage(error)}`,
+      );
+    }
+  } else if (rawControlFd !== undefined) {
+    gatewayLog.warn(`ignoring invalid OPENCLAW_CONTROL_FD value: ${JSON.stringify(rawControlFd)}`);
   }
 
   // Yuiclaw fork（回搬自 openclaw-vendor #102，2026-09-15 移植到 v2026.9.4 基线）：
   // parentPort 优雅关闭接收端。双守卫都要满足才装监听——① process.parentPort 存在
   // （普通 Node / Server Mode 下天然为 undefined，这是运行时环境守卫）；②
-  // OPENCLAW_PARENTPORT_CONTROL === "1" 显式开关（类比上面 OPENCLAW_STDIN_CONTROL，即使
+  // OPENCLAW_PARENTPORT_CONTROL === "1" 显式开关（类比上面 OPENCLAW_CONTROL_FD，即使
   // 将来某天 Node 原生 process 也长出了同名字段，没有这个显式开关也不会误装）。两个条件
   // 缺一都不装，对上游 openclaw、对 Server Mode（走 child_process，没有 parentPort）零副作用。
   const parentPort = getElectronParentPort();

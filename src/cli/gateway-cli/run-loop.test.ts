@@ -326,6 +326,19 @@ vi.mock("node:readline", async (importOriginal) => ({
   createInterface: vi.fn(() => fakeRl),
 }));
 
+// Yuiclaw fork：控制管道（OPENCLAW_CONTROL_FD）测试用的假 socket。测试进程里没有父进程
+// 传下来的 fd 3，真去 new net.Socket({ fd: 3 }) 会碰到不相干的句柄；这里只替换「打开管道」
+// 这一步，fd 解析（parseGatewayControlFd）保持真实实现。
+const fakeControlSocket = {
+  on: vi.fn(),
+  unref: vi.fn(),
+  destroy: vi.fn(),
+};
+vi.mock("../../process/gateway-control-channel.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../process/gateway-control-channel.js")>()),
+  openGatewayControlChannel: vi.fn(() => fakeControlSocket),
+}));
+
 // Yuiclaw fork（回搬自 openclaw-vendor #102，2026-09-15 移植到 v2026.9.4 基线）：
 // parentPort 优雅关闭接收端测试用的可控 mock。process.parentPort 在真实
 // utilityProcess 子进程里是 Electron 运行时注入的全局对象，普通 Node 测试进程里
@@ -3722,26 +3735,36 @@ describe("runGatewayLoop", () => {
     });
   });
 
-  // Yuiclaw fork（回搬自 openclaw-vendor #98，2026-09-15 移植到 v2026.9.4 基线）：Windows
-  // 上父进程管不了子进程的 POSIX 信号，改用 stdin 暗号触发同一条 request("stop") 优雅
-  // 关闭路径。下面四个用例覆盖：①暗号生效 ②非暗号行不触发 ③env 未开启时压根不装
-  // readline ④env 非严格 "1" 值同样不装 readline（对上游/其它运行方式零影响）。
-  describe("stdin graceful shutdown channel", () => {
+  // Yuiclaw fork（回搬自 openclaw-vendor #98，2026-09-15 移植到 v2026.9.4 基线；2026-10 起
+  // 通道从 stdin 换成 OPENCLAW_CONTROL_FD 指定的专用管道，原因见 src/process/gateway-control-channel.ts）：
+  // Windows 上父进程管不了子进程的 POSIX 信号，改用控制管道暗号触发同一条 request("stop")
+  // 优雅关闭路径。下面用例覆盖：①暗号生效且退出时拆掉管道 ②非暗号行不触发 ③env 未设不装
+  // ④env 非法值（含 0-2 标准流）不装 ⑤打开管道失败只降级、不拖垮 gateway。
+  describe("control channel graceful shutdown", () => {
     afterEach(() => {
-      // PR #121 review 追加：与下面 parentPort 组对称，兜底清 env + 捕获的 line handler，
-      // 防止某个用例提前 throw 漏执行 finally，让 OPENCLAW_STDIN_CONTROL 泄漏到后续既有
-      // 用例误装 readline。各用例自身的 finally 仍保留作双保险。
-      delete process.env.OPENCLAW_STDIN_CONTROL;
+      // 兜底清 env + 捕获的 line handler，防止某个用例提前 throw 漏执行 finally，让
+      // OPENCLAW_CONTROL_FD 泄漏到后续既有用例误装控制通道。各用例自身的 finally 仍保留作双保险。
+      delete process.env.OPENCLAW_CONTROL_FD;
       capturedLineHandler = null;
     });
 
-    it("shuts down on stdin sentinel when OPENCLAW_STDIN_CONTROL=1", async () => {
+    it("shuts down on control channel sentinel when OPENCLAW_CONTROL_FD=3", async () => {
       vi.clearAllMocks();
-      process.env.OPENCLAW_STDIN_CONTROL = "1";
+      process.env.OPENCLAW_CONTROL_FD = "3";
       capturedLineHandler = null;
+      const controlChannel = await import("../../process/gateway-control-channel.js");
+      const readline = await import("node:readline");
       try {
         await withIsolatedSignals(async () => {
           const { close, runtime, exited } = await createSignaledLoopHarness();
+          expect(controlChannel.openGatewayControlChannel).toHaveBeenCalledWith(3);
+          // 读的是控制管道，绝不能再读 process.stdin（否则子进程继承 stdin 的老问题回来）。
+          expect(readline.createInterface).toHaveBeenCalledWith({
+            input: fakeControlSocket,
+            terminal: false,
+          });
+          expect(fakeControlSocket.unref).toHaveBeenCalled();
+          expect(fakeControlSocket.on).toHaveBeenCalledWith("error", expect.any(Function));
           expect(capturedLineHandler).toBeTypeOf("function");
           capturedLineHandler!("__openclaw_stdin_shutdown__");
           await expect(exited).resolves.toBe(0);
@@ -3750,17 +3773,18 @@ describe("runGatewayLoop", () => {
             restartExpectedMs: null,
           });
           expect(runtime.exit).toHaveBeenCalledWith(0);
-          // cleanupSignals 应把 stdin readline 一并拆掉，避免退出后悬挂监听。
+          // cleanupSignals 应把 readline 与管道句柄一并拆掉，避免退出后悬挂监听。
           expect(fakeRl.close).toHaveBeenCalled();
+          expect(fakeControlSocket.destroy).toHaveBeenCalled();
         });
       } finally {
-        delete process.env.OPENCLAW_STDIN_CONTROL;
+        delete process.env.OPENCLAW_CONTROL_FD;
       }
     });
 
-    it("ignores non-sentinel stdin lines", async () => {
+    it("ignores non-sentinel control channel lines", async () => {
       vi.clearAllMocks();
-      process.env.OPENCLAW_STDIN_CONTROL = "1";
+      process.env.OPENCLAW_CONTROL_FD = "3";
       capturedLineHandler = null;
       try {
         await withIsolatedSignals(async () => {
@@ -3772,33 +3796,61 @@ describe("runGatewayLoop", () => {
           expect(close).not.toHaveBeenCalled();
         });
       } finally {
-        delete process.env.OPENCLAW_STDIN_CONTROL;
+        delete process.env.OPENCLAW_CONTROL_FD;
       }
     });
 
-    it("does not install stdin control when env unset", async () => {
+    it("does not install control channel when env unset", async () => {
       vi.clearAllMocks();
-      delete process.env.OPENCLAW_STDIN_CONTROL;
+      delete process.env.OPENCLAW_CONTROL_FD;
+      const controlChannel = await import("../../process/gateway-control-channel.js");
       const readline = await import("node:readline");
       await withIsolatedSignals(async () => {
         await createSignaledLoopHarness();
+        expect(controlChannel.openGatewayControlChannel).not.toHaveBeenCalled();
         expect(readline.createInterface).not.toHaveBeenCalled();
       });
     });
 
-    it("does not install stdin control for non-'1' env value", async () => {
+    it.each(["0", "2", "abc", "3.5", ""])(
+      "does not install control channel for invalid fd %j",
+      async (value) => {
+        vi.clearAllMocks();
+        // 0-2 是标准流：拿它们当控制通道就回到 stdin 方案的老问题，必须拒绝。
+        process.env.OPENCLAW_CONTROL_FD = value;
+        const controlChannel = await import("../../process/gateway-control-channel.js");
+        const readline = await import("node:readline");
+        try {
+          await withIsolatedSignals(async () => {
+            await createSignaledLoopHarness();
+            expect(controlChannel.openGatewayControlChannel).not.toHaveBeenCalled();
+            expect(readline.createInterface).not.toHaveBeenCalled();
+          });
+        } finally {
+          delete process.env.OPENCLAW_CONTROL_FD;
+        }
+      },
+    );
+
+    it("keeps running when the control channel cannot be opened", async () => {
       vi.clearAllMocks();
-      // 严格 === "1" 判定：不能把任何 truthy 字符串（如 "0" / "true"）都当开启，
-      // 防止环境变量误传非 "1" 值时意外装上 stdin 控制通道。
-      process.env.OPENCLAW_STDIN_CONTROL = "0";
+      process.env.OPENCLAW_CONTROL_FD = "3";
+      const controlChannel = await import("../../process/gateway-control-channel.js");
       const readline = await import("node:readline");
+      vi.mocked(controlChannel.openGatewayControlChannel).mockImplementationOnce(() => {
+        throw new Error("EBADF: bad file descriptor");
+      });
       try {
-        await withIsolatedSignals(async () => {
-          await createSignaledLoopHarness();
+        await withIsolatedSignals(async ({ captureSignal }) => {
+          const { exited } = await createSignaledLoopHarness();
+          const sigterm = captureSignal("SIGTERM");
           expect(readline.createInterface).not.toHaveBeenCalled();
+          // 控制通道坏了只是「优雅退出不可用」，其它关闭路径照常可用。
+          sigterm();
+          await expect(exited).resolves.toBe(0);
         });
       } finally {
-        delete process.env.OPENCLAW_STDIN_CONTROL;
+        delete process.env.OPENCLAW_CONTROL_FD;
       }
     });
   });
@@ -4001,7 +4053,7 @@ describe("runGatewayLoop", () => {
           sigterm();
           await exited;
           expect(close).toHaveBeenCalled();
-          // cleanupSignals() 与 stdinControl?.close() 对称，退出后应把 parentPort
+          // cleanupSignals() 与 controlReader?.close() 对称，退出后应把 parentPort
           // 的 message 监听一并摘掉，且必须是安装时的同一个函数引用。
           expect(fakeParentPort.removeListener).toHaveBeenCalledWith("message", installedListener);
         });

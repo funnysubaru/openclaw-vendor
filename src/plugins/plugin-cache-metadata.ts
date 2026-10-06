@@ -26,7 +26,22 @@ type CurrentPluginMetadataCacheState = {
 
 export type PluginCacheMetadata = {
   metadata: {
-    bundledPluginsDir?: { key: string; value: string | undefined };
+    // 回搬自上游 #145226（ADR-0033 任务 72 第二批）：原实现每次调用 resolveBundledPluginsDir
+    // 都要 JSON.stringify 一个 7 元组（含 import.meta.url / argv[1] / execPath / cwd 等）拼出
+    // 缓存键字符串，命中缓存时这次字符串分配 + 拼接纯属浪费——provider 策略查询会对模型目录
+    // 的每个 provider/model 都调一次这里。改成按字段逐一比较，缓存命中时零分配；只有任意一个
+    // 输入字段真的变化（如 cwd 切换、env override 改了、gateway 重启换了新 metadata owner）
+    // 时才会落到 resolveBundledPluginsDirUncached 重新计算。
+    bundledPluginsDir?: {
+      moduleUrl: string;
+      disabled: boolean;
+      resolvedOverride: string | undefined;
+      trustOverride: boolean;
+      argv1: string | undefined;
+      execPath: string;
+      cwd: string | undefined;
+      value: string | undefined;
+    };
     bundledDiscoveryMode?: { value: "compat" | "allowlist" | undefined };
     current: CurrentPluginMetadataCacheState;
     snapshots: Map<string, PluginMetadataSnapshot>;

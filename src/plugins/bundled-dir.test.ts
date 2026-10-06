@@ -535,7 +535,13 @@ describe("resolveBundledPluginsDir", () => {
     );
   });
 
-  it("does not let VITEST relax existing override trust checks", () => {
+  it("rechecks changed override trust within one cache owner", () => {
+    // 回搬自上游 #145226 配套测试:原测试只验证了单次解析结果,覆盖不到「同一个 cache owner
+    // 内,某个输入字段(这里是 OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR)变化后缓存是否真的
+    // 失效重算」这条关键路径——而这正是本次把 JSON.stringify 缓存键换成逐字段比较最容易引入
+    // 隐蔽 bug 的地方(漏比较一个字段 = 缓存假命中,返回陈旧结果)。于是改成在同一个
+    // withPluginCache owner 内连续翻转 trust 三次(false→true→false),每次都必须拿到对应的
+    // 正确结果,才能证明逐字段比较没有漏掉 trustOverride 这一项。
     const overrideRoot = makeRepoRoot("openclaw-bundled-dir-vitest-override-reject-");
     seedBundledPluginTree(overrideRoot, "extensions", "memory-core");
 
@@ -547,11 +553,22 @@ describe("resolveBundledPluginsDir", () => {
     delete process.env.OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR;
     delete process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS;
 
-    const bundledDir = requireBundledDir(resolveBundledPluginsDir());
-
-    expect(fs.realpathSync(bundledDir)).not.toBe(
-      fs.realpathSync(path.join(overrideRoot, "extensions")),
-    );
+    const expectedOverride = fs.realpathSync(path.join(overrideRoot, "extensions"));
+    withPluginCache(createPluginCache(), () => {
+      for (const trust of [false, true, false]) {
+        if (trust) {
+          process.env.OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR = "1";
+        } else {
+          delete process.env.OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR;
+        }
+        const bundledDir = fs.realpathSync(requireBundledDir(resolveBundledPluginsDir()));
+        if (trust) {
+          expect(bundledDir).toBe(expectedOverride);
+        } else {
+          expect(bundledDir).not.toBe(expectedOverride);
+        }
+      }
+    });
   });
 
   it("does not let VITEST add cwd to bundled plugin resolution candidates", () => {

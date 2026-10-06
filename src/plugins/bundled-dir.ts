@@ -285,20 +285,40 @@ function resolveBundledPluginsDirUncached(env: NodeJS.ProcessEnv): string | unde
 export function resolveBundledPluginsDir(env: NodeJS.ProcessEnv = process.env): string | undefined {
   const disabled = areBundledPluginsDisabled(env);
   const override = disabled ? undefined : env.OPENCLAW_BUNDLED_PLUGINS_DIR?.trim();
-  const key = JSON.stringify([
-    import.meta.url,
-    disabled,
-    override ? resolveUserPath(override, env) : undefined,
-    shouldTrustTestBundledPluginsDirOverride(env),
-    process.argv[1],
-    process.execPath,
-    tryProcessCwd(),
-  ]);
+  const resolvedOverride = override ? resolveUserPath(override, env) : undefined;
+  const trustOverride = shouldTrustTestBundledPluginsDirOverride(env);
+  const argv1 = process.argv[1];
+  const execPath = process.execPath;
+  const cwd = tryProcessCwd();
   const metadata = getPluginCache().metadata;
-  // Reuse the selected root, not just its filesystem facts. Management scopes and
-  // Gateway restart acquire a new owner; config activation retains this inventory.
-  if (metadata.bundledPluginsDir?.key !== key) {
-    metadata.bundledPluginsDir = { key, value: resolveBundledPluginsDirUncached(env) };
+  const cached = metadata.bundledPluginsDir;
+  // 回搬自上游 #145226：原实现每次都 JSON.stringify 整个 7 元组拼缓存键再比较字符串，
+  // 命中缓存时这次字符串分配纯属浪费（provider 策略查询对模型目录每个 provider/model 都会
+  // 调一次这里）。改成按字段逐一比较——语义不变：任何一项输入变化（cwd 切换、override 改了、
+  // gateway 重启换了新 metadata owner 等）都会落空走到下面的 resolveBundledPluginsDirUncached
+  // 重新计算；全部相同才直接返回缓存值，省掉这次分配。
+  if (
+    cached &&
+    cached.moduleUrl === import.meta.url &&
+    cached.disabled === disabled &&
+    cached.resolvedOverride === resolvedOverride &&
+    cached.trustOverride === trustOverride &&
+    cached.argv1 === argv1 &&
+    cached.execPath === execPath &&
+    cached.cwd === cwd
+  ) {
+    return cached.value;
   }
-  return metadata.bundledPluginsDir.value;
+  const value = resolveBundledPluginsDirUncached(env);
+  metadata.bundledPluginsDir = {
+    moduleUrl: import.meta.url,
+    disabled,
+    resolvedOverride,
+    trustOverride,
+    argv1,
+    execPath,
+    cwd,
+    value,
+  };
+  return value;
 }

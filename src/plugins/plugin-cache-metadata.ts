@@ -10,6 +10,7 @@ import type {
 import type { ManifestModelSuppressionResolver } from "./manifest-model-suppression.types.js";
 import type { PluginManifestRecord } from "./manifest-registry.types.js";
 import type { PluginMetadataSnapshot } from "./plugin-metadata-snapshot.types.js";
+import type { ProviderPolicyOwnerIndex } from "./provider-policy-owners.types.js";
 
 type CurrentPluginMetadataCacheState = {
   snapshot: unknown;
@@ -38,6 +39,11 @@ export type PluginCacheMetadata = {
     channelAdapters: WeakMap<PluginManifestRecord, Map<string, ManifestChannelPlugin | undefined>>;
     bundledChannelCatalogs: Map<string, BundledChannelCatalogEntry[]>;
     staticCatalogStates: WeakMap<object, WeakMap<OpenClawConfig, BundledStaticCatalogState>>;
+    // 回搬自上游 #144290/#145921/#146123/#149528/#155241/#155250（provider 策略查询性能修复，ADR-0033 任务 72/84）。
+    // registry.plugins 在同一次 Gateway 启动期间是稳定引用（loadPluginManifestRegistryCore 返回同一份
+    // gatewaySnapshot.manifestRegistry），按 registry 对象身份做一次性索引缓存，避免每次 provider 策略查询
+    // 都重新 toSorted(localeCompare) + 为每个插件重建 Set（CPU profile 实测单进程首轮约占 30 秒）。
+    providerPolicyOwners: WeakMap<object, ProviderPolicyOwnerIndex>;
     modelSuppressionResolvers: WeakMap<
       PluginMetadataSnapshot,
       {
@@ -72,6 +78,7 @@ export function createPluginCacheMetadata(): PluginCacheMetadata {
       bundledChannelCatalogs: new Map(),
       staticCatalogStates: new WeakMap(),
       modelSuppressionResolvers: new WeakMap(),
+      providerPolicyOwners: new WeakMap(),
     },
   };
 }

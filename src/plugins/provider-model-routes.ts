@@ -46,11 +46,13 @@ export function resolveProviderModelPolicySurface(
       allowScopedSnapshot: true,
       allowWorkspaceScopedSnapshot: true,
     });
-  return metadata
-    ? resolveProviderPolicySurface(provider, {
-        manifestRegistry: { plugins: [...metadata.plugins] },
-      })
-    : null;
+  // 回搬自上游 #155250（ADR-0033 任务 72/84 同一批）：原先这里每次调用都拿 metadata.plugins
+  // 重新 spread 出一份新数组、包一层新对象，导致 provider-policy-owners.ts 按对象引用做的缓存
+  // 永远不命中（每次收到的 manifestRegistry 都是全新对象，WeakMap 找不到上次建好的索引）。
+  // metadata（getCurrentPluginMetadataSnapshotRequiredRuntime 的返回值）本身就是 Gateway 运行期间
+  // 稳定不变的当前快照引用（见 plugins/CLAUDE.md「Gateway plugin metadata is stable while the
+  // Gateway running」），直接传它过去即可，不需要再包一层。
+  return metadata ? resolveProviderPolicySurface(provider, { manifestRegistry: metadata }) : null;
 }
 
 /** Binds one provider's identity facts for an authored-row lookup. */

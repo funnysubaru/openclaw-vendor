@@ -49,13 +49,25 @@ function isSourceCheckoutRoot(packageRoot: string): boolean {
   );
 }
 
+// 回搬自上游 #155250（ADR-0033 任务 72，与 provider-policy-owners.ts 同一批里当时
+// 只搬了后半段，漏了这一处）：原实现先调用两次 isVitestRuntimeEnv（各自最多访问 5 个
+// process.env 属性）判断是否处于 vitest 进程，再去看 TEST_TRUST_BUNDLED_PLUGINS_DIR_ENV
+// 是否为真——但生产环境下 TEST_TRUST 这个变量几乎永远没设置，先判断它（最多 1-2 次属性
+// 访问）就能短路掉后面两次 isVitestRuntimeEnv 调用。resolveBundledPluginsDir() 每次调用
+// 都会间接触发这里，而 resolveBundledPluginsDir 又是每次解析 provider 策略（整个模型目录
+// 的每个 provider/model 都要查一遍）都会调用的热路径——Windows 上 process.env 属性读取
+// 是走系统调用的，比 macOS/Linux 慢一个量级，20 个员工 × 全量模型目录重算时，这里的调用
+// 次数线性放大成了秒级甚至分钟级（ADR-0033 任务 72 Windows 实测：resolveProviderPolicySurface
+// 单次就能占到约 48 秒）。短路顺序不改变任何输入下的返回值，纯粹是读取次数优化。
 export function shouldTrustTestBundledPluginsDirOverride(env: NodeJS.ProcessEnv): boolean {
-  const isVitestProcess = isVitestRuntimeEnv(env) || isVitestRuntimeEnv(process.env);
-  return (
-    isVitestProcess &&
-    (isTruthyEnvValue(env[TEST_TRUST_BUNDLED_PLUGINS_DIR_ENV]) ||
-      isTruthyEnvValue(process.env[TEST_TRUST_BUNDLED_PLUGINS_DIR_ENV]))
-  );
+  const separateEnv = env !== process.env;
+  if (
+    !isTruthyEnvValue(env[TEST_TRUST_BUNDLED_PLUGINS_DIR_ENV]) &&
+    !(separateEnv && isTruthyEnvValue(process.env[TEST_TRUST_BUNDLED_PLUGINS_DIR_ENV]))
+  ) {
+    return false;
+  }
+  return isVitestRuntimeEnv(env) || (separateEnv && isVitestRuntimeEnv(process.env));
 }
 
 export function hasUsableBundledPluginTree(pluginsDir: string): boolean {

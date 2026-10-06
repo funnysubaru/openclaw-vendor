@@ -3,9 +3,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as openClawRoot from "../infra/openclaw-root.js";
+import * as testRuntimeEnvModule from "../infra/test-runtime-env.js";
 import {
   resolveBundledPluginsDir,
   resolveSourceCheckoutDependencyDiagnostic,
+  shouldTrustTestBundledPluginsDirOverride,
 } from "./bundled-dir.js";
 import { createPluginCache, withPluginCache } from "./plugin-cache.js";
 import { cleanupTrackedTempDirs, makeTrackedTempDir } from "./test-helpers/fs-fixtures.js";
@@ -197,6 +199,58 @@ afterEach(() => {
   process.execArgv.length = 0;
   process.execArgv.push(...originalExecArgv);
   cleanupTrackedTempDirs(tempDirs);
+});
+
+describe("shouldTrustTestBundledPluginsDirOverride", () => {
+  // ADR-0033 任务 72（Windows 实测证据，回搬自上游 #155250）：热路径里这个函数每次调用都要
+  // 判断是否处于 vitest 进程。生产环境下 OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR 几乎永远
+  // 不设置，先判它能短路掉代价更高的 isVitestRuntimeEnv 调用（process.env 属性读取在
+  // Windows 上是系统调用，比 POSIX 慢一个量级）。
+  //
+  // 矩阵测试用 mock 直接控制 isVitestRuntimeEnv 的返回值而不是摆弄真实
+  // process.env.VITEST——因为测试本身就跑在 vitest worker 里，process.env 上
+  // VITEST_POOL_ID / VITEST_WORKER_ID / NODE_ENV=test 这些字段天然为真，摆弄
+  // VITEST 单个字段测不出「非 vitest 环境」这一分支（isVitestRuntimeEnv 还会兜底
+  // 检查真实 process.env，必然命中）。mock 掉之后才能独立控制两个输入维度。
+  it.each([
+    [false, undefined, false],
+    [false, "1", false],
+    [true, undefined, false],
+    [true, "1", true],
+    [true, "true", true],
+    [true, "0", false],
+  ] as const)(
+    "returns %s when isVitestRuntimeEnv()=%s and trust-env=%j",
+    (isVitestMocked, trustEnvValue, expected) => {
+      vi.spyOn(testRuntimeEnvModule, "isVitestRuntimeEnv").mockReturnValue(isVitestMocked);
+      const env: NodeJS.ProcessEnv =
+        trustEnvValue === undefined
+          ? {}
+          : { OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR: trustEnvValue };
+      // 行为等价性断言：短路顺序重排不改变任何输入组合下的返回值。
+      expect(shouldTrustTestBundledPluginsDirOverride(env)).toBe(expected);
+    },
+  );
+
+  it("short-circuits without calling isVitestRuntimeEnv when the trust-override env var is unset (production shape)", () => {
+    const spy = vi.spyOn(testRuntimeEnvModule, "isVitestRuntimeEnv");
+    // 不带 OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR 的独立 env 对象——这是生产环境
+    // 每次调用 resolveBundledPluginsDir() 时的真实形状。
+    const result = shouldTrustTestBundledPluginsDirOverride({});
+    expect(result).toBe(false);
+    // 核心断言：修复前这里会无条件调用两次 isVitestRuntimeEnv（各自最多访问 5 个
+    // process.env 属性）。修复后短路在那之前，调用次数应为 0。还原旧实现（先判
+    // isVitestProcess 再判 trust）此断言会变红，证明测的是这次改动本身。
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("still calls isVitestRuntimeEnv when the trust-override env var is set", () => {
+    const spy = vi.spyOn(testRuntimeEnvModule, "isVitestRuntimeEnv");
+    shouldTrustTestBundledPluginsDirOverride({
+      OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR: "1",
+    });
+    expect(spy).toHaveBeenCalled();
+  });
 });
 
 describe("resolveBundledPluginsDir", () => {

@@ -1,6 +1,6 @@
 // Startup-only recovery; this module cannot depend on dist or installed packages.
 import { spawn, spawnSync } from "node:child_process";
-import { lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { fstatSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -69,10 +69,73 @@ const respawnSignalExitGraceMs = 1_000;
 const respawnSignalForceKillGraceMs = 1_000;
 const respawnSignalHardExitGraceMs = 1_000;
 
+// Yuiclaw：Windows 优雅关闭控制通道（OPENCLAW_CONTROL_FD）在启动器层的转传。
+// Yuiclaw 在 Windows 上把「优雅退出暗号」走一根额外的 fd 3 管道（stdin 改 ignore，见
+// src/process/gateway-control-channel.ts）。openclaw.mjs 这一层在源码目录（关编译缓存）和正式包
+// （换编译缓存目录）两种情况下都会先自我重启一次再进 gateway，走的就是下面的 runRespawnedChild。
+// 原来写死 stdio:"inherit" 只转 0-2，fd 3 在里层是空位，随后被 gateway 自己打开的普通文件占掉，
+// run-loop 装控制通道时报「Unsupported fd type: FILE」，暗号送不到、关窗口只能 taskkill 强杀。
+// 本模块不能依赖 dist（见文件头），所以「解析控制 fd / 拼自我重启 stdio」的唯一实现放在这里；
+// src/ 里的 respawn-child-runner.ts、gateway-control-channel.ts（run-loop 用）反过来 import 本文件，
+// 与 src 引用 node-sqlite.mjs / node-version.mjs 同一做法，避免两份实现各改各的。
+export const GATEWAY_CONTROL_FD_ENV = "OPENCLAW_CONTROL_FD";
+
+/**
+ * 解析 OPENCLAW_CONTROL_FD。只接受 ≥3 的十进制整数：0-2 是标准流，拿它们当控制通道等于
+ * 回到 stdin 方案的老问题；其它非法值（空串、负数、小数、"abc"）一律视为未开启，返回 undefined。
+ */
+export const parseGatewayControlFd = (raw) => {
+  if (raw === undefined) {
+    return undefined;
+  }
+  const trimmed = String(raw).trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return undefined;
+  }
+  const fd = Number(trimmed);
+  return Number.isSafeInteger(fd) && fd >= 3 ? fd : undefined;
+};
+
+const isLauncherFdOpen = (fd) => {
+  try {
+    fstatSync(fd);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * 启动器自我重启时用的 stdio + env：
+ *   - 未带 OPENCLAW_CONTROL_FD → 与改造前完全一致（stdio:"inherit"、env 原样），对上游零影响；
+ *   - 值合法（≥3 的十进制整数）且本进程手上这个 fd 是开着的 → 0-2 inherit，控制 fd 原样转到里层
+ *     同一个 fd 号（中间空位填 ignore）；
+ *   - 值非法或 fd 没开 → 保持 "inherit"，并从里层 env 删掉该变量，免得里层去打开不相干的 fd。
+ *     拿不到控制通道只是优雅退出不可用（父进程会落到强杀兜底），绝不能因此让 gateway 起不来。
+ */
+export const resolveLauncherRespawnStdio = (env, fdIsOpen = isLauncherFdOpen) => {
+  const raw = env[GATEWAY_CONTROL_FD_ENV];
+  if (raw === undefined) {
+    return { stdio: "inherit", env };
+  }
+  const fd = parseGatewayControlFd(raw);
+  if (fd === undefined || !fdIsOpen(fd)) {
+    const { [GATEWAY_CONTROL_FD_ENV]: _dropped, ...rest } = env;
+    return { stdio: "inherit", env: rest };
+  }
+  const stdio = ["inherit", "inherit", "inherit"];
+  while (stdio.length < fd) {
+    stdio.push("ignore");
+  }
+  stdio.push(fd);
+  return { stdio, env };
+};
+
 export const runRespawnedChild = (command, args, env) => {
+  const spawnIo = resolveLauncherRespawnStdio(env);
   const child = spawn(command, args, {
-    stdio: "inherit",
-    env,
+    stdio: spawnIo.stdio,
+    env: spawnIo.env,
   });
   const listeners = new Map();
   // Keep signal forwarding and bounded shutdown in sync with src/entry.compile-cache.ts.

@@ -216,6 +216,21 @@ describe("prepared binary availability", () => {
     expect((await prepareBinaryAvailability([bin])).hasBinary(bin)).toBe(true);
     expect(hasBinary(bin)).toBe(true);
   });
+
+  // Yuiclaw：缺失程序要扫「PATH 目录数 × PATHEXT 后缀数」个候选。时效检查（读 PATH / PATHEXT / cwd）
+  // 只应按程序做、不应按候选做——Windows 上读环境变量是系统调用，按候选做会被放大成秒级。
+  it("checks PATH freshness per binary instead of per candidate path", async () => {
+    const root = tempDirs.make("openclaw-prepared-freshness-");
+    const dirs = Array.from({ length: 30 }, (_, index) => path.join(root, `missing-${index}`));
+    vi.stubEnv("PATH", dirs.join(path.delimiter));
+    const cwd = vi.spyOn(process, "cwd");
+    const facts = await prepareBinaryAvailability(["fixture-missing-a", "fixture-missing-b"]);
+    expect(facts.hasBinary("fixture-missing-a")).toBe(false);
+    expect(facts.hasBinary("fixture-missing-b")).toBe(false);
+    // 30 个目录 × 2 个程序至少 60 个候选；按程序检查只需起始 1 次 + 每个 worker 取程序时各几次。
+    expect(cwd.mock.calls.length).toBeLessThan(20);
+    cwd.mockRestore();
+  });
 });
 
 describe("runtime requirements through eligibility", () => {

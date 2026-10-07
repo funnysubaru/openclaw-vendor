@@ -233,7 +233,13 @@ export async function prepareBinaryAvailability(
       return;
     }
     for (const candidate of binaryCandidates(search, bin)) {
-      if (failure || !isCurrent()) {
+      // Yuiclaw：这里原先每个候选路径都调一次 isCurrent()（读 PATH / PATHEXT 环境变量 + cwd）。
+      // Windows 上 process.env 读取是系统调用，缺失程序要扫「PATH 目录数 × PATHEXT 后缀数」个候选
+      // （实测 47 × 12 = 564），20 个员工每次重算都要扫，CPU profile 里 isCurrent 自身占约 5 秒。
+      // 改为只在 worker 取下一个程序前检查一次（见下方 worker 循环）：PATH 若在扫某个程序途中变了，
+      // 最多把这一个程序剩下的候选白扫完；命中时下面仍会再判一次 isCurrent() 才记结果，
+      // 调用方也会用返回的 isCurrent() 发现过期并整轮重来，所以不会用到旧 PATH 的结论。
+      if (failure) {
         return;
       }
       assertCurrent?.();

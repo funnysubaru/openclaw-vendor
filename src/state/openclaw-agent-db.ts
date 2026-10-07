@@ -213,6 +213,26 @@ export async function withOpenClawAgentDatabaseAsync<T>(
   return withOpenClawAgentDatabaseAsyncAfterOpenAdmission(options, operation, assertCurrent);
 }
 
+/**
+ * ADR-0033 任务84(c) 续：内部专用绕过入口，跳过上面那层 waitForAgentStartupAdmission
+ * 等待检查，直接走 "打开已经承认" 之后的那条路径。
+ *
+ * 唯一合法用途——`scheduleAgentStartupAdmission` 调度出的 openAgent/migrateAgent
+ * 回调内部、处理"正是自己负责准入的那个 agentId"：那段代码正跑在
+ * `pendingByAgentId` 还没删除这个 agentId 的窗口期里，如果它对同一个 agentId
+ * 调用上面的 `withOpenClawAgentDatabaseAsync`，会拿到自己正在等的那个 work
+ * promise，变成自己等自己的死锁（work 要等 openAgent/migrateAgent 跑完才 settle，
+ * 而 openAgent/migrateAgent 现在卡在等 work settle）。
+ *
+ * 不能被其它路径调用：CLI doctor、非 "gateway-startup" 的调用方从来不会被
+ * scheduleAgentStartupAdmission 接管 agentId，对它们而言走正常的
+ * withOpenClawAgentDatabaseAsync（会等待检查）才是正确行为——用这个绕过入口会让它们
+ * 在"后台准入还没完成"时抢先摸到数据库，绕开本该等待的完整性扫描顺序。只在
+ * config/sessions/startup-migration.ts 里"调度器自己回调"那几处用。
+ */
+export const withOpenClawAgentDatabaseAsyncSkippingStartupAdmissionWait =
+  withOpenClawAgentDatabaseAsyncAfterOpenAdmission;
+
 function* openOpenClawAgentDatabaseSteps(
   options: OpenClawAgentDatabaseOptions,
   pending?: PendingAgentDatabaseOpen,

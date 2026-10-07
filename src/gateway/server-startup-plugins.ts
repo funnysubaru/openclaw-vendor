@@ -77,9 +77,15 @@ export async function runGatewayStartupMaintenance(params: {
       }),
     ];
     if (!params.minimalTestGateway) {
-      const { runStartupSessionMigration } = await import("./server-startup-session-migration.js");
+      // ADR-0033 任务84(c)：改用非阻塞版本——这个 promise 只代表"后台准入调度已经
+      // 登记完成"，不代表每个员工库的迁移+移交都跑完了，所以放进 startupTasks 一起
+      // await 不会把 HTTP 监听拖慢到等所有员工库检查完；真正的逐员工 open+migrate
+      // 在 scheduleAgentStartupAdmission 的后台继续跑，请求路径会在
+      // withOpenClawAgentDatabaseAsync 里透明地等到对应员工准入完成。
+      const { scheduleBackgroundStartupSessionMigration } =
+        await import("./server-startup-session-migration.js");
       startupTasks.push(
-        runStartupSessionMigration({
+        scheduleBackgroundStartupSessionMigration({
           cfg: params.cfgAtStart,
           env: process.env,
           log: params.log,

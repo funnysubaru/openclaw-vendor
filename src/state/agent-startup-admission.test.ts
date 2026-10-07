@@ -176,4 +176,80 @@ describe("agent-startup-admission", () => {
 
     expect(waitForAgentStartupAdmission("x")).toBeUndefined();
   });
+
+  // ADR-0033 任务84(c)：gateway 支持不退出进程的热 restart（"gateway-restart" 独立于
+  // "gateway-startup"），本模块是模块级全局单例，cancelAgentStartupAdmission 收尾后
+  // 必须顺带清空 failedByAgentId——否则上一轮真的失败过的 agentId 会被
+  // scheduleAgentStartupAdmission 的 dedup 判据永久跳过，下一轮启动永远不会重试，
+  // waitForAgentStartupAdmission 对它也永远 reject 同一个陈旧原因。
+  it("cancelAgentStartupAdmission 收尾后清空失败记录，下一轮 restart 能重新调度同一个 agentId", async () => {
+    scheduleAgentStartupAdmission({
+      agentIds: ["flaky"],
+      openAgent: async () => {
+        throw new Error("transient disk error on first boot");
+      },
+      migrateAgent: async () => {},
+    });
+    await expect(waitForAgentStartupAdmission("flaky")).rejects.toThrow(
+      "transient disk error on first boot",
+    );
+
+    await cancelAgentStartupAdmission();
+
+    // 清空之后，这个 agentId 不再被 dedup 挡住——下一轮 restart 的
+    // scheduleAgentStartupAdmission 能把它重新排进去，而不是永远背着上一轮的旧错误。
+    let reopened = false;
+    scheduleAgentStartupAdmission({
+      agentIds: ["flaky"],
+      openAgent: async () => {
+        reopened = true;
+      },
+      migrateAgent: async () => {},
+    });
+    await waitForAgentStartupAdmission("flaky");
+    expect(reopened).toBe(true);
+  });
+
+  // 死锁回归：openclaw-agent-db.ts 的 withOpenClawAgentDatabaseAsync 第一步就是调
+  // waitForAgentStartupAdmission(options.agentId) 并 await 它拿到的 pending；如果
+  // 调度出的 openAgent/migrateAgent 回调内部对"自己正在处理的那个 agentId"走这同一
+  // 步骤（而不是 withOpenClawAgentDatabaseAsyncSkippingStartupAdmissionWait 绕过
+  // 入口），waitForAgentStartupAdmission 返回的正是自己这个 work 本身——等于自己等
+  // 自己，不靠外部事件永远不会 resolve。
+  //
+  // 这条测试直接用 waitForAgentStartupAdmission（而不是真去调
+  // withOpenClawAgentDatabaseAsync）复现这个核心机制，避免真的触发 sqlite 文件 I/O
+  // ——一旦 migrateAgent 自己通过 race 的超时分支返回，work 会 settle，那时如果换了
+  // 真实的 withOpenClawAgentDatabaseAsync，它遗留的那个"还在等 pending"的调用会在
+  // work settle 后继续往下跑到真正开库那一步，在测试环境里没有意义地碰真实
+  // sqlite 路径；用纯函数 waitForAgentStartupAdmission 复现同一条件，遗留的
+  // `.then()` 延续只是个无副作用的空操作，不会有这个问题。
+  //
+  // 用一个短超时的 Promise.race 把"不靠外部事件永远不会 resolve"变成可在几十毫秒内
+  // 判定的结果，而不是真的把测试进程挂死：换成
+  // withOpenClawAgentDatabaseAsyncSkippingStartupAdmissionWait 的等价绕过逻辑（直接
+  // 跳过 waitForAgentStartupAdmission 这一步）的话，这条测试会从"判定为死锁"反转成
+  // "立刻判定为已解除"，从而变红——证明测试确实在断言正确的那一端。
+  it("调度回调内部如果对同一个 agentId 走等待检查这一步会自己等自己（死锁回归）", async () => {
+    let outcome: "deadlocked" | "resolved" | undefined;
+    scheduleAgentStartupAdmission({
+      agentIds: ["self-wait"],
+      openAgent: async () => {},
+      migrateAgent: async (agentId) => {
+        // 等价于 withOpenClawAgentDatabaseAsync 真正会执行的第一步：此刻
+        // pendingByAgentId 里挂着的正是自己这个 work。
+        const pending = waitForAgentStartupAdmission(agentId);
+        const result = await Promise.race([
+          (pending ?? Promise.resolve()).then(() => "resolved" as const),
+          new Promise<"deadlocked">((resolve) => {
+            setTimeout(() => resolve("deadlocked"), 50);
+          }),
+        ]);
+        outcome = result;
+      },
+    });
+
+    await waitForAgentStartupAdmission("self-wait");
+    expect(outcome).toBe("deadlocked");
+  });
 });

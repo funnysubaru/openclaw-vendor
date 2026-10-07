@@ -115,7 +115,9 @@ const runChannelPluginStartupMaintenance = vi.hoisted(() =>
 const listAmbientOnlyConfiguredChannelIds = vi.hoisted(() =>
   vi.fn((_params: unknown) => [] as string[]),
 );
-const runStartupSessionMigration = vi.hoisted(() => vi.fn(async (_params: unknown) => undefined));
+const scheduleBackgroundStartupSessionMigration = vi.hoisted(() =>
+  vi.fn(async (_params: unknown) => undefined),
+);
 const migrateLegacyDevicePairingStore = vi.hoisted(() =>
   vi.fn(async (_params: unknown) => undefined),
 );
@@ -184,7 +186,8 @@ vi.mock("./server-plugin-bootstrap.js", () => ({
 }));
 
 vi.mock("./server-startup-session-migration.js", () => ({
-  runStartupSessionMigration: (params: unknown) => runStartupSessionMigration(params),
+  scheduleBackgroundStartupSessionMigration: (params: unknown) =>
+    scheduleBackgroundStartupSessionMigration(params),
 }));
 
 function createLog() {
@@ -234,7 +237,7 @@ async function prepareBootstrapWithRuntimeConfig(
 describe("runGatewayStartupMaintenance", () => {
   beforeEach(() => {
     runChannelPluginStartupMaintenance.mockClear();
-    runStartupSessionMigration.mockClear();
+    scheduleBackgroundStartupSessionMigration.mockClear();
     migrateLegacyDevicePairingStore.mockClear();
     migrateLegacyNodePairingStore.mockClear();
   });
@@ -255,7 +258,7 @@ describe("runGatewayStartupMaintenance", () => {
       env: process.env,
       log,
     });
-    expect(runStartupSessionMigration).toHaveBeenCalledWith({
+    expect(scheduleBackgroundStartupSessionMigration).toHaveBeenCalledWith({
       cfg: {},
       env: process.env,
       log,
@@ -280,7 +283,7 @@ describe("runGatewayStartupMaintenance", () => {
     });
 
     expect(runChannelPluginStartupMaintenance).not.toHaveBeenCalled();
-    expect(runStartupSessionMigration).not.toHaveBeenCalled();
+    expect(scheduleBackgroundStartupSessionMigration).not.toHaveBeenCalled();
     expect(migrateLegacyDevicePairingStore).not.toHaveBeenCalled();
     expect(migrateLegacyNodePairingStore).not.toHaveBeenCalled();
   });
@@ -302,7 +305,7 @@ describe("runGatewayStartupMaintenance", () => {
       env: process.env,
       log,
     });
-    expect(runStartupSessionMigration).not.toHaveBeenCalled();
+    expect(scheduleBackgroundStartupSessionMigration).not.toHaveBeenCalled();
     expect(migrateLegacyDevicePairingStore).not.toHaveBeenCalled();
     expect(migrateLegacyNodePairingStore).not.toHaveBeenCalled();
   });
@@ -327,7 +330,7 @@ describe("prepareGatewayPluginBootstrap startup plugins", () => {
     });
     resolveOpenClawPackageRootSync.mockClear().mockReturnValue("/package");
     runChannelPluginStartupMaintenance.mockClear();
-    runStartupSessionMigration.mockClear();
+    scheduleBackgroundStartupSessionMigration.mockClear();
     migrateLegacyDevicePairingStore.mockClear();
     migrateLegacyNodePairingStore.mockClear();
   });
@@ -335,7 +338,7 @@ describe("prepareGatewayPluginBootstrap startup plugins", () => {
     await prepareBootstrapWithRuntimeConfig({});
 
     expect(runChannelPluginStartupMaintenance).not.toHaveBeenCalled();
-    expect(runStartupSessionMigration).not.toHaveBeenCalled();
+    expect(scheduleBackgroundStartupSessionMigration).not.toHaveBeenCalled();
     expect(migrateLegacyDevicePairingStore).not.toHaveBeenCalled();
     expect(migrateLegacyNodePairingStore).not.toHaveBeenCalled();
   });

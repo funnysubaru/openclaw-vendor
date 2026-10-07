@@ -118,20 +118,44 @@ export function waitForAgentStartupAdmission(agentId: string): Promise<void> | u
   return pendingByAgentId.get(normalized);
 }
 
-/** 关闭时取消还没跑完的后台准入，并等它们真正收尾（对齐上游 shutdown 语义）。 */
+/**
+ * 关闭时取消还没跑完的后台准入，并等它们真正收尾（对齐上游 shutdown 语义）。
+ *
+ * 收尾后顺带清空 pendingByAgentId / failedByAgentId：gateway 支持不退出进程的热
+ * restart（"gateway-restart" 是独立于 "gateway-startup" 的操作），本模块的状态是
+ * 模块级全局单例，如果不清，下一轮 scheduleAgentStartupAdmission 会被两处坑中：
+ * ①某 agentId 上一轮已经成功过，pendingByAgentId 里早被删了，不清 failedByAgentId
+ * 没问题，但调度器的 dedup 判据是"pendingByAgentId.has || failedByAgentId.has"，
+ * 成功过的 agentId 两边都不在，下一轮会被重新调度一次——不算错但浪费；②更严重的是
+ * 上一轮如果真的失败过，failedByAgentId 永久记着那个旧错误，下一轮同一个 agentId
+ * 会被 dedup 直接跳过、永远不会重新尝试，waitForAgentStartupAdmission 对它则永远
+ * reject 同一个陈旧原因。清空之后下一轮 scheduleAgentStartupAdmission 拿到的是
+ * 干净状态，等价于重新评估一遍。
+ */
 export async function cancelAgentStartupAdmission(): Promise<void> {
   controller?.abort(new Error("Gateway stopped during agent database startup admission"));
   while (tracked.size > 0) {
     await Promise.allSettled(tracked);
   }
+  clearAgentStartupAdmissionState();
 }
 
-/** 测试专用：清空全局单例状态，不走 AsyncLocalStorage 的理由见文件顶部注释。 */
-export function resetAgentStartupAdmissionForTest(): void {
+/** 真正做清空的内部实现，cancelAgentStartupAdmission 与测试专用 reset 共用。 */
+function clearAgentStartupAdmissionState(): void {
   controller = undefined;
   opening = createPermitPool(AGENT_STARTUP_OPEN_CONCURRENCY);
   migrating = createPermitPool(AGENT_STARTUP_MIGRATE_CONCURRENCY);
   pendingByAgentId.clear();
   failedByAgentId.clear();
   tracked.clear();
+}
+
+/**
+ * 测试专用：清空全局单例状态，不走 AsyncLocalStorage 的理由见文件顶部注释。跟
+ * cancelAgentStartupAdmission 不同的是这里不 abort、不等收尾——测试场景里通常
+ * 没有真正跑着的后台任务要等，直接清空状态即可，避免测试每次都要走一次
+ * Promise.allSettled 的异步等待。
+ */
+export function resetAgentStartupAdmissionForTest(): void {
+  clearAgentStartupAdmissionState();
 }

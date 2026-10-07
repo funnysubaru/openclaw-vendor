@@ -39,6 +39,11 @@ type SkillsPathWatchState = {
   watcher: FSWatcher;
   watchRoot: string;
   depth: number;
+  // 任务72:一个 workspace 常挂多个 skill root,旧实现里每个 root 的首次
+  // ready 都各自独立广播一次(哪怕内容没变),N 个 root 就是 N 次全量
+  // chat-metadata 重建。initialScan 把同一 workspace 名下全部 target 的
+  // 首次扫描状态汇总,等全部 settle(ready/error)了才统一发一次。
+  initialScan: "pending" | "ready" | "error";
   timer?: ReturnType<typeof setTimeout>;
   pendingPath?: string;
   readonly subscribers: Set<string>;
@@ -503,7 +508,41 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
     watcher,
     watchRoot: target.watchRoot,
     depth: target.depth,
+    initialScan: "pending",
     subscribers: new Set<string>(),
+  };
+
+  const publishChange = (watcherKey: string, changedPath?: string) => {
+    workspaceWatchTargetCache.delete(watcherKey);
+    bumpSkillsSnapshotVersion({
+      workspaceDir: workspaceWatchOwnerDirs.get(watcherKey) ?? watcherKey,
+      reason: "watch",
+      changedPath,
+    });
+  };
+
+  // 只有某个 subscriber 的全部 target 都结算完(ready/error)才发一次;
+  // state 被新 watcher 取代或已 closed 时放弃,避免对作废的 watcher 发布。
+  const settleInitialScan = (result: "ready" | "error") => {
+    if (
+      watcher.closed ||
+      pathWatchers.get(target.path) !== state ||
+      state.initialScan === "ready" ||
+      state.initialScan === result
+    ) {
+      return;
+    }
+    state.initialScan = result;
+    for (const watcherKey of state.subscribers) {
+      const targets = workspaceWatchTargets.get(watcherKey);
+      const allSettled = targets?.every((entry) => {
+        const current = pathWatchers.get(entry.path);
+        return current && !current.watcher.closed && current.initialScan !== "pending";
+      });
+      if (allSettled) {
+        publishChange(watcherKey);
+      }
+    }
   };
 
   const schedule = (changedPath?: string) => {
@@ -520,12 +559,7 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
       // Fan the change out to every workspace subscribed to this directory so a
       // shared skill root refreshes the snapshot for all agents that use it.
       for (const watcherKey of state.subscribers) {
-        workspaceWatchTargetCache.delete(watcherKey);
-        bumpSkillsSnapshotVersion({
-          workspaceDir: workspaceWatchOwnerDirs.get(watcherKey) ?? watcherKey,
-          reason: "watch",
-          changedPath: pendingPath,
-        });
+        publishChange(watcherKey, pendingPath);
       }
     }, SKILLS_WATCH_DEBOUNCE_MS);
   };
@@ -538,8 +572,9 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
   };
 
   // ignoreInitial suppresses writes discovered before native watches are ready.
-  // Reconcile snapshots read during that gap once the initial scan completes.
-  watcher.on("ready", () => schedule());
+  // 不再让每个 root 的 ready 各自广播;汇总到 settleInitialScan,对齐上游
+  // PR #146480 的思路(按本仓结构重写,非逐行搬运)。
+  watcher.on("ready", () => settleInitialScan("ready"));
   watcher.on("all", (_event, changedPath) => {
     if (isPathInside(target.path, changedPath) || isPathInside(changedPath, target.path)) {
       schedule(changedPath);
@@ -584,6 +619,9 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
       return;
     }
     log.warn(`skills watcher error (${target.path}): ${String(err)}`);
+    // 一个 root 扫描失败不该让同一 workspace 的其它健康 root 永远等不到
+    // 结算——用 "error" 结算这个 target,其余 target 该怎么判还怎么判。
+    settleInitialScan("error");
   });
 
   return state;
@@ -778,3 +816,4 @@ if (process.env.VITEST || process.env.NODE_ENV === "test") {
     resetSkillsRefreshForTest: () => closeSkillsWatchers(true),
   };
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

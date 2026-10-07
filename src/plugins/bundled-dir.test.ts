@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as openClawRoot from "../infra/openclaw-root.js";
 import * as testRuntimeEnvModule from "../infra/test-runtime-env.js";
 import {
+  areBundledPluginsDisabled,
   resolveBundledPluginsDir,
   resolveSourceCheckoutDependencyDiagnostic,
   shouldTrustTestBundledPluginsDirOverride,
@@ -744,5 +745,37 @@ describe("resolveBundledPluginsDir", () => {
     },
   ] as const)("$name", ({ createScenario }) => {
     expectInstalledBundledDirScenarioCase(createScenario);
+  });
+});
+
+// ADR-0033 任务72第二批：areBundledPluginsDisabled 原来每次调用都要重新
+// normalizeOptionalLowercaseString 一次——单次很便宜，但被按"员工 × 模型"反复调用的
+// resolveBundledPluginsDir/createResolutionKey 链路放大成秒级(真实数据 CPU profile self time
+// 3.4 秒)。加了一个按原始输入值做 size-1 记忆化。这里直接验证记忆化本身的正确性：同值复用、
+// 变了立刻重算，覆盖"从 true 变回 false"和"从有值变成 undefined"两个方向，不只测"调用一次
+// 不报错"。
+describe("areBundledPluginsDisabled", () => {
+  afterEach(() => {
+    delete process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS;
+  });
+
+  it("keeps returning true for repeated identical truthy values", () => {
+    expect(areBundledPluginsDisabled({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" })).toBe(true);
+    expect(areBundledPluginsDisabled({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" })).toBe(true);
+    expect(areBundledPluginsDisabled({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "true" })).toBe(true);
+  });
+
+  it("flips back to false immediately after the env value changes", () => {
+    expect(areBundledPluginsDisabled({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" })).toBe(true);
+    expect(areBundledPluginsDisabled({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "0" })).toBe(false);
+    expect(areBundledPluginsDisabled({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" })).toBe(true);
+  });
+
+  it("treats a missing env var the same across repeated calls and after a truthy value clears", () => {
+    expect(areBundledPluginsDisabled({})).toBe(false);
+    expect(areBundledPluginsDisabled({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "true" })).toBe(true);
+    // 从「有值」变回「undefined」也必须被当成输入变化重新计算，不能因为上一次缓存的是
+    // 字符串 "true" 而把这次的 undefined 误判成"没变"。
+    expect(areBundledPluginsDisabled({})).toBe(false);
   });
 });

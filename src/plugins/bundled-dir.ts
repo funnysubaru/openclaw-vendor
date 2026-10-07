@@ -27,10 +27,32 @@ type SourceCheckoutDependencyDiagnostic = {
   message: string;
 };
 
+// ADR-0033 任务72第二批（已查上游 src/plugins/bundled-dir.ts 当前实现：逐字节同构，没有缓存，
+// 这里不是搬上游、是自己加的等价最小修复）。真实数据二轮复测 CPU profile 里这个函数 self time
+// 3.4 秒——它只读一个环境变量再做一次字符串规整比较，单次调用很便宜，但被
+// resolveBundledPluginsDir / createResolutionKey 等按"员工 × 模型"的笛卡尔积反复调用（本批同一个
+// PR 的 resolveDirectBundledProviderPolicySurface 结构性缓存已经把这条调用链的调用次数砍到约等于
+// "distinct provider 数量"，这里再加一层是双保险，覆盖那条结构性缓存覆盖不到的其它调用点，比如
+// public-surface-loader.ts 的 createResolutionKey 自己也会直接调用它）。按原始输入字符串做 size-1
+// 记忆化：只读 env.OPENCLAW_DISABLE_BUNDLED_PLUGINS 这一个属性，结果只取决于这一个值，跟是从哪个
+// env 对象读到的无关，所以按值而不是按 env 对象身份做缓存是安全的——这个值在一次进程生命周期内
+// 几乎不变，变了字符串就不相等，直接重算，没有任何假命中风险。
+let lastAreBundledPluginsDisabledInput: string | undefined;
+let lastAreBundledPluginsDisabledOutput = false;
+let lastAreBundledPluginsDisabledInputSeen = false;
+
 /** Returns true when env disables bundled plugin discovery. */
 export function areBundledPluginsDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = normalizeOptionalLowercaseString(env.OPENCLAW_DISABLE_BUNDLED_PLUGINS);
-  return raw === "1" || raw === "true";
+  const input = env.OPENCLAW_DISABLE_BUNDLED_PLUGINS;
+  if (lastAreBundledPluginsDisabledInputSeen && input === lastAreBundledPluginsDisabledInput) {
+    return lastAreBundledPluginsDisabledOutput;
+  }
+  const raw = normalizeOptionalLowercaseString(input);
+  const result = raw === "1" || raw === "true";
+  lastAreBundledPluginsDisabledInput = input;
+  lastAreBundledPluginsDisabledOutput = result;
+  lastAreBundledPluginsDisabledInputSeen = true;
+  return result;
 }
 
 function resolveDisabledBundledPluginsDir(): string {

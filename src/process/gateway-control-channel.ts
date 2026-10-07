@@ -11,26 +11,21 @@
 // 额外管道（stdio 第 4 项，即 fd 3）专门传暗号，并通过 OPENCLAW_CONTROL_FD 告诉 gateway 是哪个
 // fd。gateway 派生子进程时 stdio 只列 0-2，这根管道不会作为子进程的标准流传下去。
 //
-// 唯一要「刻意传下去」的地方是 openclaw.mjs 的自我重启外壳（respawn-child-runner.ts）：外壳
-// 用 stdio:"inherit" 拉起真正跑 gateway 的里层进程，"inherit" 只传 0-2，不转传的话里层的 fd 3
-// 是个不相干的句柄（2026-10-06 Windows 真机实测里层报 "Unsupported fd type: FILE"）。
-import fs from "node:fs";
+// 兼容旧版 Yuiclaw：vendor 可以独立热更新，旧启动器只设 OPENCLAW_STDIN_CONTROL=1 并往 stdin
+// 写暗号。没给 OPENCLAW_CONTROL_FD 时 run-loop 仍按旧协议读 stdin（同一个监听函数，见下方）。
+//
+// 唯一要「刻意传下去」的地方是自我重启外壳：外壳用 stdio:"inherit" 拉起真正跑 gateway 的里层
+// 进程，"inherit" 只传 0-2，不转传的话里层的 fd 3 是个不相干的句柄（2026-10-06 Windows 真机
+// 实测里层报 "Unsupported fd type: FILE"）。解析 fd / 拼转传 stdio 的唯一实现在根目录
+// node-runtime-recovery.mjs（openclaw.mjs 启动器层不能依赖 dist，只能放那里），这里转出给 src 用。
 import net from "node:net";
-import type { StdioOptions } from "node:child_process";
+import { createInterface } from "node:readline";
 
-export const GATEWAY_CONTROL_FD_ENV = "OPENCLAW_CONTROL_FD";
-
-/**
- * 解析 OPENCLAW_CONTROL_FD。只接受 ≥3 的十进制整数：0-2 是标准流，拿它们当控制通道等于
- * 回到 stdin 方案的老问题；其它非法值（空串、负数、小数、"abc"）一律视为未开启，返回 undefined。
- */
-export function parseGatewayControlFd(raw: string | undefined): number | undefined {
-  if (raw === undefined || !/^\d+$/.test(raw.trim())) {
-    return undefined;
-  }
-  const fd = Number(raw.trim());
-  return Number.isSafeInteger(fd) && fd >= 3 ? fd : undefined;
-}
+export {
+  GATEWAY_CONTROL_FD_ENV,
+  parseGatewayControlFd,
+  resolveLauncherRespawnStdio as resolveRespawnStdioWithControlFd,
+} from "../../node-runtime-recovery.mjs";
 
 /**
  * 把父进程传下来的控制管道包成只读 socket。Windows / Unix 上 Node 都支持用 fd 打开继承来的
@@ -41,41 +36,63 @@ export function openGatewayControlChannel(fd: number): net.Socket {
   return new net.Socket({ fd, readable: true, writable: false });
 }
 
-function isFdOpen(fd: number): boolean {
-  try {
-    fs.fstatSync(fd);
-    return true;
-  } catch {
-    return false;
-  }
-}
+type ControlInput = NodeJS.ReadableStream & {
+  unref?: () => void;
+  destroy?: () => void;
+};
 
 /**
- * 自我重启外壳拉起里层进程时用的 stdio + env：
- *   - env 里带了合法的控制 fd、且外壳自己手上这个 fd 确实是开着的 → 0-2 照旧 inherit，并把
- *     控制 fd 原样转传到里层同一个 fd 号（中间空位填 ignore），里层 run-loop 才收得到暗号；
- *   - 否则（没开控制通道 / 值非法 / 外壳手上没有这个 fd）→ 保持原来的 "inherit"，并从里层 env
- *     删掉 OPENCLAW_CONTROL_FD，免得里层去打开一个不相干的 fd。拿不到控制通道只意味着优雅退出
- *     不可用，父进程会落到强杀兜底；绝不能因为转传失败让 gateway 起不来。
- * 不带控制 fd 时返回值与改造前完全一致（stdio:"inherit"、env 原样），对上游运行方式零影响。
+ * 在一条输入流上按行等关闭暗号，控制管道与旧 stdin 通道共用。
+ *
+ * 错误要在两层都接住：createInterface 会给 input 挂自己的 error 监听，再把同一个错误在
+ * readline Interface 上重新 emit 一次。只给 input 挂监听时，Interface 上的 error 没人接会变成
+ * uncaught exception 拖垮 gateway（2026-10-07 owner review 用 Windows Node 24 + PassThrough
+ * 复现）。控制通道坏了只意味着「优雅退出不可用」，父进程会落到强杀兜底，所以这里只记一次
+ * 警告并拆掉监听，gateway 照常运行。
+ *
+ * unref 只是「不挡退出」，不是「停读」：readline 照常收行、暗号照常生效，只是这个句柄不再单独
+ * ref 住事件循环（gateway 靠 server 保活）。可选链：某些执行环境（如 vitest 的 threads 池）暴露
+ * 的 process.stdin 没有 unref，跳过的后果只是进程可能晚一点退。
+ *
+ * ownsInput：控制管道是我们自己打开的，关闭时一并 destroy；process.stdin 不归我们管，只关 reader。
  */
-export function resolveRespawnStdioWithControlFd(
-  env: NodeJS.ProcessEnv,
-  fdIsOpen: (fd: number) => boolean = isFdOpen,
-): { stdio: StdioOptions; env: NodeJS.ProcessEnv } {
-  const raw = env[GATEWAY_CONTROL_FD_ENV];
-  if (raw === undefined) {
-    return { stdio: "inherit", env };
-  }
-  const fd = parseGatewayControlFd(raw);
-  if (fd === undefined || !fdIsOpen(fd)) {
-    const { [GATEWAY_CONTROL_FD_ENV]: _dropped, ...rest } = env;
-    return { stdio: "inherit", env: rest };
-  }
-  const stdio: Array<"inherit" | "ignore" | number> = ["inherit", "inherit", "inherit"];
-  while (stdio.length < fd) {
-    stdio.push("ignore");
-  }
-  stdio.push(fd);
-  return { stdio, env };
+export function listenForGatewayControlShutdown(params: {
+  input: ControlInput;
+  ownsInput: boolean;
+  sentinel: string;
+  onShutdown: () => void;
+  onError: (error: unknown) => void;
+}): { close: () => void } {
+  const { input, ownsInput, sentinel, onShutdown, onError } = params;
+  // terminal:false 明确按非交互管道处理（父进程写一行就走，不需要 TTY 行编辑/回显）。
+  const reader = createInterface({ input, terminal: false });
+  let closed = false;
+  const close = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    reader.close();
+    if (ownsInput) {
+      input.destroy?.();
+    }
+  };
+  // input 与 reader 会先后报同一个错误；closed 之后不再重复记日志。input 上的监听在 close 后
+  // 仍保留，用来吞掉拆除过程中可能再冒出的迟到错误。
+  const handleError = (error: unknown) => {
+    if (closed) {
+      return;
+    }
+    onError(error);
+    close();
+  };
+  input.on("error", handleError);
+  reader.on("error", handleError);
+  reader.on("line", (line) => {
+    if (line.trim() === sentinel) {
+      onShutdown();
+    }
+  });
+  input.unref?.();
+  return { close };
 }

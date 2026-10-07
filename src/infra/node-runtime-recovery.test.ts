@@ -951,12 +951,17 @@ describe("launcher respawn control fd forwarding", () => {
       stdio: ["inherit", "inherit", "inherit", 3],
       env,
     });
-    expect(
-      resolveLauncherRespawnStdio({ OPENCLAW_CONTROL_FD: " 5 " }, () => true).stdio,
-    ).toEqual(["inherit", "inherit", "inherit", "ignore", "ignore", 5]);
+    expect(resolveLauncherRespawnStdio({ OPENCLAW_CONTROL_FD: " 5 " }, () => true).stdio).toEqual([
+      "inherit",
+      "inherit",
+      "inherit",
+      "ignore",
+      "ignore",
+      5,
+    ]);
   });
 
-  it.each(["0", "2", "abc", "3.5", "", "-3"])(
+  it.each(["0", "1", "2", "abc", "3abc", "1e3", "3.5", "", "-3"])(
     "drops invalid control fd value %j instead of forwarding it",
     (raw) => {
       const result = resolveLauncherRespawnStdio(

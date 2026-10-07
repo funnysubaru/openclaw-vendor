@@ -3739,12 +3739,14 @@ describe("runGatewayLoop", () => {
   // 通道从 stdin 换成 OPENCLAW_CONTROL_FD 指定的专用管道，原因见 src/process/gateway-control-channel.ts）：
   // Windows 上父进程管不了子进程的 POSIX 信号，改用控制管道暗号触发同一条 request("stop")
   // 优雅关闭路径。下面用例覆盖：①暗号生效且退出时拆掉管道 ②非暗号行不触发 ③env 未设不装
-  // ④env 非法值（含 0-2 标准流）不装 ⑤打开管道失败只降级、不拖垮 gateway。
+  // ④env 非法值（含 0-2 标准流）不装 ⑤打开管道失败只降级、不拖垮 gateway
+  // ⑥旧版 Yuiclaw（只设 OPENCLAW_STDIN_CONTROL=1）仍按旧协议读 stdin ⑦新旧开关同时存在时只读控制管道。
   describe("control channel graceful shutdown", () => {
     afterEach(() => {
       // 兜底清 env + 捕获的 line handler，防止某个用例提前 throw 漏执行 finally，让
       // OPENCLAW_CONTROL_FD 泄漏到后续既有用例误装控制通道。各用例自身的 finally 仍保留作双保险。
       delete process.env.OPENCLAW_CONTROL_FD;
+      delete process.env.OPENCLAW_STDIN_CONTROL;
       capturedLineHandler = null;
     });
 
@@ -3852,6 +3854,58 @@ describe("runGatewayLoop", () => {
       } finally {
         delete process.env.OPENCLAW_CONTROL_FD;
       }
+    });
+
+    // vendor 可独立热更新：旧版 Yuiclaw 启动器只设 OPENCLAW_STDIN_CONTROL=1 并往 stdin 写暗号，
+    // 新 vendor 必须照样收得到，否则旧启动器每次退出都只能等超时强杀（2026-10-07 owner review）。
+    it("keeps the legacy stdin channel for launchers that only set OPENCLAW_STDIN_CONTROL=1", async () => {
+      vi.clearAllMocks();
+      delete process.env.OPENCLAW_CONTROL_FD;
+      process.env.OPENCLAW_STDIN_CONTROL = "1";
+      capturedLineHandler = null;
+      const controlChannel = await import("../../process/gateway-control-channel.js");
+      const readline = await import("node:readline");
+      await withIsolatedSignals(async () => {
+        const { close, exited } = await createSignaledLoopHarness();
+        expect(controlChannel.openGatewayControlChannel).not.toHaveBeenCalled();
+        expect(readline.createInterface).toHaveBeenCalledWith({
+          input: process.stdin,
+          terminal: false,
+        });
+        capturedLineHandler!("__openclaw_stdin_shutdown__");
+        await expect(exited).resolves.toBe(0);
+        expect(close).toHaveBeenCalledWith({
+          reason: "gateway stopping",
+          restartExpectedMs: null,
+        });
+        expect(fakeRl.close).toHaveBeenCalled();
+      });
+    });
+
+    it("does not install the legacy stdin channel for a non-'1' value", async () => {
+      vi.clearAllMocks();
+      process.env.OPENCLAW_STDIN_CONTROL = "0";
+      const readline = await import("node:readline");
+      await withIsolatedSignals(async () => {
+        await createSignaledLoopHarness();
+        expect(readline.createInterface).not.toHaveBeenCalled();
+      });
+    });
+
+    it("reads only the control fd when both channels are configured", async () => {
+      vi.clearAllMocks();
+      process.env.OPENCLAW_CONTROL_FD = "3";
+      process.env.OPENCLAW_STDIN_CONTROL = "1";
+      const readline = await import("node:readline");
+      await withIsolatedSignals(async () => {
+        await createSignaledLoopHarness();
+        // 新启动器下 stdin 是 ignore；即使旧开关残留也绝不能去读 stdin。
+        expect(readline.createInterface).toHaveBeenCalledTimes(1);
+        expect(readline.createInterface).toHaveBeenCalledWith({
+          input: fakeControlSocket,
+          terminal: false,
+        });
+      });
     });
   });
 

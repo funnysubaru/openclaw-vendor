@@ -75,9 +75,26 @@ const respawnSignalHardExitGraceMs = 1_000;
 // （换编译缓存目录）两种情况下都会先自我重启一次再进 gateway，走的就是下面的 runRespawnedChild。
 // 原来写死 stdio:"inherit" 只转 0-2，fd 3 在里层是空位，随后被 gateway 自己打开的普通文件占掉，
 // run-loop 装控制通道时报「Unsupported fd type: FILE」，暗号送不到、关窗口只能 taskkill 强杀。
-// 本模块不能依赖 dist（见文件头），所以这里按 gateway-control-channel.ts 的
-// resolveRespawnStdioWithControlFd 原样复刻一份，两处改动需保持一致。
-const GATEWAY_CONTROL_FD_ENV = "OPENCLAW_CONTROL_FD";
+// 本模块不能依赖 dist（见文件头），所以「解析控制 fd / 拼自我重启 stdio」的唯一实现放在这里；
+// src/ 里的 respawn-child-runner.ts、gateway-control-channel.ts（run-loop 用）反过来 import 本文件，
+// 与 src 引用 node-sqlite.mjs / node-version.mjs 同一做法，避免两份实现各改各的。
+export const GATEWAY_CONTROL_FD_ENV = "OPENCLAW_CONTROL_FD";
+
+/**
+ * 解析 OPENCLAW_CONTROL_FD。只接受 ≥3 的十进制整数：0-2 是标准流，拿它们当控制通道等于
+ * 回到 stdin 方案的老问题；其它非法值（空串、负数、小数、"abc"）一律视为未开启，返回 undefined。
+ */
+export const parseGatewayControlFd = (raw) => {
+  if (raw === undefined) {
+    return undefined;
+  }
+  const trimmed = String(raw).trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return undefined;
+  }
+  const fd = Number(trimmed);
+  return Number.isSafeInteger(fd) && fd >= 3 ? fd : undefined;
+};
 
 const isLauncherFdOpen = (fd) => {
   try {
@@ -101,9 +118,8 @@ export const resolveLauncherRespawnStdio = (env, fdIsOpen = isLauncherFdOpen) =>
   if (raw === undefined) {
     return { stdio: "inherit", env };
   }
-  const trimmed = String(raw).trim();
-  const fd = /^\d+$/.test(trimmed) ? Number(trimmed) : Number.NaN;
-  if (!Number.isSafeInteger(fd) || fd < 3 || !fdIsOpen(fd)) {
+  const fd = parseGatewayControlFd(raw);
+  if (fd === undefined || !fdIsOpen(fd)) {
     const { [GATEWAY_CONTROL_FD_ENV]: _dropped, ...rest } = env;
     return { stdio: "inherit", env: rest };
   }

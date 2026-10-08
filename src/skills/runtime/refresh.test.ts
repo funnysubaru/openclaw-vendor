@@ -940,11 +940,6 @@ describe("ensureSkillsWatcher", () => {
     ]);
   });
 
-  // 任务72:原来这里的 it.each(["change", "ready"]) 两个用例一起测,"ready"
-  // 分支断言的是旧(有问题)行为——单个 root 的 ready 立刻广播。那条语义已经
-  // 改掉(见 refresh.ready-coalesce.test.ts),"change" 分支原样保留在那边,
-  // 两个测试合并搬过去了，这里不再重复放一份断言旧行为的用例。
-
   it("stops fanning a shared-directory change to a workspace after it unsubscribes", async () => {
     vi.useFakeTimers();
     const secondWorkspace = await createFixtureDirectory("second-workspace");

@@ -190,13 +190,16 @@ describe("direct provider policy surface", () => {
         resolveModelRoutes: vi.fn(),
       }));
       const metadata = makeFakeMetadata();
+      // registry 引用和版本都固定不变，确保第二次重算只能由 selection 变化触发；
+      // 每次返回新对象的话，引用变化本身就会让缓存失效，这条用例就测不到 selection 比较。
+      const stableRegistry = { id: "registry-a" };
       vi.doMock("./bundled-dir.js", () => ({ resolveBundledPluginsDir: () => undefined }));
       vi.doMock("./plugin-cache.js", () => ({ getPluginCache: () => ({ metadata }) }));
       vi.doMock("./runtime-state.js", () => ({
         getPluginRegistryState: () => ({ activeVersion: 1 }),
       }));
       vi.doMock("./runtime/gateway-request-scope.js", () => ({
-        getPluginRegistryForContext: () => ({ id: "registry-a" }),
+        getPluginRegistryForContext: () => stableRegistry,
       }));
       vi.doMock("./public-surface-loader.js", () => ({
         loadBundledPluginPublicArtifactModuleFromCandidatesSync,

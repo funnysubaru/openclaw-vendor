@@ -30,9 +30,9 @@ import { isPersistentOpenClawAgentDatabasePath } from "./openclaw-agent-db-regis
 import { assertOpenClawAgentCurrentRuntimeSchema } from "./openclaw-agent-db-schema-helpers.js";
 import {
   inspectAgentDatabaseCandidateForPreflight,
+  inspectPreflightCandidatePresence,
   readWriterAppVersion,
 } from "./openclaw-agent-preflight-candidate.js";
-import { inspectPreflightCandidatePresence } from "./openclaw-agent-preflight-connection.js";
 import type {
   DeferredStateSchemaPublication,
   IncompatibleOpenClawDatabase,

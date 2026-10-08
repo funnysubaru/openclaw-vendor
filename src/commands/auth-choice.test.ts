@@ -1139,7 +1139,11 @@ describe("applyAuthChoice", () => {
   it("uses explicit env for plugin auth resolution instead of host env", async () => {
     await setupTempState();
     process.env.OPENAI_API_KEY = "sk-openai-host"; // pragma: allowlist secret
-    const env = { OPENAI_API_KEY: "sk-openai-explicit" } as NodeJS.ProcessEnv; // pragma: allowlist secret
+    // 显式 env 不继承 process.env：必须自带临时 state dir，否则状态库路径会回退到 home 推导。
+    const env = {
+      OPENAI_API_KEY: "sk-openai-explicit", // pragma: allowlist secret
+      OPENCLAW_STATE_DIR: process.env.OPENCLAW_STATE_DIR,
+    } as NodeJS.ProcessEnv;
     const text = vi.fn().mockResolvedValue("should-not-be-used");
     const confirm = vi.fn(async () => true);
     const { prompter, runtime } = createApiKeyPromptHarness({ text, confirm });

@@ -33,10 +33,7 @@ describe("ensureSkillsWatcher", () => {
   });
 
   beforeEach(async () => {
-    // 这批用例测的是 chokidar 路径本身(mock watchMock、检查传给它的
-    // options),原生 fs.watch 改动之后同一个 root 在 darwin/win32 上会
-    // 走原生路径、根本不调 chokidar.watch——显式关掉原生路径,让这些
-    // 断言继续在任何宿主机 OS 上验 chokidar 行为,不隐性依赖本仓 CI 恰好跑 ubuntu。
+    // 这批用例验 chokidar 路径:显式关掉原生 fs.watch,不依赖宿主机 OS(原因见 refresh.test-support.ts)。
     refreshTestSupport.setNativeSkillsWatchOverrideForTest("off");
     watchMock.mockClear();
     createdWatchers.length = 0;
@@ -46,7 +43,6 @@ describe("ensureSkillsWatcher", () => {
   });
 
   afterEach(async () => {
-    refreshTestSupport.setNativeSkillsWatchOverrideForTest(undefined);
     vi.restoreAllMocks();
     vi.useRealTimers();
     await refreshTestSupport.resetSkillsRefreshForTest();

@@ -123,6 +123,20 @@ function nativeRecursiveSkillsWatchSupported(): boolean {
 // rather than with agent count.
 const pathWatchers = new Map<string, SkillsPathWatchState>();
 let nativeWatchCapacityFailed = false;
+// chokidar 与原生 fs.watch 两种后端撞到系统 watch 容量上限时的共同处理:
+// 全局只告警一次、拆掉全部 watcher,之后改由 agent 准备阶段刷新技能。
+function handleSkillsWatchCapacityExhausted(capacityCode: string): void {
+  if (nativeWatchCapacityFailed) {
+    return;
+  }
+  nativeWatchCapacityFailed = true;
+  log.warn(
+    `skills native watcher capacity exhausted (${capacityCode}); refreshing skills during agent preparation`,
+  );
+  for (const active of pathWatchers.values()) {
+    void teardownSkillsPathWatcher(active);
+  }
+}
 // Watch targets each workspace is currently subscribed to, used to reconcile
 // subscriptions and to detect watch-target changes across calls.
 const workspaceWatchTargets = new Map<string, WatchTarget[]>();
@@ -660,15 +674,7 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
       }
       const capacityCode = usePolling ? undefined : getFileWatchCapacityCode(err);
       if (capacityCode) {
-        if (!nativeWatchCapacityFailed) {
-          nativeWatchCapacityFailed = true;
-          log.warn(
-            `skills native watcher capacity exhausted (${capacityCode}); refreshing skills during agent preparation`,
-          );
-          for (const active of pathWatchers.values()) {
-            void teardownSkillsPathWatcher(active);
-          }
-        }
+        handleSkillsWatchCapacityExhausted(capacityCode);
         return;
       }
       log.warn(`skills watcher error (${target.path}): ${String(err)}`);
@@ -710,11 +716,12 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
         } catch {
           stats = undefined;
         }
-        if (stats && !stats.isDirectory() && !stats.isSymbolicLink()) {
-          // 现存的常规文件:只有 SKILL.md 这类文件才需要走稳定性等待再刷新
-          // (对应 chokidar 的 raw 事件分支),其余常规文件被忽略不刷新
-          // (对应 shouldIgnoreSkillsWatchPath 对常规文件返回 true 的语义)。
-          if (isSkillFileWatchPath(full)) {
+        // 直接复用 chokidar 的 ignored 判据,两种后端过滤口径一致:
+        // node_modules/.git/.venv 等忽略目录里的变动不刷新;现存常规文件也被
+        // "忽略",其中只有 SKILL.md 这类文件走稳定性等待再刷新(对应 chokidar
+        // 的 raw 事件分支,isSkillFileWatchPath 对忽略目录同样返回 false)。
+        if (shouldIgnoreSkillsWatchPath(full, stats)) {
+          if (stats && isSkillFileWatchPath(full)) {
             scheduleRawSkillFile(full);
           }
           return;
@@ -737,28 +744,18 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
       }
       const capacityCode = getFileWatchCapacityCode(err);
       if (capacityCode) {
-        if (!nativeWatchCapacityFailed) {
-          nativeWatchCapacityFailed = true;
-          log.warn(
-            `skills native watcher capacity exhausted (${capacityCode}); refreshing skills during agent preparation`,
-          );
-          for (const active of pathWatchers.values()) {
-            void teardownSkillsPathWatcher(active);
-          }
-        }
+        handleSkillsWatchCapacityExhausted(capacityCode);
         return;
       }
       log.warn(`skills native watcher error (${target.watchRoot}): ${String(err)}`);
       // Node 文档:原生 fs.watch 出错后这个 watcher 实例不再可用。关掉它,
       // 补一次刷新覆盖可能错过的事件,再退回 chokidar 继续覆盖这个 root,
       // 而不是让它从此失去监听。
+      state.native = undefined;
       try {
         native.close();
       } catch {
         // best effort
-      }
-      if (state.native === native) {
-        state.native = undefined;
       }
       schedule();
       attachChokidarSkillsWatch();
@@ -981,7 +978,11 @@ export async function closeSkillsWatchers(resetState = false): Promise<void> {
 
 if (process.env.VITEST || process.env.NODE_ENV === "test") {
   (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.skillsRefreshTestApi")] = {
-    resetSkillsRefreshForTest: () => closeSkillsWatchers(true),
+    resetSkillsRefreshForTest: () => {
+      // 每个测试文件 afterEach 都会调 reset,顺手清掉覆盖位,不必各自再写一行。
+      nativeSkillsWatchOverrideForTest = undefined;
+      return closeSkillsWatchers(true);
+    },
     setNativeSkillsWatchOverrideForTest: (forced: "on" | "off" | undefined) => {
       nativeSkillsWatchOverrideForTest = forced;
     },

@@ -45,7 +45,6 @@ describe("ensureSkillsWatcher native recursive fs.watch", () => {
   });
 
   afterEach(async () => {
-    refreshTestSupport.setNativeSkillsWatchOverrideForTest(undefined);
     vi.restoreAllMocks();
     await refreshTestSupport.resetSkillsRefreshForTest();
     await fs.rm(fixtureRoot, { recursive: true, force: true });

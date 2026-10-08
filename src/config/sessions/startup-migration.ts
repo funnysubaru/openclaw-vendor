@@ -16,12 +16,16 @@ import { resolveStateDir } from "../paths.js";
 import type { OpenClawConfig } from "../types.openclaw.js";
 import { migrateLegacyMainSessionKeys } from "./legacy-main-session-migration.js";
 import { SessionStoreMigrationRequiredError } from "./migration-required.js";
+import { resolveSessionStorePathCore } from "./paths.js";
 import { resolveSqliteReadScope, toDatabaseOptions } from "./session-accessor.sqlite-scope.js";
 import {
   isCanonicalSqliteSessionMainKeyCurrent,
   setCanonicalSqliteSessionMainKey,
 } from "./session-canonical-key.js";
-import { resolveAllAgentSessionStoreTargetsSync } from "./targets.js";
+import {
+  listConfiguredSessionStoreAgentIds,
+  resolveAllAgentSessionStoreTargetsSync,
+} from "./targets.js";
 import { migrateManagedWorktreeCanonicalWorkspaces } from "./worktree-workspace-migration.js";
 
 export type SessionStartupMigrationLogger = Record<"info" | "warn", (message: string) => void>;
@@ -157,6 +161,35 @@ export async function runSessionStartupMigration(params: {
   }
 }
 
+type SessionStoreTarget = ReturnType<typeof resolveAllAgentSessionStoreTargetsSync>[number];
+
+/**
+ * 「逻辑员工 → 一组物理库 owner」（review2 P2-1 / review3 P2）：对每个（逻辑员工, 存储路径），
+ * 用与准入登记、运行期读写同一套解析（resolveSqliteReadScope → toDatabaseOptions）算出实际
+ * 库 owner，同一逻辑员工的所有结果合成一组——既含它当前配置读写的库（共享库归 main），也含
+ * 它名下仍在磁盘上的旧库。请求入口等这一组里全部仍在准入的 owner。
+ * 不存在 / 已删除 / 被去重而没调度的 owner 照记：没调度的 owner 等待方自然不用等。
+ * 某个逻辑员工有候选解析失败时整组不登记，让请求入口对它退回"等待全部"，不拿残缺映射。
+ */
+function resolveLogicalDatabaseOwners(
+  targets: readonly SessionStoreTarget[],
+  env: NodeJS.ProcessEnv,
+): Array<readonly [string, string]> {
+  const owners: Array<readonly [string, string]> = [];
+  const unresolved = new Set<string>();
+  for (const target of targets) {
+    try {
+      owners.push([
+        target.agentId,
+        toDatabaseOptions(resolveSqliteReadScope({ ...target, env })).agentId,
+      ]);
+    } catch {
+      unresolved.add(target.agentId);
+    }
+  }
+  return owners.filter(([agentId]) => !unresolved.has(agentId));
+}
+
 /** One per-agent row prepared by scheduleBackgroundSessionStartupMigration below. */
 interface PreparedBackgroundSessionStartupMigrationTarget {
   target: ReturnType<typeof resolveAllAgentSessionStoreTargetsSync>[number];
@@ -241,12 +274,17 @@ export async function scheduleBackgroundSessionStartupMigration(params: {
 
   const databases = new Set<string>();
   const itemsByAgentId = new Map<string, PreparedBackgroundSessionStartupMigrationTarget[]>();
-  // 逻辑员工 → 实际库 owner，与下面准入登记用同一次真实存储目标解析（review2 P2-1）。
-  // 去重 / 不存在 / 已删除而跳过的目标也照记：它指向的 owner 没被调度时等待方自然不用等。
-  const owners: Array<readonly [string, string]> = [];
+  // 逻辑员工 → 一组物理 owner（review3 P2）：不能只看去重后的 targets——固定共享库在目标
+  // 发现阶段就只登记成兼容 owner（main）一条，ops 用这个库的归属根本不在里面。所以按每个
+  // 配置员工解析它实际配置的存储路径（运行期读写用的同一个 resolveSessionStorePathCore），
+  // 再并上 targets 里它名下仍在磁盘上的库（如 ops 自有旧库）。
+  const configuredStores = listConfiguredSessionStoreAgentIds(params.cfg).map((agentId) => ({
+    agentId,
+    storePath: resolveSessionStorePathCore(params.cfg.session?.store, { agentId, env }),
+  }));
+  const owners = resolveLogicalDatabaseOwners([...configuredStores, ...targets], env);
   for (const target of targets) {
     const options = toDatabaseOptions(resolveSqliteReadScope({ ...target, env }));
-    owners.push([target.agentId, options.agentId]);
     const databasePath = resolveOpenClawAgentSqlitePath(options);
     if (databases.has(databasePath) || !fs.existsSync(databasePath)) {
       continue;

@@ -18,8 +18,13 @@ import {
   cancelAgentStartupAdmission,
   resetAgentStartupAdmissionForTest,
   scheduleAgentStartupAdmission,
+  waitForAgentStartupAdmission,
 } from "../state/agent-startup-admission.js";
-import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
+import {
+  closeOpenClawAgentDatabasesForTest,
+  openOpenClawAgentDatabase,
+  resolveOpenClawAgentSqlitePath,
+} from "../state/openclaw-agent-db.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { createDirectChatContext } from "./server-chat.agent-events.test-helpers.js";
 import { handleGatewayRequest } from "./server-methods.js";
@@ -280,6 +285,87 @@ describe("gateway request entry waits for agent startup admission", () => {
         expect(respond.mock.calls[0]?.[0]).toBe(true);
       } finally {
         releaseWorker.resolve();
+        vi.restoreAllMocks();
+        await cancelAgentStartupAdmission();
+      }
+    });
+  });
+
+  // review3 P2：共享库 + ops 自有旧库同时存在。目标发现按物理库去重后只剩 main/shared 与
+  // ops/旧库，若只从去重后的目标建映射会得到 ops→ops、漏掉 ops→main。让 ops 旧库先完成、
+  // main（shared.sqlite）仍在准入时，ops 的共享库历史请求必须继续等 main。
+  it("共享库 + ops 自有旧库：ops 旧库先完成时，ops 的共享库历史请求仍等 main", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      const sharedCfg = {
+        agents: {
+          ownership: "explicit",
+          defaults: { sessionStore: { agentId: "main" } },
+          entries: { main: {}, ops: {} },
+        },
+        session: { store: path.join(state.root, "custom", "shared.sqlite") },
+      } satisfies OpenClawConfig;
+      await state.writeConfig(sharedCfg);
+      const sharedScope = {
+        agentId: "ops",
+        sessionKey: "agent:ops:shared",
+        sessionId: "ops-shared",
+        storePath: sharedCfg.session.store,
+      };
+      await upsertSessionEntryCore(sharedScope, { sessionId: sharedScope.sessionId, updatedAt: 1 });
+      const sharedOptions = toDatabaseOptions(resolveSqliteReadScope(sharedScope));
+      expect(sharedOptions.agentId).toBe("main");
+      const sharedPath = resolveOpenClawAgentSqlitePath(sharedOptions);
+      // ops 名下仍保留的默认旧库（真实文件）。
+      const opsRetainedPath = openOpenClawAgentDatabase({ agentId: "ops" }).path;
+      expect(opsRetainedPath).not.toBe(sharedPath);
+      // 准入前先正常请求一次：确认会话可读，同时让 chat.history 的惰性 handler 模块加载完，
+      // 否则冷加载本身就要数秒，"窗口内没响应"会被误当成在等待。
+      const warmup = dispatch(
+        "chat.history",
+        { sessionKey: sharedScope.sessionKey },
+        createDirectChatContext({ getRuntimeConfig: () => sharedCfg }),
+      );
+      await warmup.request;
+      expect(warmup.respond.mock.calls[0]?.[0]).toBe(true);
+      closeOpenClawAgentDatabasesForTest();
+
+      // 只卡住 shared.sqlite 的完整性检查，让 ops 旧库先完成准入。
+      const releaseShared = createDeferred<void>();
+      const actualCheck = integrityWorker.assertSqliteIntegrityInWorker;
+      vi.spyOn(integrityWorker, "assertSqliteIntegrityInWorker").mockImplementation(
+        async (pathname, busyTimeoutMs, signal) => {
+          if (pathname === sharedPath) {
+            await releaseShared.promise;
+          }
+          return await actualCheck(pathname, busyTimeoutMs, signal);
+        },
+      );
+      await scheduleBackgroundSessionStartupMigration({
+        cfg: { ...sharedCfg, session: { ...sharedCfg.session, mainKey: "work" } },
+        log: { info: vi.fn(), warn: vi.fn() },
+      });
+      try {
+        await waitForAgentStartupAdmission("ops");
+        expect(waitForAgentStartupAdmission("main")).toBeDefined();
+
+        const { request, respond } = dispatch(
+          "chat.history",
+          { sessionKey: sharedScope.sessionKey },
+          createDirectChatContext({ getRuntimeConfig: () => sharedCfg }),
+        );
+        let early: unknown;
+        await Promise.race([request, tick(2_000)]).catch((error: unknown) => {
+          early = error;
+        });
+        expect(early).toBeUndefined();
+        expect(respond).not.toHaveBeenCalled();
+
+        releaseShared.resolve();
+        await request;
+        expect(respond).toHaveBeenCalledOnce();
+        expect(respond.mock.calls[0]?.[0]).toBe(true);
+      } finally {
+        releaseShared.resolve();
         vi.restoreAllMocks();
         await cancelAgentStartupAdmission();
       }

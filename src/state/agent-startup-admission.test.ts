@@ -317,4 +317,31 @@ describe("agent-startup-admission", () => {
     expect(opsSettled).toBe(true);
     expect(unknownSettled).toBe(true);
   });
+
+  // review3：一个逻辑员工对应一组物理 owner（共享库 main + 自有旧库 ops）。组里任一 owner
+  // 准入已失败，就立即按那个 owner 的失败原因结束，不再等组里其它仍在准入的 owner。
+  it("一组 owner 里任一已失败 → 立即报该 owner 的失败原因，不陪其余 owner 等", async () => {
+    const mainGate = deferred();
+    const failure = new Error("ops retained database failed");
+    scheduleAgentStartupAdmission({
+      agentIds: ["main", "ops"],
+      openAgent: async (agentId) => {
+        if (agentId === "main") {
+          await mainGate.promise;
+          return;
+        }
+        throw failure;
+      },
+      migrateAgent: async () => {},
+      owners: [
+        ["ops", "main"],
+        ["ops", "ops"],
+      ],
+    });
+    await expect(waitForAgentStartupAdmission("ops")).rejects.toBe(failure);
+    await expect(waitForAgentStartupAdmissionBeforeRequest({ agentId: "ops" })).rejects.toBe(
+      failure,
+    );
+    mainGate.resolve();
+  });
 });

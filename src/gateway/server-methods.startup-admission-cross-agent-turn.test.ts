@@ -1,11 +1,15 @@
-// PR #132 第三轮独立审查（selfreview3）的一轮探针（按需搬入其中 3 条）。
-// 每员工默认库布局（收窄证明成立）下卡住 ops 的准入，让 main 走真实收窄分发跑一轮真实的
-// chat.send（本地 mock 模型，127.0.0.1:0 临时端口，不起 gateway），在准入闸门上插桩，记录
-// 这一轮里（排除准入工作自身的异步作用域）经过闸门的目标员工。
+// 真实一轮对话在别的员工还在后台启动准入时，会碰哪些员工库（PR #132 审查探针 P3 / P5 的正式化）。
+// 每员工默认库布局（收窄证明成立）下卡住 ops 的准入，让 main 经真实收窄分发跑一轮真实的
+// chat.send。模型是本地 mock（127.0.0.1 临时端口，models.mode=replace），整轮不出网；
+// 每条用例都断言 mock 被命中，证明这一轮确实打到了本地而不是默认的外部 provider。
+// 在准入闸门上插桩，记录这一轮里（排除准入工作自身的异步作用域）经过闸门的目标员工：
 // - 纯文本一轮：只碰 main，任何 ops 闸门都不应出现。
 // - session_status 读 / 写 ops 会话：跨员工访问必须先异步等 ops 准入（dbwait / async 记录
 //   都是预期行为），不能撞上同步兜底被拒（thrown 里不应有 ops）。第一次看到 ops 闸门 500ms
-//   后才放行 ops，让等待能结束、这一轮能跑完。
+//   后才放行 ops，保证工具一定在 ops 准入窗口内执行，等待结束后这一轮能跑完。
+// agent 方法在这种直接调用的测试上下文里没有已发布的回复运行时（handler 直接回 UNAVAILABLE，
+// 不起一轮），所以这里只跑 chat.send；agent 的入口收窄由 server-methods.startup-admission.test.ts
+// 覆盖。
 import { createServer, type ServerResponse } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { writeOpenAiResponsesSse } from "../../test/helpers/openai-responses-sse.js";
@@ -105,15 +109,15 @@ const PROBES: Array<{
   toolsProfile?: string;
   crossAgent: boolean;
 }> = [
-  { label: "纯文本一轮", tools: [], crossAgent: false },
+  { label: "纯文本一轮只碰本员工的库", tools: [], crossAgent: false },
   {
-    label: "session_status 指向 ops 会话（读）",
+    label: "session_status 读别的员工会话：先等对方准入再读，不被同步兜底拒绝",
     tools: [{ name: "session_status", args: { sessionKey: "agent:ops:chat1" } }],
     toolsProfile: "full",
     crossAgent: true,
   },
   {
-    label: "session_status 改 ops 会话模型（写）",
+    label: "session_status 改别的员工会话模型：异步等对方准入后写入",
     tools: [
       {
         name: "session_status",
@@ -125,7 +129,7 @@ const PROBES: Array<{
   },
 ];
 
-describe("PR #132 selfreview3 薄弱点 1：main 的真实 chat.send 一轮在 ops 准入中触碰哪些员工库", () => {
+describe("ops 准入中 main 的真实一轮对话经过的员工库闸门", () => {
   it.each(PROBES)(
     "$label",
     async (probe) => {
@@ -272,12 +276,12 @@ describe("PR #132 selfreview3 薄弱点 1：main 的真实 chat.send 一轮在 o
           await handleGatewayRequest({
             req: {
               type: "req",
-              id: "p5",
+              id: "turn-probe",
               method: "chat.send",
               params: {
                 sessionKey: "agent:main:chat1",
                 message: "hi",
-                idempotencyKey: `p5-run-${probe.label.length}-${Date.now()}`,
+                idempotencyKey: `turn-probe-${Date.now()}`,
               },
             },
             respond,
@@ -285,9 +289,9 @@ describe("PR #132 selfreview3 薄弱点 1：main 的真实 chat.send 一轮在 o
             isWebchatConnect: () => false,
             context,
           });
-          // 等这一轮真正结束（broadcast 出 chat final / error），最多 100 秒。
+          // 等这一轮真正结束：chat 广播出终态，或模型的最后一次请求之后安静 5 秒，最多 100 秒。
+          // 这一步也保证 finally 收尾前后台这一轮已经停下，不会在测试结束后继续跑。
           const deadline = Date.now() + 100_000;
-          const startedAt = Date.now();
           const isTerminal = () =>
             (context.broadcast as ReturnType<typeof vi.fn>).mock.calls.some(
               ([event, payload]) =>
@@ -296,7 +300,6 @@ describe("PR #132 selfreview3 薄弱点 1：main 的真实 chat.send 一轮在 o
                   String((payload as { state?: string })?.state),
                 ),
             );
-          let lastDump = Date.now();
           let doneAt: number | undefined;
           const finished = () => {
             if (isTerminal()) {
@@ -312,80 +315,35 @@ describe("PR #132 selfreview3 薄弱点 1：main 的真实 chat.send 一轮在 o
             await new Promise((resolve) => {
               setTimeout(resolve, 50);
             });
-            if (Date.now() - lastDump > 5_000) {
-              lastDump = Date.now();
-              console.log(
-                `[P5 ${probe.label}] t=${Date.now() - startedAt} reqs=${requestBodies.length} gates=${JSON.stringify(gated.slice(-6))}`,
-              );
-            }
           }
-          console.log(`[P5 ${probe.label}] waited ms:`, Date.now() - startedAt);
           recording = false;
-          const terminal = (context.broadcast as ReturnType<typeof vi.fn>).mock.calls
-            .filter(([event]) => event === "chat")
-            .map(([, payload]) => payload)
-            .at(-1);
-          console.log(
-            `[P5 ${probe.label}] respond:`,
-            JSON.stringify(respond.mock.calls).slice(0, 400),
-          );
-          console.log(`[P5 ${probe.label}] provider requests:`, requestBodies.length);
-          console.log(
-            `[P5 ${probe.label}] tools offered:`,
-            JSON.stringify(
-              (JSON.parse(requestBodies[0] ?? "{}").tools ?? []).map(
-                (t: { name?: string }) => t.name,
-              ),
-            ),
-          );
-          for (const [index, body] of requestBodies.entries()) {
-            const parsed = JSON.parse(body) as {
-              input?: Array<{ type?: string; output?: unknown }>;
-            };
-            const outputs = (parsed.input ?? []).filter(
-              (item) => item.type === "function_call_output",
-            );
-            if (outputs.length > 0) {
-              console.log(
-                `[P5 ${probe.label}] req#${index} tool outputs:`,
-                JSON.stringify(outputs).slice(0, 700),
-              );
-            }
-          }
-          console.log(
-            `[P5 ${probe.label}] terminal:`,
-            String(JSON.stringify(terminal)).slice(0, 500),
-          );
-          console.log(
-            `[P5 ${probe.label}] gates:`,
-            JSON.stringify([...new Set(gated)]),
-            "count",
-            gated.length,
-          );
-          console.log(`[P5 ${probe.label}] thrown:`, thrown.join("\n---\n"));
-          console.log(
-            `[P5 ${probe.label}] logGateway.error/warn:`,
-            JSON.stringify([
-              ...(context.logGateway.error as ReturnType<typeof vi.fn>).mock.calls,
-              ...(context.logGateway.warn as ReturnType<typeof vi.fn>).mock.calls,
-            ]).slice(0, 800),
-          );
-          expect(requestBodies.length).toBeGreaterThan(0);
+          const diagnostics = [
+            `gates=${JSON.stringify([...new Set(gated)])}`,
+            `respond=${JSON.stringify(respond.mock.calls).slice(0, 600)}`,
+            `thrown=${thrown.join("\n---\n")}`,
+          ].join("\n");
+          // 本地 mock 被命中：这一轮的模型请求打到了 127.0.0.1，没有出网。
+          expect(requestBodies.length, diagnostics).toBeGreaterThan(0);
           if (probe.crossAgent) {
-            // 跨员工访问只允许"先等 ops 准入"，不允许撞上同步兜底被拒。
-            expect(thrown.filter((entry) => entry.startsWith("ops:"))).toEqual([]);
-            expect(requestBodies.length).toBeGreaterThan(probe.tools.length);
+            // 跨员工访问只允许"先等 ops 准入"，不允许撞上同步兜底被拒；工具结果回到模型后
+            // 这一轮还要继续（模型请求数多于工具步数）。
+            expect(
+              thrown.filter((entry) => entry.startsWith("ops:")),
+              diagnostics,
+            ).toEqual([]);
+            expect(requestBodies.length, diagnostics).toBeGreaterThan(probe.tools.length);
           } else {
-            expect(gated.filter((entry) => entry.endsWith(":ops"))).toEqual([]);
+            expect(
+              gated.filter((entry) => entry.endsWith(":ops")),
+              diagnostics,
+            ).toEqual([]);
           }
         } finally {
           recording = false;
           releaseOps.resolve();
           await waitForAgentStartupAdmission("ops")?.catch(() => {});
-          console.log("[P5] cleanup: releasing");
           vi.restoreAllMocks();
           await cancelAgentStartupAdmission();
-          console.log("[P5] cleanup: admission cancelled");
           server.closeAllConnections();
           await new Promise<void>((resolve) => {
             server.close(() => resolve());

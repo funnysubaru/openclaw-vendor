@@ -1,4 +1,4 @@
-// PR #132 第二轮独立审查（selfreview2）薄弱点 2：reconcile 在后台启动准入里被关停中止后，走
+// reconcile 在后台启动准入里被关停中止后（PR #132 审查项"关停中止 reconcile"），走
 // "worker 未正常结束"收尾（terminate planner + 另起 release worker 释放租约）。以前只有崩溃走，
 // 现在关停常规走。真实 worker + 真实 SQLite + 真实准入调度器。
 import { Worker, type WorkerOptions } from "node:worker_threads";
@@ -102,15 +102,6 @@ it.each(["on-create", "plan-start"] as const)(
         );
         await cancelling;
         const cancelMs = Date.now() - cancelStartedAt;
-        console.log(
-          `[R-${trigger}] cancel ms=`,
-          cancelMs,
-          "modes=",
-          JSON.stringify(modes),
-          "outcome=",
-          reconcileOutcome?.status,
-          String(reconcileOutcome?.error),
-        );
         expect(reconcileOutcome?.status).toBe("rejected");
         expect(String(reconcileOutcome?.error)).not.toContain("cleanup incomplete");
         expect(modes).toEqual(["disk", "release"]);
@@ -120,7 +111,6 @@ it.each(["on-create", "plan-start"] as const)(
 
         // 关停之后（模拟热重启后的下一轮）同一个库能正常 reconcile，残留的半截投影不卡住。
         const again = await reconcileSessionTranscriptIndexes(options);
-        console.log(`[R-${trigger}] reconcile after abort:`, JSON.stringify(again));
         expect(again.reconciledSessions).toBe(1);
         expect(readLeases()).toEqual(baseline);
       } finally {

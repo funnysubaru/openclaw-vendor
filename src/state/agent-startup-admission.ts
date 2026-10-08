@@ -284,7 +284,7 @@ export function classifyAgentStartupAdmissionError(
  */
 export function assertAgentStartupAdmissionSettled(agentId: string): void {
   // 绝大多数时候调度器是空的；这条判断让热路径上的同步开库几乎零开销。
-  if (pendingByAgentId.size === 0 && failedByAgentId.size === 0) {
+  if (!hasAgentStartupAdmissionState()) {
     return;
   }
   const normalized = normalizeAgentId(agentId);

@@ -1,4 +1,4 @@
-// PR #132 selfreview3：OAuth 刷新栅栏只在真正要写某个 peer 员工库之前等它的准入。
+// OAuth 刷新栅栏只在真正要写某个 peer 员工库之前等它的准入（PR #132 审查项 R1–R3）。
 // R1 / R2：不持有该凭据、根本不会被写的 peer，既不让刷新陪它等，也不因它准入失败而失败。
 // R3：准入已失败、但确实持有该凭据的 peer 仍让刷新失败（fail-closed，避免它重启后拿旧
 // refresh token 再刷一次触发重用检测），错误点名该员工并提示重启 gateway。
@@ -51,16 +51,17 @@ async function setup(cfg: OpenClawConfig) {
   return { original, mainDir, opsDir };
 }
 
-describe("PR #132 selfreview3：OAuth 栅栏对不需要写的 peer 也等准入", () => {
-  it("R1 ops 准入失败（库本身完好，例如 handoff 失败）且 ops 不持有该凭据：main 的刷新栅栏应成功（0 claims）", async () => {
+describe("OAuth 刷新栅栏与 peer 员工库的启动准入", () => {
+  it("不持有该凭据的员工准入失败（库本身完好，例如 handoff 失败）：刷新栅栏照常成功，0 claims", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       const cfg = {
         agents: { ownership: "explicit", entries: { main: {}, ops: {} } },
       } satisfies OpenClawConfig;
       await state.writeConfig(cfg);
       const { original, mainDir } = await setup(cfg);
+      // 前提：ops 的 auth 库确实在候选里（否则"不陪它等"就是空测）。
       const candidates = await listCandidateAuthProfileStores({ cfg });
-      console.log("[R1] candidates:", candidates.map((c) => c.agentId).join(","));
+      expect(candidates.map((candidate) => candidate.agentId)).toContain("ops");
       scheduleAgentStartupAdmission({
         agentIds: ["ops"],
         narrowRequestsToAgent: true,
@@ -83,7 +84,6 @@ describe("PR #132 selfreview3：OAuth 栅栏对不需要写的 peer 也等准入
           (error: unknown) =>
             `rejected: ${String(error)} / cause: ${String((error as { cause?: unknown }).cause)}`,
         );
-        console.log("[R1] outcome:", outcome);
         expect(outcome).toBe("claims:0");
       } finally {
         await cancelAgentStartupAdmission();
@@ -91,7 +91,7 @@ describe("PR #132 selfreview3：OAuth 栅栏对不需要写的 peer 也等准入
     });
   });
 
-  it("R2 ops 准入中且 ops 不持有该凭据：main 的刷新栅栏不应陪 ops 等", async () => {
+  it("不持有该凭据的员工还在准入：刷新栅栏不陪它等，立即 0 claims", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       const cfg = {
         agents: { ownership: "explicit", entries: { main: {}, ops: {} } },
@@ -126,11 +126,10 @@ describe("PR #132 selfreview3：OAuth 栅栏对不需要写的 peer 也等准入
           setTimeout(resolve, 300);
         });
         const atWindow = settled;
-        console.log("[R2] after 300ms with ops pending:", atWindow);
         gate.resolve();
         await fence;
-        console.log("[R2] after ops admitted:", settled);
         expect(atWindow).toBe("claims:0");
+        expect(settled).toBe("claims:0");
       } finally {
         gate.resolve();
         await cancelAgentStartupAdmission();
@@ -138,7 +137,7 @@ describe("PR #132 selfreview3：OAuth 栅栏对不需要写的 peer 也等准入
     });
   });
 
-  it("R3 ops 准入失败且持有同代际凭据：刷新 fail-closed，错误点名 ops 并提示重启", async () => {
+  it("持有同代际凭据的员工准入失败：刷新 fail-closed，错误点名该员工并提示重启 gateway", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       const cfg = {
         agents: { ownership: "explicit", entries: { main: {}, ops: {} } },

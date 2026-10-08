@@ -1,6 +1,6 @@
-// PR #132 第二轮独立审查（selfreview2）薄弱点 1：开库准入 owner 的「最后一个等待者因 signal 离开
+// 开库准入 owner 的「最后一个等待者因 signal 离开
 // 且库未打开完 → 中止共享打开」。真实 SQLite + 真实开库生成器，只把完整性 worker 换成一个
-// 会响应 signal 的慢检查（与真实 worker 同语义）。
+// 会响应 signal 的慢检查（与真实 worker 同语义）。对应 PR #132 审查项 W1a–W1c。
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import * as integrityWorker from "../infra/sqlite-integrity-worker.js";
@@ -62,8 +62,8 @@ async function prepareColdDatabase() {
   return pathname;
 }
 
-describe("PR #132 selfreview2 薄弱点 1：最后一个等待者离开即中止共享打开", () => {
-  it("W1a 带 signal 的发起方离开、无 signal 的同伴仍在 → 打开不被中止，同伴拿到库", async () => {
+describe("共享开库：最后一个等待者离开即中止", () => {
+  it("带 signal 的发起方离开、无 signal 的同伴仍在：打开不被中止，同伴拿到库", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       const pathname = await prepareColdDatabase();
       const gate = gateIntegrity(pathname);
@@ -81,7 +81,7 @@ describe("PR #132 selfreview2 薄弱点 1：最后一个等待者离开即中止
     });
   });
 
-  it("W1b 唯一等待者离开 → 打开被中止；紧接着到的无 signal 调用方重试成功，句柄 / 租约无泄漏", async () => {
+  it("唯一等待者离开：打开被中止；紧接着到的无 signal 调用方重试成功，句柄 / 租约无泄漏", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       const pathname = await prepareColdDatabase();
       const baseline = readLeases();
@@ -99,10 +99,6 @@ describe("PR #132 selfreview2 薄弱点 1：最后一个等待者离开即中止
       await vi.waitFor(() => expect(gate.calls).toHaveLength(2));
       expect(gate.calls[0]?.aborted).toBe(true);
       expect(gate.calls[1]?.aborted).toBe(false);
-      console.log(
-        "[W1b] pending-at-second-call aborted=",
-        pendingBefore?.controller.signal.aborted ?? "already-retired",
-      );
       expect(pendingBefore?.controller.signal.aborted).toBe(true);
       gate.release();
       await expect(second).resolves.toBe(pathname);
@@ -116,7 +112,7 @@ describe("PR #132 selfreview2 薄弱点 1：最后一个等待者离开即中止
     });
   });
 
-  it("W1c 中止后无人重试：句柄、租约、pending 全部收尾，同步开库仍可用且不跳过完整性", async () => {
+  it("中止后无人重试：句柄、租约、pending 全部收尾，之后重开不跳过完整性检查", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       const pathname = await prepareColdDatabase();
       const baseline = readLeases();

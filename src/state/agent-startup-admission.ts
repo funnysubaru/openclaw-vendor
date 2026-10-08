@@ -59,6 +59,24 @@ export class AgentStartupAdmissionPendingError extends Error {
 }
 
 /**
+ * 能 await 的代码要写某个具体物理库（options.agentId = 库 owner）之前调用（selfreview2 P2）：
+ * 该库还在后台启动准入就等它完成，已失败就 reject 同一原因；调度器 cancel（关停 / 热重启）
+ * 立即以 AbortError 结束。用于"一轮对话里跨员工写别的员工库"这类入口收窄时没等到的库——
+ * 例如 OAuth 刷新给其它员工库写刷新栅栏、写 owner / 共享凭据库。同步开库入口自己没法等，
+ * 所以由这些写入方在进入同步写之前先 await 这一步。不在准入中返回 undefined。
+ */
+export function waitForAgentDatabaseStartupAdmission(
+  databaseAgentId: string,
+): Promise<void> | undefined {
+  const target = waitForAgentStartupAdmission(databaseAgentId);
+  if (!target) {
+    return undefined;
+  }
+  target.catch(() => {});
+  return racePromiseWithAbortSignal(target, controller?.signal);
+}
+
+/**
  * 当前异步上下文正处在某个员工的准入工作里时，返回调度器的停止信号（selfreview P2-1）。
  * 准入工作内部所有开库（设置 mainKey、worktree 迁移、handoff → reconcile → 开库）都经
  * withOpenClawAgentDatabaseAsync / reconcile 两个收口点取这个信号，cancel 时进行中的完整性

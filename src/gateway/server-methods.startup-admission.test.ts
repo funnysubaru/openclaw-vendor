@@ -500,4 +500,80 @@ describe("gateway request entry waits for agent startup admission", () => {
       await cancelAgentStartupAdmission();
     }
   });
+
+  // selfreview2：chat.send / agent 加入收窄清单（面板与 LINE 首轮对话入口）。每员工一库布局
+  // （调度方证明了一一对应）下只等本员工；会话键无前缀、agentId 与会话键不一致、agent 不给
+  // 会话键（按渠道 / 绑定选员工）时，入口算不出目标，等全部。用记录调用时刻的测试 handler
+  // 覆盖同名方法，观察分发层是否放行。
+  async function dispatchRecorded(method: string, params: Record<string, unknown>) {
+    const invoked = vi.fn();
+    const request = handleGatewayRequest({
+      req: { type: "req", id: `scoped-${method}`, method, params },
+      respond: vi.fn<RespondFn>(),
+      client: { connect: { scopes: ["operator.admin"] } } as never,
+      isWebchatConnect: () => false,
+      context: createDirectChatContext({ getRuntimeConfig: () => cfg }),
+      extraHandlers: {
+        [method]: ({ respond: reply }) => {
+          invoked();
+          reply(true, {}, undefined);
+        },
+      },
+    });
+    await Promise.race([request, tick(300)]);
+    return { invoked, request };
+  }
+
+  it.each([
+    ["chat.send", { sessionKey: "agent:main:chat1", message: "hi" }],
+    ["chat.send", { sessionKey: "agent:main:chat1", agentId: "main", message: "hi" }],
+    ["agent", { sessionKey: "agent:main:chat1", message: "hi" }],
+  ] as const)(
+    "%s 带前缀会话键（%o）：ops 准入中只等 main，立即进入 handler",
+    async (method, params) => {
+      const gate = scheduleGatedAdmission(["ops"], { narrow: true });
+      scheduleAgentStartupAdmission({
+        agentIds: ["main"],
+        openAgent: async () => {},
+        migrateAgent: async () => {},
+        narrowRequestsToAgent: true,
+      });
+      try {
+        await waitForAgentStartupAdmission("main");
+        const { invoked } = await dispatchRecorded(method, params);
+        expect(invoked).toHaveBeenCalledOnce();
+      } finally {
+        gate.resolve();
+        await cancelAgentStartupAdmission();
+      }
+    },
+  );
+
+  it.each([
+    ["chat.send", { sessionKey: "chat1", message: "hi" }],
+    // agentId 与会话键员工不一致：chat.send / agent 这种会话写入在授权阶段就被拒，换用同一条
+    // 收窄规则下的读方法 chat.history 观察分发层是否等全部。
+    ["chat.history", { sessionKey: "agent:main:chat1", agentId: "ops" }],
+    ["agent", { channel: "line", to: "U123", message: "hi" }],
+    ["agent", { sessionKey: "chat1", message: "hi" }],
+  ] as const)("%s 目标算不出（%o）：等全部在途准入", async (method, params) => {
+    const gate = scheduleGatedAdmission(["ops"], { narrow: true });
+    scheduleAgentStartupAdmission({
+      agentIds: ["main"],
+      openAgent: async () => {},
+      migrateAgent: async () => {},
+      narrowRequestsToAgent: true,
+    });
+    try {
+      await waitForAgentStartupAdmission("main");
+      const { invoked, request } = await dispatchRecorded(method, params);
+      expect(invoked).not.toHaveBeenCalled();
+      gate.resolve();
+      await request;
+      expect(invoked).toHaveBeenCalledOnce();
+    } finally {
+      gate.resolve();
+      await cancelAgentStartupAdmission();
+    }
+  });
 });

@@ -108,6 +108,7 @@ import {
   resolveAuthProfileDatabasePath as resolveAgentAuthPath,
   resolveAuthProfileStoreOwner,
   runAuthProfileWriteTransaction,
+  waitForAuthProfileDatabaseStartupAdmission,
   writePersistedAuthProfileStateRaw,
   writePersistedAuthProfileStoreRaw,
   type AuthProfileDatabase,
@@ -1505,6 +1506,14 @@ export function createAuthProfileStoreRuntime(
           stateDir: params.stateDir,
         });
       }
+      const writeOptions = {
+        sharedStoreWrite: params.sharedStoreWrite,
+        stateDir: params.stateDir,
+        env: params.stateDir ? undefined : getScopedAuthProfileEnv(),
+      };
+      // 目标库（可能是别的员工库：继承的 owner 凭据 / 落在员工库里的共享库）还在后台启动
+      // 准入时先等它，再进下面的同步写事务（ADR-0033 任务84(c) selfreview2 P2）。
+      await waitForAuthProfileDatabaseStartupAdmission(agentDir, writeOptions);
       store = runAuthProfileWriteTransaction(
         agentDir,
         (database, owner) => {
@@ -1529,11 +1538,7 @@ export function createAuthProfileStoreRuntime(
           }
           return loadedStore;
         },
-        {
-          sharedStoreWrite: params.sharedStoreWrite,
-          stateDir: params.stateDir,
-          env: params.stateDir ? undefined : getScopedAuthProfileEnv(),
-        },
+        writeOptions,
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

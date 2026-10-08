@@ -1,6 +1,7 @@
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resolvePathViaExistingAncestorSync } from "../../infra/boundary-path.js";
 import { toErrorObject } from "../../infra/errors.js";
+import { waitForAgentDatabaseStartupAdmission } from "../../state/agent-startup-admission.js";
 import { isUserModelAuthProfileId } from "../../state/user-model-account-id.js";
 import {
   listCandidateAuthProfileStores,
@@ -143,6 +144,9 @@ export async function fenceOAuthRefreshPeers(params: {
   const claims: OAuthRefreshPeerClaim[] = [];
   try {
     for (const candidate of await listPeerCandidates(params)) {
+      // 栅栏要同步写别的员工库：它还在后台启动准入就先等它（ADR-0033 任务84(c) selfreview2
+      // P2）。之后对同一批 claims 的同步回滚 / settle / fail 写的都是这里等过的库。
+      await waitForAgentDatabaseStartupAdmission(candidate.agentId);
       const store = loadCandidateAuthProfileStore(candidate);
       if (!store) {
         continue;
@@ -405,6 +409,7 @@ export async function removeOAuthRefreshGenerationPeers(params: {
   generation: OAuthCredential;
 }): Promise<void> {
   for (const candidate of await listPeerCandidates(params)) {
+    await waitForAgentDatabaseStartupAdmission(candidate.agentId);
     const store = loadCandidateAuthProfileStore(candidate);
     if (!store) {
       continue;

@@ -522,12 +522,20 @@ function startupAdmissionErrorShape(error: unknown): ErrorShape | undefined {
 /**
  * 员工库启动准入期间允许按员工收窄等待的方法（显式声明，默认一律等全部；selfreview P2-2）。
  * 不再扫描参数猜目标：附带的会话键、消息正文里恰好以 agent:<id>: 开头的文本、无前缀键
- * （解析到默认员工）都会让猜测收窄到错的员工。这里只收录"目标就是 sessionKey 指向的那一个
- * 会话、handler 只读该会话所在员工库"的读方法；新增方法前必须确认同样成立。
+ * （解析到默认员工）都会让猜测收窄到错的员工。收录条件（新增方法前必须确认同样成立）：
+ * - 目标就是 sessionKey 指向的那一个会话，handler 在进入运行之前只碰该员工的库；
+ * - 运行中如果跨员工：要么经 RPC 重新进入口等待（子 agent、sessions_send 等工具），要么
+ *   在跨员工写之前 await 对方库的准入（OAuth 刷新栅栏 / owner / 共享凭据库写入，见
+ *   waitForAgentDatabaseStartupAdmission）；只读连接池的跨员工读不经闸门。
+ * chat.send / agent 是面板与 LINE 首轮对话的入口（selfreview2）：收窄后首轮只等本员工准入。
+ * agent 不给 sessionKey 时按渠道 / 绑定选员工，入口算不出来——下面要求必须有带前缀的
+ * sessionKey，所以这种情况自然等全部。sessions.list 等本身跨员工的方法不能收录。
  */
 const STARTUP_ADMISSION_SESSION_KEY_SCOPED_METHODS: ReadonlySet<string> = new Set([
   "chat.history",
   "chat.message.get",
+  "chat.send",
+  "agent",
 ]);
 
 /**

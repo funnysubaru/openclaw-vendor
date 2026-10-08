@@ -1,7 +1,7 @@
 // Test environment helpers install process env defaults for tests.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import { createRequire } from "node:module";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -285,6 +285,33 @@ function initializeIsolatedTestEnv(tempHome: string): void {
   setTestEnvValue("XDG_CACHE_HOME", path.join(tempHome, ".cache"));
 }
 
+/**
+ * 让 os.homedir() 跟随本线程隔离后的 HOME / USERPROFILE。
+ *
+ * 为什么需要：vitest 默认 threads 池，worker 线程里的 process.env 只是本线程副本，
+ * 而 os.homedir() 走 libuv 直接读进程级真实环境变量，看不到上面 initializeIsolatedTestEnv
+ * 改写的 HOME。生产代码在调用方传入「不含 HOME / OPENCLAW_STATE_DIR 的显式 env」时
+ * （如 resolveStateDir(env)）会回退到 os.homedir()，于是落到开发者真实的 ~/.openclaw ——
+ * src/commands/auth-choice.test.ts 的 "uses explicit env…" 用例实测打开过真实的
+ * ~/.openclaw/state/openclaw.sqlite。forks 池下 process.env 写入会同步到 OS 环境，
+ * 本来就是这个行为，这里只是让 threads 池与之对齐。
+ *
+ * 边界：本线程 HOME 被测试删掉 / 置空时回退原始实现（与改动前一致）；
+ * 显式 vi.spyOn(os, "homedir") 的用例照常覆盖本补丁。
+ * syncBuiltinESMExports() 让 `import { homedir } from "node:os"` 的具名导入也拿到新函数。
+ */
+function followIsolatedHomeInOsHomedir(): () => void {
+  const originalHomedir = os.homedir;
+  os.homedir = () =>
+    (process.platform === "win32" ? process.env.USERPROFILE : process.env.HOME)?.trim() ||
+    originalHomedir();
+  syncBuiltinESMExports();
+  return () => {
+    os.homedir = originalHomedir;
+    syncBuiltinESMExports();
+  };
+}
+
 function ensureParentDir(targetPath: string): void {
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
 }
@@ -503,6 +530,8 @@ export function installTestEnv(options?: InstallTestEnvOptions): {
   };
   const rollback = captureFullEnv();
   let tempHome: string | undefined;
+  // 安装失败时 catch 分支也要撤销 os.homedir 补丁，所以提到 try 外。
+  let restoreHomedir = () => {};
   const removeHome = () => {
     if (!tempHome) {
       return;
@@ -526,6 +555,7 @@ export function installTestEnv(options?: InstallTestEnvOptions): {
     const restore = resolveRestoreEntries();
     tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-test-home-"));
     initializeIsolatedTestEnv(tempHome);
+    restoreHomedir = followIsolatedHomeInOsHomedir();
 
     if (hermetic) {
       for (const key of HERMETIC_TEST_ENV_KEYS) {
@@ -545,12 +575,14 @@ export function installTestEnv(options?: InstallTestEnvOptions): {
     return {
       tempHome,
       cleanup: () => {
+        restoreHomedir();
         restoreEnv(restore);
         removeHome();
       },
     };
   } catch (error) {
     // Successful live setup keeps profile additions; failed setup restores the caller exactly.
+    restoreHomedir();
     rollback.restore();
     removeHome();
     throw error;

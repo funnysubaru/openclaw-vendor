@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as openClawRoot from "../infra/openclaw-root.js";
 import * as testRuntimeEnvModule from "../infra/test-runtime-env.js";
 import {
+  areBundledPluginsDisabled,
   resolveBundledPluginsDir,
   resolveSourceCheckoutDependencyDiagnostic,
   shouldTrustTestBundledPluginsDirOverride,
@@ -535,7 +536,13 @@ describe("resolveBundledPluginsDir", () => {
     );
   });
 
-  it("does not let VITEST relax existing override trust checks", () => {
+  it("rechecks changed override trust within one cache owner", () => {
+    // 回搬自上游 #145226 配套测试:原测试只验证了单次解析结果,覆盖不到「同一个 cache owner
+    // 内,某个输入字段(这里是 OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR)变化后缓存是否真的
+    // 失效重算」这条关键路径——而这正是本次把 JSON.stringify 缓存键换成逐字段比较最容易引入
+    // 隐蔽 bug 的地方(漏比较一个字段 = 缓存假命中,返回陈旧结果)。于是改成在同一个
+    // withPluginCache owner 内连续翻转 trust 三次(false→true→false),每次都必须拿到对应的
+    // 正确结果,才能证明逐字段比较没有漏掉 trustOverride 这一项。
     const overrideRoot = makeRepoRoot("openclaw-bundled-dir-vitest-override-reject-");
     seedBundledPluginTree(overrideRoot, "extensions", "memory-core");
 
@@ -547,11 +554,22 @@ describe("resolveBundledPluginsDir", () => {
     delete process.env.OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR;
     delete process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS;
 
-    const bundledDir = requireBundledDir(resolveBundledPluginsDir());
-
-    expect(fs.realpathSync(bundledDir)).not.toBe(
-      fs.realpathSync(path.join(overrideRoot, "extensions")),
-    );
+    const expectedOverride = fs.realpathSync(path.join(overrideRoot, "extensions"));
+    withPluginCache(createPluginCache(), () => {
+      for (const trust of [false, true, false]) {
+        if (trust) {
+          process.env.OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR = "1";
+        } else {
+          delete process.env.OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR;
+        }
+        const bundledDir = fs.realpathSync(requireBundledDir(resolveBundledPluginsDir()));
+        if (trust) {
+          expect(bundledDir).toBe(expectedOverride);
+        } else {
+          expect(bundledDir).not.toBe(expectedOverride);
+        }
+      }
+    });
   });
 
   it("does not let VITEST add cwd to bundled plugin resolution candidates", () => {
@@ -727,5 +745,37 @@ describe("resolveBundledPluginsDir", () => {
     },
   ] as const)("$name", ({ createScenario }) => {
     expectInstalledBundledDirScenarioCase(createScenario);
+  });
+});
+
+// ADR-0033 任务72第二批：areBundledPluginsDisabled 原来每次调用都要重新
+// normalizeOptionalLowercaseString 一次——单次很便宜，但被按"员工 × 模型"反复调用的
+// resolveBundledPluginsDir/createResolutionKey 链路放大成秒级(真实数据 CPU profile self time
+// 3.4 秒)。加了一个按原始输入值做 size-1 记忆化。这里直接验证记忆化本身的正确性：同值复用、
+// 变了立刻重算，覆盖"从 true 变回 false"和"从有值变成 undefined"两个方向，不只测"调用一次
+// 不报错"。
+describe("areBundledPluginsDisabled", () => {
+  afterEach(() => {
+    delete process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS;
+  });
+
+  it("keeps returning true for repeated identical truthy values", () => {
+    expect(areBundledPluginsDisabled({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" })).toBe(true);
+    expect(areBundledPluginsDisabled({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" })).toBe(true);
+    expect(areBundledPluginsDisabled({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "true" })).toBe(true);
+  });
+
+  it("flips back to false immediately after the env value changes", () => {
+    expect(areBundledPluginsDisabled({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" })).toBe(true);
+    expect(areBundledPluginsDisabled({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "0" })).toBe(false);
+    expect(areBundledPluginsDisabled({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" })).toBe(true);
+  });
+
+  it("treats a missing env var the same across repeated calls and after a truthy value clears", () => {
+    expect(areBundledPluginsDisabled({})).toBe(false);
+    expect(areBundledPluginsDisabled({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "true" })).toBe(true);
+    // 从「有值」变回「undefined」也必须被当成输入变化重新计算，不能因为上一次缓存的是
+    // 字符串 "true" 而把这次的 undefined 误判成"没变"。
+    expect(areBundledPluginsDisabled({})).toBe(false);
   });
 });

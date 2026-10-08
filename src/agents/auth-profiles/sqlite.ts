@@ -21,7 +21,10 @@ import { isPathInside } from "../../infra/path-guards.js";
 import { resolveSqliteDatabaseFilePaths } from "../../infra/sqlite-files.js";
 import { readSqliteUserVersion } from "../../infra/sqlite-user-version.js";
 import { registerSqliteCacheExitClose } from "../../infra/sqlite-wal.js";
-import { waitForAgentDatabaseStartupAdmission } from "../../state/agent-startup-admission.js";
+import {
+  hasAgentStartupAdmissionState,
+  waitForAgentDatabaseStartupAdmission,
+} from "../../state/agent-startup-admission.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import {
   deferOpenClawAgentPostCommitPublication,
@@ -696,12 +699,16 @@ function resolveAuthProfileWriteEnv(options: AuthProfileWriteOptions): NodeJS.Pr
  * 任务84(c) selfreview2 P2）：写入目标若是某个员工库（含其它员工的库：继承来的 owner 凭据、
  * 落在员工库里的共享库），且它还在后台启动准入，就先等它完成；已失败则 reject 同一原因。
  * 目标库的推算与 runAuthProfileWriteTransaction 一致，只是不做共享库初始化。目标是状态库
- * （state-db 共享库）时不涉及员工库准入，直接返回。
+ * （state-db 共享库）、或调度器空闲时没有要等的，返回 undefined（调用方不必 await）。
  */
-export async function waitForAuthProfileDatabaseStartupAdmission(
+export function waitForAuthProfileDatabaseStartupAdmission(
   agentDir: string | undefined,
   options: AuthProfileWriteOptions = {},
-): Promise<void> {
+): Promise<void> | undefined {
+  // 非启动期调度器空闲：不推算目标库，调用方也不多一次 await（同步快速路径）。
+  if (!hasAgentStartupAdmissionState()) {
+    return undefined;
+  }
   const env = resolveAuthProfileWriteEnv(options);
   const shared = isSharedAuthStoreWrite({
     agentDir,
@@ -709,9 +716,7 @@ export async function waitForAuthProfileDatabaseStartupAdmission(
     env,
   });
   const target = resolveAuthProfileDatabaseOptions(shared ? undefined : agentDir, env);
-  if (target.kind === "agent") {
-    await waitForAgentDatabaseStartupAdmission(target.agentId);
-  }
+  return target.kind === "agent" ? waitForAgentDatabaseStartupAdmission(target.agentId) : undefined;
 }
 
 /** Runs an auth-profile database write transaction for store/state updates. */

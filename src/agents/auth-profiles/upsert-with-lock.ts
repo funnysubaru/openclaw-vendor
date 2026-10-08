@@ -189,10 +189,13 @@ export async function persistAuthProfileBatch(
       let stateWasAbsent = false;
       // 目标库还在后台启动准入时先等它，再进同步写事务（ADR-0033 任务84(c) selfreview2 P2）。
       // 之后的同步回滚写同一个库，届时准入早已完成。
-      await waitForAuthProfileDatabaseStartupAdmission(params.agentDir, {
+      const admission = waitForAuthProfileDatabaseStartupAdmission(params.agentDir, {
         sharedStoreWrite: true,
         stateDir: params.stateDir,
       });
+      if (admission) {
+        await admission;
+      }
       const preparedOwner = runAuthProfileWriteTransaction(
         params.agentDir,
         (database, owner) => {

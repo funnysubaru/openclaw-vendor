@@ -525,8 +525,10 @@ function startupAdmissionErrorShape(error: unknown): ErrorShape | undefined {
  * （解析到默认员工）都会让猜测收窄到错的员工。收录条件（新增方法前必须确认同样成立）：
  * - 目标就是 sessionKey 指向的那一个会话，handler 在进入运行之前只碰该员工的库；
  * - 运行中如果跨员工：要么经 RPC 重新进入口等待（子 agent、sessions_send 等工具），要么
- *   在跨员工写之前 await 对方库的准入（OAuth 刷新栅栏 / owner / 共享凭据库写入，见
- *   waitForAgentDatabaseStartupAdmission）；只读连接池的跨员工读不经闸门。
+ *   在跨员工访问之前 await 对方库的准入（OAuth 刷新栅栏 / owner / 共享凭据库写入、
+ *   session_status 的用量读取，见 waitForAgentDatabaseStartupAdmission）。只读连接池
+ *   （auth 读取、*ReadOnly 会话读取）的跨员工读不经闸门；但并非所有"读"都走只读池——
+ *   会话投影快照等读路径用的是可写的同步开库，会经过同步闸门，在准入窗口内由兜底拒绝。
  * chat.send / agent 是面板与 LINE 首轮对话的入口（selfreview2）：收窄后首轮只等本员工准入。
  * agent 不给 sessionKey 时按渠道 / 绑定选员工，入口算不出来——下面要求必须有带前缀的
  * sessionKey，所以这种情况自然等全部。sessions.list 等本身跨员工的方法不能收录。

@@ -1513,7 +1513,10 @@ export function createAuthProfileStoreRuntime(
       };
       // 目标库（可能是别的员工库：继承的 owner 凭据 / 落在员工库里的共享库）还在后台启动
       // 准入时先等它，再进下面的同步写事务（ADR-0033 任务84(c) selfreview2 P2）。
-      await waitForAuthProfileDatabaseStartupAdmission(agentDir, writeOptions);
+      const admission = waitForAuthProfileDatabaseStartupAdmission(agentDir, writeOptions);
+      if (admission) {
+        await admission;
+      }
       store = runAuthProfileWriteTransaction(
         agentDir,
         (database, owner) => {

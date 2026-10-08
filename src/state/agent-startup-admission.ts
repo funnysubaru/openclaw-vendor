@@ -58,22 +58,43 @@ export class AgentStartupAdmissionPendingError extends Error {
   }
 }
 
+/** 调度器里有没有在途或已失败的准入；空闲时（非启动期）各等待入口直接返回，不做任何推算。 */
+export function hasAgentStartupAdmissionState(): boolean {
+  return pendingByAgentId.size > 0 || failedByAgentId.size > 0;
+}
+
 /**
- * 能 await 的代码要写某个具体物理库（options.agentId = 库 owner）之前调用（selfreview2 P2）：
- * 该库还在后台启动准入就等它完成，已失败就 reject 同一原因；调度器 cancel（关停 / 热重启）
- * 立即以 AbortError 结束。用于"一轮对话里跨员工写别的员工库"这类入口收窄时没等到的库——
- * 例如 OAuth 刷新给其它员工库写刷新栅栏、写 owner / 共享凭据库。同步开库入口自己没法等，
- * 所以由这些写入方在进入同步写之前先 await 这一步。不在准入中返回 undefined。
+ * 等待目标与调度器停止信号（以及调用方额外的信号）竞速：任一中止立即以 AbortError 结束。
+ * signal 已中止时竞速会直接返回、不再订阅 target，所以先挂一个空处理，免得失败原因变成
+ * 未处理 rejection（等待方照样从竞速结果里拿到失败）。
+ */
+function raceWithAdmissionSignals(
+  target: Promise<void>,
+  extraSignals: ReadonlyArray<AbortSignal | undefined> = [],
+): Promise<void> {
+  const signals = [controller?.signal, ...extraSignals].filter(
+    (signal): signal is AbortSignal => signal !== undefined,
+  );
+  target.catch(() => {});
+  return racePromiseWithAbortSignal(target, AbortSignal.any(signals));
+}
+
+/**
+ * 能 await 的代码要写某个具体物理库之前调用（selfreview2 P2）。databaseAgentId 是该库的
+ * 物理 owner（即开库 options.agentId，也是准入调度的 key）。该库还在后台启动准入就等它完成，
+ * 已失败就 reject 同一原因；调度器 cancel（关停 / 热重启）立即以 AbortError 结束。用于"一轮
+ * 对话里跨员工写别的员工库"这类入口收窄时没等到的库——例如 OAuth 刷新给其它员工库写刷新
+ * 栅栏、写 owner / 共享凭据库。同步开库入口自己没法等，所以由这些写入方在进入同步写之前先
+ * await 这一步。不在准入中返回 undefined。
  */
 export function waitForAgentDatabaseStartupAdmission(
   databaseAgentId: string,
 ): Promise<void> | undefined {
-  const target = waitForAgentStartupAdmission(databaseAgentId);
-  if (!target) {
+  if (!hasAgentStartupAdmissionState()) {
     return undefined;
   }
-  target.catch(() => {});
-  return racePromiseWithAbortSignal(target, controller?.signal);
+  const target = waitForAgentStartupAdmission(databaseAgentId);
+  return target ? raceWithAdmissionSignals(target) : undefined;
 }
 
 /**
@@ -204,26 +225,14 @@ export function waitForAgentStartupAdmission(agentId: string): Promise<void> | u
 export function waitForAgentStartupAdmissionBeforeRequest(
   params: { agentId?: string; signals?: ReadonlyArray<AbortSignal | undefined> } = {},
 ): Promise<void> | undefined {
-  if (
-    (pendingByAgentId.size === 0 && failedByAgentId.size === 0) ||
-    ownAdmission.getStore()?.active
-  ) {
+  if (!hasAgentStartupAdmissionState() || ownAdmission.getStore()?.active) {
     return undefined;
   }
   const target =
     params.agentId && narrowRequestsToAgent
       ? waitForAgentStartupAdmission(params.agentId)
       : waitForAllAgentStartupAdmissions(params.agentId);
-  if (!target) {
-    return undefined;
-  }
-  const signals = [controller?.signal, ...(params.signals ?? [])].filter(
-    (signal): signal is AbortSignal => signal !== undefined,
-  );
-  // signal 已中止时竞速会直接返回、不再订阅 target；先挂一个空处理，免得失败原因变成
-  // 未处理 rejection（等待方照样从竞速结果里拿到失败）。
-  target.catch(() => {});
-  return racePromiseWithAbortSignal(target, AbortSignal.any(signals));
+  return target ? raceWithAdmissionSignals(target, params.signals) : undefined;
 }
 
 /**

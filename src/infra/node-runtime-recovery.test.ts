@@ -9,7 +9,11 @@ import os from "node:os";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core/expect";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
-import { isUsableNode, recoverNodeRuntime } from "../../node-runtime-recovery.mjs";
+import {
+  isUsableNode,
+  recoverNodeRuntime,
+  resolveLauncherRespawnStdio,
+} from "../../node-runtime-recovery.mjs";
 import { SQLITE_CAPABILITY_PROBE } from "../../node-sqlite.mjs";
 import { buildTaskScript } from "../daemon/schtasks-layout.js";
 import { withTempDir } from "../test-utils/temp-dir.js";
@@ -926,5 +930,58 @@ describe("candidate admission probe", () => {
 
       expect(isUsableNode(candidate)).toBe(false);
     });
+  });
+});
+
+// Yuiclaw：启动器自我重启时转传 Windows 优雅关闭控制通道（OPENCLAW_CONTROL_FD）。
+// 回归点：源码目录 / 正式包都会经 runRespawnedChild 自我重启一次，原来只转 0-2，
+// 里层 fd 3 被普通文件占掉 → 控制通道装不上、关窗口只能强杀。
+describe("launcher respawn control fd forwarding", () => {
+  it("keeps plain inherit and the same env object without a control fd", () => {
+    const env = { PATH: "/bin" };
+    const fdIsOpen = vi.fn(() => true);
+    expect(resolveLauncherRespawnStdio(env, fdIsOpen)).toEqual({ stdio: "inherit", env });
+    expect(resolveLauncherRespawnStdio(env, fdIsOpen).env).toBe(env);
+    expect(fdIsOpen).not.toHaveBeenCalled();
+  });
+
+  it("forwards an open control fd to the same descriptor in the child", () => {
+    const env = { PATH: "/bin", OPENCLAW_CONTROL_FD: "3" };
+    expect(resolveLauncherRespawnStdio(env, () => true)).toEqual({
+      stdio: ["inherit", "inherit", "inherit", 3],
+      env,
+    });
+    expect(resolveLauncherRespawnStdio({ OPENCLAW_CONTROL_FD: " 5 " }, () => true).stdio).toEqual([
+      "inherit",
+      "inherit",
+      "inherit",
+      "ignore",
+      "ignore",
+      5,
+    ]);
+  });
+
+  it.each(["0", "1", "2", "abc", "3abc", "1e3", "3.5", "", "-3"])(
+    "drops invalid control fd value %j instead of forwarding it",
+    (raw) => {
+      const result = resolveLauncherRespawnStdio(
+        { PATH: "/bin", OPENCLAW_CONTROL_FD: raw },
+        () => true,
+      );
+      expect(result).toEqual({ stdio: "inherit", env: { PATH: "/bin" } });
+    },
+  );
+
+  it("drops a control fd this launcher does not hold", () => {
+    const result = resolveLauncherRespawnStdio(
+      { PATH: "/bin", OPENCLAW_CONTROL_FD: "3" },
+      () => false,
+    );
+    expect(result).toEqual({ stdio: "inherit", env: { PATH: "/bin" } });
+  });
+
+  it("probes real descriptors by default", () => {
+    const result = resolveLauncherRespawnStdio({ OPENCLAW_CONTROL_FD: "2147483000" });
+    expect(result).toEqual({ stdio: "inherit", env: {} });
   });
 });

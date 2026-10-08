@@ -54,6 +54,34 @@ describe("runRespawnChildWithSignalBridge", () => {
     });
   });
 
+  // Yuiclaw fork：外壳手上没有父进程声明的控制 fd 时，绝不能把一个不存在的 fd 塞进 stdio（spawn
+  // 会直接失败、gateway 起不来），而是保持 "inherit" 并从里层 env 删掉该变量。转传成功的分支见
+  // gateway-control-channel.test.ts（需要可控的 fd 探测，不依赖测试进程真实 fd 表）。
+  it("drops an unusable OPENCLAW_CONTROL_FD instead of forwarding it", () => {
+    const { child } = createChild(1234);
+    const spawnChild = vi.fn(() => child);
+
+    runRespawnChildWithSignalBridge({
+      command: "/usr/bin/node",
+      args: ["/repo/openclaw/dist/entry.js"],
+      // 测试进程里不可能开着 fd 2147483000，fstat 必然失败。
+      env: { OPENCLAW_CONTROL_FD: "2147483000", KEEP: "1" },
+      stdioIsTerminal: false,
+      runtime: {
+        spawn: spawnChild as unknown as typeof spawn,
+        attachChildProcessBridge: vi.fn(),
+        exit: vi.fn<RespawnChildRuntime["exit"]>(),
+      },
+      onError: vi.fn(),
+    });
+
+    expect(spawnChild).toHaveBeenCalledWith("/usr/bin/node", ["/repo/openclaw/dist/entry.js"], {
+      stdio: "inherit",
+      env: { KEEP: "1" },
+      detached: false,
+    });
+  });
+
   it.each([
     { signal: "SIGINT" as const, laterSignal: "SIGTERM" as const, exitCode: 130 },
     { signal: "SIGTERM" as const, laterSignal: "SIGINT" as const, exitCode: 143 },

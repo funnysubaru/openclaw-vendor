@@ -11,6 +11,8 @@ import type { ManifestModelSuppressionResolver } from "./manifest-model-suppress
 import type { PluginManifestRecord } from "./manifest-registry.types.js";
 import type { PluginMetadataSnapshot } from "./plugin-metadata-snapshot.types.js";
 import type { ProviderPolicyOwnerIndex } from "./provider-policy-owners.types.js";
+import type { BundledProviderPolicySurface } from "./provider-policy-surface.js";
+import type { PluginRegistry } from "./registry-types.js";
 
 type CurrentPluginMetadataCacheState = {
   snapshot: unknown;
@@ -26,7 +28,18 @@ type CurrentPluginMetadataCacheState = {
 
 export type PluginCacheMetadata = {
   metadata: {
-    bundledPluginsDir?: { key: string; value: string | undefined };
+    // 回搬自上游 #145226（ADR-0033 任务 72 第二批）：按字段逐一比较的缓存条目，命中时零字符串分配；
+    // 为什么这么改、哪些输入变化会触发重算见 bundled-dir.ts 的 resolveBundledPluginsDir。
+    bundledPluginsDir?: {
+      moduleUrl: string;
+      disabled: boolean;
+      resolvedOverride: string | undefined;
+      trustOverride: boolean;
+      argv1: string | undefined;
+      execPath: string;
+      cwd: string | undefined;
+      value: string | undefined;
+    };
     bundledDiscoveryMode?: { value: "compat" | "allowlist" | undefined };
     current: CurrentPluginMetadataCacheState;
     snapshots: Map<string, PluginMetadataSnapshot>;
@@ -44,6 +57,19 @@ export type PluginCacheMetadata = {
     // gatewaySnapshot.manifestRegistry），按 registry 对象身份做一次性索引缓存，避免每次 provider 策略查询
     // 都重新 toSorted(localeCompare) + 为每个插件重建 Set（CPU profile 实测单进程首轮约占 30 秒）。
     providerPolicyOwners: WeakMap<object, ProviderPolicyOwnerIndex>;
+    // ADR-0033 任务72第二批：resolveDirectBundledProviderPolicySurface 按 pluginId 的结果缓存，
+    // 用 registry 引用 / registry 版本号 / selection（bundledPluginsDir 缓存条目对象）三项判断失效；
+    // 为什么需要、三类失效边界的详细说明见 provider-policy-surface.ts 的同名函数。整个 Map 随 cache
+    // owner 更换（gateway 重启/管理范围切换/config 热重载）整体丢弃重建。
+    bundledProviderPolicySurfaces: Map<
+      string,
+      {
+        registry: PluginRegistry | null;
+        version: number | undefined;
+        selection: unknown;
+        value: BundledProviderPolicySurface | null;
+      }
+    >;
     modelSuppressionResolvers: WeakMap<
       PluginMetadataSnapshot,
       {
@@ -79,6 +105,7 @@ export function createPluginCacheMetadata(): PluginCacheMetadata {
       staticCatalogStates: new WeakMap(),
       modelSuppressionResolvers: new WeakMap(),
       providerPolicyOwners: new WeakMap(),
+      bundledProviderPolicySurfaces: new Map(),
     },
   };
 }

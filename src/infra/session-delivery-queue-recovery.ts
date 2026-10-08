@@ -1,4 +1,7 @@
 // Recovers queued session deliveries after process crashes.
+import { parseAgentSessionKey } from "../routing/session-key.js";
+import { waitForAgentStartupAdmissionBeforeRequest } from "../state/agent-startup-admission.js";
+import { isAbortError } from "./abort-signal.js";
 import {
   createDeliveryRecoveryCoordinator,
   createEmptyDeliveryRecoverySummary,
@@ -171,6 +174,25 @@ async function processPendingSessionDelivery(opts: {
   }
   if ((await opts.beforeDelivery?.()) === "stop") {
     return { status: "stop" };
+  }
+  // ADR-0033 任务84(c)：重放会读写该员工的会话库；后台启动准入未完成时先等它，不撞同步
+  // 开库入口的可重试兜底。准入失败就延后（不计重试），网关关闭就停止本轮。
+  const startupAdmission = waitForAgentStartupAdmissionBeforeRequest({
+    agentId:
+      (entry.kind === "systemEvent" ? entry.agentId : undefined) ??
+      parseAgentSessionKey(entry.sessionKey)?.agentId,
+  });
+  if (startupAdmission) {
+    const refused = await startupAdmission.then(
+      () => undefined,
+      (error: unknown) => ({ error }),
+    );
+    if (refused) {
+      context.log.warn(
+        `${context.logLabel}: entry ${entry.id} deferred: agent database startup admission did not complete: ${formatErrorMessage(refused.error)}`,
+      );
+      return { status: isAbortError(refused.error) ? "stop" : "deferred" } as const;
+    }
   }
 
   let result: SessionDeliverySettledOutcome;

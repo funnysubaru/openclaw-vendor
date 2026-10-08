@@ -7,6 +7,8 @@ import type {
 } from "../../channels/message/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
+import { waitForAgentStartupAdmissionBeforeRequest } from "../../state/agent-startup-admission.js";
+import { isAbortError } from "../abort-signal.js";
 import {
   createDeliveryRecoveryCoordinator,
   createEmptyDeliveryRecoverySummary,
@@ -1225,6 +1227,24 @@ async function processQueuedRecovery(
       context.onDeadlineExceeded();
     }
     return "stop";
+  }
+  // ADR-0033 任务84(c)：投递会读写该员工的会话库；后台启动准入未完成时先等它，不撞同步
+  // 开库入口的可重试兜底。等不到（准入失败 / 网关关闭）就原样留下这条，不计重试次数，
+  // 下一轮恢复再处理。
+  const startupAdmission = waitForAgentStartupAdmissionBeforeRequest({
+    agentId: entry.session?.agentId,
+  });
+  if (startupAdmission) {
+    const refused = await startupAdmission.then(
+      () => undefined,
+      (error: unknown) => ({ error }),
+    );
+    if (refused) {
+      log.warn(
+        `${label} deferred: agent database startup admission did not complete: ${formatErrorMessage(refused.error)}`,
+      );
+      return isAbortError(refused.error) ? "stop" : "continue";
+    }
   }
   // Pacing is the final await before a new durable attempt is admitted. A
   // lifecycle fence here leaves the untouched row and retry metadata intact.

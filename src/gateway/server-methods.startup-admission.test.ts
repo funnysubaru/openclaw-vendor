@@ -189,4 +189,28 @@ describe("gateway request entry waits for agent startup admission", () => {
     expect(run).toHaveBeenCalledOnce();
     expect(res.statusCode).toBe(503);
   });
+
+  it("免等白名单：心跳方法 last-heartbeat 在准入中立即返回，白名单外的方法仍等待", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      await state.writeConfig(cfg);
+      const gate = scheduleGatedAdmission(["main"]);
+      try {
+        const heartbeat = dispatch("last-heartbeat", {});
+        const presence = dispatch("system-presence", {});
+        await Promise.race([heartbeat.request, tick(2_000)]);
+        expect(heartbeat.respond).toHaveBeenCalledOnce();
+        expect(heartbeat.respond.mock.calls[0]?.[0]).toBe(true);
+        // 白名单外（即便同样只读内存）也照常等待：防止白名单被写成全放行。
+        await Promise.race([presence.request, tick(500)]);
+        expect(presence.respond).not.toHaveBeenCalled();
+
+        gate.resolve();
+        await presence.request;
+        expect(presence.respond.mock.calls[0]?.[0]).toBe(true);
+      } finally {
+        gate.resolve();
+        await cancelAgentStartupAdmission();
+      }
+    });
+  });
 });

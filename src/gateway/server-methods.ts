@@ -488,6 +488,15 @@ export async function runWithGatewayRequestEnvelope<T>(
 }
 
 /**
+ * 员工库后台启动准入期间免等的方法（显式白名单，只此一个）：给客户端连接心跳用——Yuiclaw
+ * 面板每 25 秒发一次、10 秒没回就判掉线重连，准入窗口一长，等待会让心跳超时、连接级联重连。
+ * last-heartbeat 的 handler 只读进程内存里最近一次 heartbeat 事件，不读任何员工库。
+ * 往这里加新方法前必须确认它的 handler 及整条调用链同样不读员工库：读的话会在准入完成前
+ * 读到未迁移的数据，或撞上同步开库入口的可重试兜底。
+ */
+const STARTUP_ADMISSION_EXEMPT_METHODS: ReadonlySet<string> = new Set(["last-heartbeat"]);
+
+/**
  * 请求参数里能直接看出目标员工时（agentId，或 agent:<id>: 形式的 sessionKey）只等这一个
  * 员工；看不出就返回 undefined，由等待 helper 等全部在途准入。
  */
@@ -546,8 +555,8 @@ export async function handleGatewayRequest(
     // ADR-0033 任务84(c)：员工库后台启动准入未完成时，请求在进 handler 前透明等待（handler
     // 里大量同步读员工库，同步入口只能拒绝不能等）。放在 root work 准入之前，等待期间不占
     // 重启 / 挂起要排空的 root work；入口租约关闭（close 前奏）或请求中止都会立即打断等待。
-    // continuation 是已在跑的工作的回包，不等。
-    if (opts.admission !== "continuation") {
+    // continuation 是已在跑的工作的回包，不等；白名单方法见 STARTUP_ADMISSION_EXEMPT_METHODS。
+    if (opts.admission !== "continuation" && !STARTUP_ADMISSION_EXEMPT_METHODS.has(req.method)) {
       const startupAdmission = waitForAgentStartupAdmissionBeforeRequest({
         agentId: resolveStartupAdmissionAgentId(req.params),
         signals: [signal, context.requestEntryLifetime?.signal],

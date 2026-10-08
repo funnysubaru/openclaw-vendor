@@ -11,6 +11,11 @@ vi.mock("../utils/sleep.js", () => ({ sleep: sleepMock }));
 
 import { createInfoWarnErrorLogger } from "../../test/helpers/mock-logger.js";
 import {
+  cancelAgentStartupAdmission,
+  scheduleAgentStartupAdmission,
+} from "../state/agent-startup-admission.js";
+import { racePromiseWithAbortSignal } from "./abort-signal.js";
+import {
   drainPendingSessionDelivery,
   recoverPendingSessionDeliveries,
 } from "./session-delivery-queue-recovery.js";
@@ -813,5 +818,85 @@ describe("session-delivery queue recovery", () => {
     });
 
     vi.useRealTimers();
+  });
+
+  // ADR-0033 任务84(c)：重放会读写员工会话库；后台启动准入未完成时先等它，准入完成后照常
+  // 重放；等待中网关关闭则停止本轮、条目原样留待下次。
+  describe("agent startup admission", () => {
+    function scheduleGatedAdmission() {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      scheduleAgentStartupAdmission({
+        agentIds: ["main"],
+        openAgent: async (_agentId, signal) => await racePromiseWithAbortSignal(gate, signal),
+        migrateAgent: async () => {},
+      });
+      return release;
+    }
+
+    it("waits for the agent's admission before replaying, then replays", async () => {
+      await withTestDir({ prefix: "openclaw-session-delivery-admission-" }, async (tempDir) => {
+        await enqueueSessionDelivery(
+          {
+            kind: "agentTurn",
+            sessionKey: "agent:main:main",
+            message: "resume",
+            messageId: "restart:admission",
+          },
+          tempDir,
+        );
+        const release = scheduleGatedAdmission();
+        try {
+          const deliver = vi.fn(async () => undefined);
+          const recovery = recoverPendingSessionDeliveries({
+            deliver,
+            stateDir: tempDir,
+            log: createInfoWarnErrorLogger(),
+          });
+          await new Promise((resolve) => {
+            setTimeout(resolve, 100);
+          });
+          expect(deliver).not.toHaveBeenCalled();
+
+          release();
+          const summary = await recovery;
+          expect(deliver).toHaveBeenCalledTimes(1);
+          expect(summary.recovered).toBe(1);
+        } finally {
+          release();
+          await cancelAgentStartupAdmission();
+        }
+      });
+    });
+
+    it("stops without replaying when the gateway closes during the wait", async () => {
+      await withTestDir({ prefix: "openclaw-session-delivery-admission-" }, async (tempDir) => {
+        await enqueueSessionDelivery(
+          {
+            kind: "agentTurn",
+            sessionKey: "agent:main:main",
+            message: "resume",
+            messageId: "restart:admission-cancel",
+          },
+          tempDir,
+        );
+        scheduleGatedAdmission();
+        const deliver = vi.fn(async () => undefined);
+        const recovery = recoverPendingSessionDeliveries({
+          deliver,
+          stateDir: tempDir,
+          log: createInfoWarnErrorLogger(),
+        });
+        await new Promise((resolve) => {
+          setTimeout(resolve, 50);
+        });
+        await cancelAgentStartupAdmission();
+        await recovery;
+        expect(deliver).not.toHaveBeenCalled();
+        expect(await loadPendingSessionDeliveries(tempDir)).toHaveLength(1);
+      });
+    });
   });
 });

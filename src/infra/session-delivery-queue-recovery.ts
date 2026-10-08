@@ -127,6 +127,8 @@ type SessionDeliveryDrainContext = {
   stateDir?: string;
   deliver: DeliverSessionDeliveryFn;
   onSettled?: SettleSessionDeliveryFn;
+  /** 调用方（恢复任务 / 投递运行时）的停止信号：关闭时要能打断在员工库启动准入上的等待。 */
+  signal?: AbortSignal;
 };
 
 async function processPendingSessionDelivery(opts: {
@@ -177,10 +179,13 @@ async function processPendingSessionDelivery(opts: {
   }
   // ADR-0033 任务84(c)：重放会读写该员工的会话库；后台启动准入未完成时先等它，不撞同步
   // 开库入口的可重试兜底。准入失败就延后（不计重试），网关关闭就停止本轮。
+  // 同时订阅调用方的停止信号（review2 P2-2）：关闭前置阶段先 await 投递运行时退出，之后才
+  // 轮到 cancelAgentStartupAdmission，只订阅调度器取消的话关闭会被慢准入拖住。
   const startupAdmission = waitForAgentStartupAdmissionBeforeRequest({
     agentId:
       (entry.kind === "systemEvent" ? entry.agentId : undefined) ??
       parseAgentSessionKey(entry.sessionKey)?.agentId,
+    signals: [context.signal],
   });
   if (startupAdmission) {
     const refused = await startupAdmission.then(
@@ -305,6 +310,7 @@ export async function recoverPendingSessionDeliveries(opts: {
   stateDir?: string;
   maxRecoveryMs?: number;
   maxEnqueuedAt?: number;
+  signal?: AbortSignal;
 }): Promise<DeliveryRecoverySummary> {
   const pending = (await loadPendingSessionDeliveries(opts.stateDir)).filter(
     (entry) => opts.maxEnqueuedAt == null || entry.enqueuedAt <= opts.maxEnqueuedAt,

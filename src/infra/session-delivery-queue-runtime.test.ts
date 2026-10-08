@@ -1,6 +1,10 @@
 // Covers same-process scheduling for durable session delivery retries.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferredCore } from "../shared/deferred.js";
+import {
+  cancelAgentStartupAdmission,
+  scheduleAgentStartupAdmission,
+} from "../state/agent-startup-admission.js";
 import { withTestDir } from "../test-helpers/temp-dir.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { drainPendingSessionDelivery } from "./session-delivery-queue-recovery.js";
@@ -67,6 +71,47 @@ describe("session delivery queue runtime", () => {
       expect(onSettled).toHaveBeenCalledWith(expect.objectContaining({ id }), "recovered");
       expect(await loadPendingSessionDeliveries()).toStrictEqual([]);
       await stop();
+    });
+  });
+
+  // review2 P2-2：关闭前置阶段先 await 投递运行时 stop，之后才取消员工库启动准入。
+  // 排空停在准入等待上时，运行时自己的 stop 必须立即打断，条目原样保留。
+  it("stops promptly while a drain waits for agent startup admission", async () => {
+    await withRuntime(async (startRuntime) => {
+      const id = await enqueueSessionDelivery({
+        kind: "agentTurn",
+        sessionKey: "agent:main:main",
+        message: "resume",
+        messageId: "admission:runtime-stop",
+      });
+      const admissionGate = createDeferredCore<void>();
+      scheduleAgentStartupAdmission({
+        agentIds: ["main"],
+        openAgent: async () => await admissionGate.promise,
+        migrateAgent: async () => {},
+      });
+      try {
+        const deliver = vi.fn(async () => {});
+        const stop = startRuntime({ deliver, log: logger });
+        await expect(scheduleSessionDelivery(id)).resolves.toBe(true);
+        await new Promise((resolve) => {
+          setTimeout(resolve, 200);
+        });
+        expect(deliver).not.toHaveBeenCalled();
+
+        const outcome = await Promise.race([
+          stop().then(() => "stopped" as const),
+          new Promise<"blocked">((resolve) => {
+            setTimeout(() => resolve("blocked"), 2_000);
+          }),
+        ]);
+        expect(outcome).toBe("stopped");
+        expect(deliver).not.toHaveBeenCalled();
+        expect(await loadPendingSessionDelivery(id)).toBeTruthy();
+      } finally {
+        admissionGate.resolve();
+        await cancelAgentStartupAdmission();
+      }
     });
   });
 

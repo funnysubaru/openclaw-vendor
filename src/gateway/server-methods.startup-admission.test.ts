@@ -2,16 +2,24 @@
 // 而不是撞上同步开库入口的可重试错误；等待能被关闭 / 热重启打断，失败的员工立即返回
 // 同一原因。走真实分发层 handleGatewayRequest + 真实 handler + 真实临时 SQLite。
 import type { ServerResponse } from "node:http";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { upsertSessionEntryCore } from "../config/sessions/session-accessor.js";
+import {
+  resolveSqliteReadScope,
+  toDatabaseOptions,
+} from "../config/sessions/session-accessor.sqlite-scope.js";
+import { scheduleBackgroundSessionStartupMigration } from "../config/sessions/startup-migration.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
+import * as integrityWorker from "../infra/sqlite-integrity-worker.js";
 import {
   cancelAgentStartupAdmission,
   resetAgentStartupAdmissionForTest,
   scheduleAgentStartupAdmission,
 } from "../state/agent-startup-admission.js";
+import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { createDirectChatContext } from "./server-chat.agent-events.test-helpers.js";
 import { handleGatewayRequest } from "./server-methods.js";
@@ -209,6 +217,70 @@ describe("gateway request entry waits for agent startup admission", () => {
         expect(presence.respond.mock.calls[0]?.[0]).toBe(true);
       } finally {
         gate.resolve();
+        await cancelAgentStartupAdmission();
+      }
+    });
+  });
+
+  // review2 P2-1：准入按数据库物理 owner 登记。共享库里 agent:ops:shared 的会话存在 main
+  // 的库里，main 准入中时请求必须等 main，而不是只看逻辑员工 ops。走真实目标解析和真实
+  // 后台迁移调度（完整性检查卡住让 main 停在准入的 open 阶段）。
+  it("共享库：按物理 owner 等待，main 准入完成前不读 ops 所在的共享库", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      const sharedCfg = {
+        agents: {
+          ownership: "explicit",
+          defaults: { sessionStore: { agentId: "main" } },
+          entries: { main: {}, ops: {} },
+        },
+        session: { store: path.join(state.root, "custom", "shared.sqlite") },
+      } satisfies OpenClawConfig;
+      await state.writeConfig(sharedCfg);
+      const sharedScope = {
+        agentId: "ops",
+        sessionKey: "agent:ops:shared",
+        sessionId: "ops-shared",
+        storePath: sharedCfg.session.store,
+      };
+      await upsertSessionEntryCore(sharedScope, { sessionId: sharedScope.sessionId, updatedAt: 1 });
+      // 前置条件自证：这条会话的物理库 owner 是 main。
+      expect(toDatabaseOptions(resolveSqliteReadScope(sharedScope)).agentId).toBe("main");
+      closeOpenClawAgentDatabasesForTest();
+
+      // 让 main 停在 open 阶段的完整性检查里（库此时是冷的，同步开库会撞兜底）。
+      const workerEntered = createDeferred<void>();
+      const releaseWorker = createDeferred<void>();
+      const actualCheck = integrityWorker.assertSqliteIntegrityInWorker;
+      vi.spyOn(integrityWorker, "assertSqliteIntegrityInWorker").mockImplementation(
+        async (pathname, busyTimeoutMs, signal) => {
+          workerEntered.resolve();
+          await releaseWorker.promise;
+          return await actualCheck(pathname, busyTimeoutMs, signal);
+        },
+      );
+      await scheduleBackgroundSessionStartupMigration({
+        cfg: { ...sharedCfg, session: { ...sharedCfg.session, mainKey: "work" } },
+        log: { info: vi.fn(), warn: vi.fn() },
+      });
+      await workerEntered.promise;
+      try {
+        // sessions.list 的读取不经过同步开库兜底：修前它只看逻辑员工 ops（不在准入中）就直接
+        // 读了 main 名下、仍在准入中的共享库。
+        const { request, respond } = dispatch(
+          "sessions.list",
+          { agentId: "ops" },
+          createDirectChatContext({ getRuntimeConfig: () => sharedCfg }),
+        );
+        await Promise.race([request, tick(2_000)]);
+        expect(respond).not.toHaveBeenCalled();
+
+        releaseWorker.resolve();
+        await request;
+        expect(respond).toHaveBeenCalledOnce();
+        expect(respond.mock.calls[0]?.[0]).toBe(true);
+      } finally {
+        releaseWorker.resolve();
+        vi.restoreAllMocks();
         await cancelAgentStartupAdmission();
       }
     });

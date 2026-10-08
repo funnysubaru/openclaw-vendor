@@ -241,8 +241,12 @@ export async function scheduleBackgroundSessionStartupMigration(params: {
 
   const databases = new Set<string>();
   const itemsByAgentId = new Map<string, PreparedBackgroundSessionStartupMigrationTarget[]>();
+  // 逻辑员工 → 实际库 owner，与下面准入登记用同一次真实存储目标解析（review2 P2-1）。
+  // 去重 / 不存在 / 已删除而跳过的目标也照记：它指向的 owner 没被调度时等待方自然不用等。
+  const owners: Array<readonly [string, string]> = [];
   for (const target of targets) {
     const options = toDatabaseOptions(resolveSqliteReadScope({ ...target, env }));
+    owners.push([target.agentId, options.agentId]);
     const databasePath = resolveOpenClawAgentSqlitePath(options);
     if (databases.has(databasePath) || !fs.existsSync(databasePath)) {
       continue;
@@ -285,6 +289,7 @@ export async function scheduleBackgroundSessionStartupMigration(params: {
 
   scheduleAgentStartupAdmission({
     agentIds: [...itemsByAgentId.keys()],
+    owners,
     openAgent: async (agentId) => {
       const items = itemsByAgentId.get(agentId) ?? [];
       try {

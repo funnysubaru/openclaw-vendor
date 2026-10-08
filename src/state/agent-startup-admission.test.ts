@@ -8,6 +8,7 @@ import {
   resetAgentStartupAdmissionForTest,
   scheduleAgentStartupAdmission,
   waitForAgentStartupAdmission,
+  waitForAgentStartupAdmissionBeforeRequest,
 } from "./agent-startup-admission.js";
 
 afterEach(() => {
@@ -277,5 +278,43 @@ describe("agent-startup-admission", () => {
     });
     await expect(waitForAgentStartupAdmission("broken")).rejects.toBe(failure);
     expect(() => assertAgentStartupAdmissionSettled("broken")).toThrow(failure);
+  });
+
+  // review2 P2-1：请求入口给的是逻辑员工，准入按物理库 owner 登记。共享库下 ops 的会话在
+  // main 名下的库里：ops 自己准入完了也得等 main；完全不认识的员工退回等全部。
+  it("请求入口按逻辑员工 → 物理 owner 映射等待，不认识的员工等全部", async () => {
+    const mainGate = deferred();
+    scheduleAgentStartupAdmission({
+      agentIds: ["main", "ops"],
+      openAgent: async (agentId) => {
+        if (agentId === "main") {
+          await mainGate.promise;
+        }
+      },
+      migrateAgent: async () => {},
+      owners: [["ops", "main"]],
+    });
+    await waitForAgentStartupAdmission("ops");
+    let opsSettled = false;
+    let unknownSettled = false;
+    void waitForAgentStartupAdmissionBeforeRequest({ agentId: "ops" })?.then(() => {
+      opsSettled = true;
+    });
+    void waitForAgentStartupAdmissionBeforeRequest({ agentId: "stranger" })?.then(() => {
+      unknownSettled = true;
+    });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(opsSettled).toBe(false);
+    expect(unknownSettled).toBe(false);
+
+    mainGate.resolve();
+    await waitForAgentStartupAdmission("main");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(opsSettled).toBe(true);
+    expect(unknownSettled).toBe(true);
   });
 });

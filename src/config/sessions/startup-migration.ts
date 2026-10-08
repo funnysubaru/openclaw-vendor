@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { formatCliCommand } from "../../cli/command-format.js";
 import { formatDoctorStateRepairFailure } from "../../infra/state-repair-message.js";
+import { normalizeAgentId } from "../../routing/session-key.js";
 import { readAgentDeletionJournal } from "../../state/agent-deletion-journal.js";
 import { scheduleAgentStartupAdmission } from "../../state/agent-startup-admission.js";
 import { listOpenClawRegisteredAgentDatabases } from "../../state/openclaw-agent-db-registry.js";
@@ -22,6 +23,7 @@ import {
   isCanonicalSqliteSessionMainKeyCurrent,
   setCanonicalSqliteSessionMainKey,
 } from "./session-canonical-key.js";
+import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 import {
   listConfiguredSessionStoreAgentIds,
   resolveAllAgentSessionStoreTargetsSync,
@@ -164,30 +166,42 @@ export async function runSessionStartupMigration(params: {
 type SessionStoreTarget = ReturnType<typeof resolveAllAgentSessionStoreTargetsSync>[number];
 
 /**
- * 「逻辑员工 → 一组物理库 owner」（review2 P2-1 / review3 P2）：对每个（逻辑员工, 存储路径），
- * 用与准入登记、运行期读写同一套解析（resolveSqliteReadScope → toDatabaseOptions）算出实际
- * 库 owner，同一逻辑员工的所有结果合成一组——既含它当前配置读写的库（共享库归 main），也含
- * 它名下仍在磁盘上的旧库。请求入口等这一组里全部仍在准入的 owner。
- * 不存在 / 已删除 / 被去重而没调度的 owner 照记：没调度的 owner 等待方自然不用等。
- * 某个逻辑员工有候选解析失败时整组不登记，让请求入口对它退回"等待全部"，不拿残缺映射。
+ * 证明"请求里的逻辑员工就是要等的物理库 owner"（review2~4 收口）：配置中每个员工的配置存储、
+ * 以及目标发现得到的每个库（含已移出配置员工的保留旧库），都必须解析成以该员工自己为
+ * owner、且不是共享库（固定 .sqlite 路径会被多个员工共用）。另外配置了
+ * agents.defaults.sessionStore.agentId（把退役 main 的行收归到别的员工库）也视为证明不了。
+ * 任何一条不满足或解析抛错都返回 false，请求入口就对所有员工等待全部在途准入——宁可多等
+ * 几秒，也不按一张可能残缺的"逻辑 → 物理"表收窄。
  */
-function resolveLogicalDatabaseOwners(
+function provesOneToOneAgentStorage(
+  cfg: OpenClawConfig,
   targets: readonly SessionStoreTarget[],
   env: NodeJS.ProcessEnv,
-): Array<readonly [string, string]> {
-  const owners: Array<readonly [string, string]> = [];
-  const unresolved = new Set<string>();
-  for (const target of targets) {
-    try {
-      owners.push([
-        target.agentId,
-        toDatabaseOptions(resolveSqliteReadScope({ ...target, env })).agentId,
-      ]);
-    } catch {
-      unresolved.add(target.agentId);
-    }
+): boolean {
+  if (cfg.agents?.defaults?.sessionStore?.agentId) {
+    return false;
   }
-  return owners.filter(([agentId]) => !unresolved.has(agentId));
+  try {
+    const stores = [
+      ...listConfiguredSessionStoreAgentIds(cfg).map((agentId) => ({
+        agentId,
+        storePath: resolveSessionStorePathCore(cfg.session?.store, { agentId, env }),
+      })),
+      ...targets,
+    ];
+    return stores.every((store) => {
+      const agentId = normalizeAgentId(store.agentId);
+      if (resolveSqliteTargetFromSessionStorePath(store.storePath, { agentId, env }).shared) {
+        return false;
+      }
+      return (
+        normalizeAgentId(toDatabaseOptions(resolveSqliteReadScope({ ...store, env })).agentId) ===
+        agentId
+      );
+    });
+  } catch {
+    return false;
+  }
 }
 
 /** One per-agent row prepared by scheduleBackgroundSessionStartupMigration below. */
@@ -274,15 +288,6 @@ export async function scheduleBackgroundSessionStartupMigration(params: {
 
   const databases = new Set<string>();
   const itemsByAgentId = new Map<string, PreparedBackgroundSessionStartupMigrationTarget[]>();
-  // 逻辑员工 → 一组物理 owner（review3 P2）：不能只看去重后的 targets——固定共享库在目标
-  // 发现阶段就只登记成兼容 owner（main）一条，ops 用这个库的归属根本不在里面。所以按每个
-  // 配置员工解析它实际配置的存储路径（运行期读写用的同一个 resolveSessionStorePathCore），
-  // 再并上 targets 里它名下仍在磁盘上的库（如 ops 自有旧库）。
-  const configuredStores = listConfiguredSessionStoreAgentIds(params.cfg).map((agentId) => ({
-    agentId,
-    storePath: resolveSessionStorePathCore(params.cfg.session?.store, { agentId, env }),
-  }));
-  const owners = resolveLogicalDatabaseOwners([...configuredStores, ...targets], env);
   for (const target of targets) {
     const options = toDatabaseOptions(resolveSqliteReadScope({ ...target, env }));
     const databasePath = resolveOpenClawAgentSqlitePath(options);
@@ -327,7 +332,7 @@ export async function scheduleBackgroundSessionStartupMigration(params: {
 
   scheduleAgentStartupAdmission({
     agentIds: [...itemsByAgentId.keys()],
-    owners,
+    narrowRequestsToAgent: provesOneToOneAgentStorage(params.cfg, targets, env),
     openAgent: async (agentId) => {
       const items = itemsByAgentId.get(agentId) ?? [];
       try {

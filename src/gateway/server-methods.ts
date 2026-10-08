@@ -27,7 +27,7 @@ import {
   tryBeginGatewayPreparedRestartRootWorkAdmission,
   tryBeginGatewayRootWorkAdmission,
 } from "../process/gateway-work-admission.js";
-import { parseAgentSessionKey } from "../routing/session-key.js";
+import { normalizeAgentId, parseAgentSessionKey } from "../routing/session-key.js";
 import { waitForAgentStartupAdmissionBeforeRequest } from "../state/agent-startup-admission.js";
 import { formatControlPlaneActor, resolveControlPlaneActor } from "./control-plane-audit.js";
 import {
@@ -497,19 +497,38 @@ export async function runWithGatewayRequestEnvelope<T>(
 const STARTUP_ADMISSION_EXEMPT_METHODS: ReadonlySet<string> = new Set(["last-heartbeat"]);
 
 /**
- * 请求参数里能直接看出目标员工时（agentId，或 agent:<id>: 形式的 sessionKey）只等这一个
- * 员工；看不出就返回 undefined，由等待 helper 等全部在途准入。
+ * 请求只涉及"一个"员工时返回它，供等待 helper 收窄（是否真的收窄还取决于存储布局能否证明
+ * 逻辑员工 = 物理 owner）。扫描参数里的 agentId 和所有形如 agent:<id>:... 的会话键（含数组与
+ * 浅层嵌套对象，覆盖 sessionKey / key / keys / parentSessionKey 等各种字段名）：恰好一个
+ * 员工才返回；一个都没有、或出现多个不同员工（例如 agentId 与会话键指向不同员工）都返回
+ * undefined，由 helper 等全部在途准入——宁可多等，不按可能不完整的线索收窄。
  */
 function resolveStartupAdmissionAgentId(params: unknown): string | undefined {
-  if (!isRecord(params)) {
-    return undefined;
-  }
-  if (typeof params.agentId === "string" && params.agentId.trim()) {
-    return params.agentId;
-  }
-  return typeof params.sessionKey === "string"
-    ? parseAgentSessionKey(params.sessionKey)?.agentId
-    : undefined;
+  const agentIds = new Set<string>();
+  const visit = (value: unknown, key: string | undefined, depth: number) => {
+    if (typeof value === "string") {
+      const agentId =
+        key === "agentId" ? value.trim() || undefined : parseAgentSessionKey(value)?.agentId;
+      if (agentId) {
+        agentIds.add(normalizeAgentId(agentId));
+      }
+      return;
+    }
+    if (depth >= 3) {
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        visit(item, key, depth + 1);
+      }
+    } else if (isRecord(value)) {
+      for (const [childKey, child] of Object.entries(value)) {
+        visit(child, childKey, depth + 1);
+      }
+    }
+  };
+  visit(params, undefined, 0);
+  return agentIds.size === 1 ? [...agentIds][0] : undefined;
 }
 
 /** Authorizes and dispatches one gateway JSON-RPC-style request. */

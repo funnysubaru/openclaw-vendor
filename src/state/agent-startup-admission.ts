@@ -36,10 +36,13 @@ let opening = createPermitPool(AGENT_STARTUP_OPEN_CONCURRENCY);
 let migrating = createPermitPool(AGENT_STARTUP_MIGRATE_CONCURRENCY);
 const pendingByAgentId = new Map<string, Promise<void>>();
 const failedByAgentId = new Map<string, Error>();
-// 准入按数据库的物理 owner 登记（pendingByAgentId 的 key），请求入口拿到的却是逻辑员工。
-// 共享库里两者不同（如 ops 的会话存在 main 名下的 shared.sqlite）。这张表由调度方用与准入
-// 登记同一套真实存储目标解析填入：逻辑员工 → 实际存放它会话的库 owner（可能多个）。
-const ownersByAgentId = new Map<string, Set<string>>();
+// 请求入口能否只等「请求里那个员工」（review2~4 收口）。准入按数据库物理 owner 登记，请求
+// 入口拿到的却是逻辑员工；共享库 / 自定义库 / 保留旧库等配置下两者可以不同，而"逻辑员工 →
+// 全部物理库"的关系无法在启动时可靠穷举（每一轮 review 都找到新的漏网组合）。所以规则改成
+// 构造上安全：只有调度方证明了整批准入里"逻辑员工 = 物理 owner、且没有共享库"
+// （一一对应，最常见的每员工默认库布局）时才按员工收窄；其余一律等待全部在途准入。
+// undefined = 尚未调度；多次调度取逻辑与，任何一次证明不了就不收窄。
+let narrowRequestsToAgent: boolean | undefined;
 // active 在该员工的准入工作结束时置 false：准入期间派生、但活得比准入久的后台任务
 // 会继承这份上下文，结束后不能再拿它当豁免凭证（对齐上游 scope.active）。
 const ownAdmission = new AsyncLocalStorage<{ agentId: string; active: boolean }>();
@@ -67,16 +70,14 @@ export function scheduleAgentStartupAdmission(params: {
   agentIds: readonly string[];
   openAgent: (agentId: string, signal: AbortSignal) => Promise<void>;
   migrateAgent: (agentId: string, signal: AbortSignal) => Promise<void>;
-  /** [逻辑员工, 实际库 owner]：请求入口据此把逻辑员工换成要等的物理 owner。 */
-  owners?: ReadonlyArray<readonly [logicalAgentId: string, databaseAgentId: string]>;
+  /**
+   * 调度方已证明：本批（及配置中）每个逻辑员工的数据都只落在以它自己为 owner 的库里、且没有
+   * 共享库。只有为 true 时请求入口才按员工收窄等待；不传 / false = 一律等待全部。
+   */
+  narrowRequestsToAgent?: boolean;
 }): void {
   controller ??= new AbortController();
-  for (const [logicalAgentId, databaseAgentId] of params.owners ?? []) {
-    const logical = normalizeAgentId(logicalAgentId);
-    const owners = ownersByAgentId.get(logical) ?? new Set<string>();
-    owners.add(normalizeAgentId(databaseAgentId));
-    ownersByAgentId.set(logical, owners);
-  }
+  narrowRequestsToAgent = (narrowRequestsToAgent ?? true) && params.narrowRequestsToAgent === true;
   const signal = controller.signal;
   for (const rawAgentId of params.agentIds) {
     const agentId = normalizeAgentId(rawAgentId);
@@ -157,10 +158,11 @@ export function waitForAgentStartupAdmission(agentId: string): Promise<void> | u
  * 请求入口（RPC 分发 / HTTP 用户路由 / 渠道入站）用的等待：入口后面往往是同步读员工库，
  * 同步入口自己没法等，所以在进入请求前先在这里等准入（owner 2026-10-08 选 B：透明等待，
  * 不让请求撞上同步开库入口的可重试错误）。
- * - 给了 agentId（逻辑员工）：换算成实际存放它会话的库 owner 后只等这些 owner；任一已失败
- *   就立即 reject 同一原因，不陪别的员工等；换算不了（不认识的员工）退回等全部。
- * - 没给 agentId（入口说不清要读哪个员工）：等当前所有在途准入结束（allSettled），失败的
- *   员工留给后续开库入口按员工报同一原因。
+ * - 收窄（调度方证明了逻辑员工 = 物理 owner、无共享库）且给了 agentId：只等这一个员工；
+ *   它已失败就立即 reject 同一原因，不陪别的员工等。
+ * - 其余情况（没给 agentId，或存储布局证明不了一一对应）：等当前所有在途准入结束
+ *   （allSettled）；请求的员工本身若是已失败的库 owner，结束后报同一原因，否则失败留给后续
+ *   开库入口按员工报出。
  * - 关闭 / 热重启：调度器的 abort（cancelAgentStartupAdmission）和调用方传入的 signals
  *   （请求入口租约关闭、请求自身中止）任一触发都立即以 AbortError 结束，不卡住关闭。
  * - 在任何员工自己的准入工作里调用直接放行：准入工作若绕回请求入口，等全部会等到自己。
@@ -175,12 +177,10 @@ export function waitForAgentStartupAdmissionBeforeRequest(
   ) {
     return undefined;
   }
-  const owners = params.agentId ? resolveAdmissionOwners(params.agentId) : undefined;
-  const target = owners
-    ? waitForAgentOwners(owners)
-    : pendingByAgentId.size > 0
-      ? Promise.allSettled(pendingByAgentId.values()).then(() => undefined)
-      : undefined;
+  const target =
+    params.agentId && narrowRequestsToAgent
+      ? waitForAgentStartupAdmission(params.agentId)
+      : waitForAllAgentStartupAdmissions(params.agentId);
   if (!target) {
     return undefined;
   }
@@ -193,25 +193,19 @@ export function waitForAgentStartupAdmissionBeforeRequest(
   return racePromiseWithAbortSignal(target, AbortSignal.any(signals));
 }
 
-/**
- * 逻辑员工 → 要等的物理库 owner：登记过映射的用映射（加上它自己若也是准入 key）；完全不认识
- * 的员工（映射里没有、自己也不是准入 key）说明解析不可靠，返回 undefined 让调用方等全部。
- */
-function resolveAdmissionOwners(agentId: string): string[] | undefined {
-  const normalized = normalizeAgentId(agentId);
-  const owners = new Set(ownersByAgentId.get(normalized));
-  if (pendingByAgentId.has(normalized) || failedByAgentId.has(normalized)) {
-    owners.add(normalized);
+/** 等全部在途准入结束；requestedAgentId 本身若是已失败的库 owner，结束后报它的失败原因。 */
+function waitForAllAgentStartupAdmissions(requestedAgentId?: string): Promise<void> | undefined {
+  const failure = requestedAgentId
+    ? failedByAgentId.get(normalizeAgentId(requestedAgentId))
+    : undefined;
+  if (pendingByAgentId.size === 0) {
+    return failure ? Promise.reject(failure) : undefined;
   }
-  return ownersByAgentId.has(normalized) || owners.size > 0 ? [...owners] : undefined;
-}
-
-/** 等这些 owner 的准入；任一已失败立即 reject 同一原因；都不在准入中则不等。 */
-function waitForAgentOwners(owners: readonly string[]): Promise<void> | undefined {
-  const waits = owners
-    .map((owner) => waitForAgentStartupAdmission(owner))
-    .filter((wait): wait is Promise<void> => wait !== undefined);
-  return waits.length > 0 ? Promise.all(waits).then(() => undefined) : undefined;
+  return Promise.allSettled(pendingByAgentId.values()).then(() => {
+    if (failure) {
+      throw failure;
+    }
+  });
 }
 
 /**
@@ -269,7 +263,7 @@ function clearAgentStartupAdmissionState(): void {
   migrating = createPermitPool(AGENT_STARTUP_MIGRATE_CONCURRENCY);
   pendingByAgentId.clear();
   failedByAgentId.clear();
-  ownersByAgentId.clear();
+  narrowRequestsToAgent = undefined;
 }
 
 /**

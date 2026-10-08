@@ -280,68 +280,91 @@ describe("agent-startup-admission", () => {
     expect(() => assertAgentStartupAdmissionSettled("broken")).toThrow(failure);
   });
 
-  // review2 P2-1：请求入口给的是逻辑员工，准入按物理库 owner 登记。共享库下 ops 的会话在
-  // main 名下的库里：ops 自己准入完了也得等 main；完全不认识的员工退回等全部。
-  it("请求入口按逻辑员工 → 物理 owner 映射等待，不认识的员工等全部", async () => {
-    const mainGate = deferred();
+  // review2~4 收口：只有调度方证明了"逻辑员工 = 物理 owner、无共享库"才按员工收窄；
+  // 证明不了（不传 / false）时任何员工的请求都等全部在途准入。
+  it("证明了一一对应才按员工收窄；否则一律等全部", async () => {
+    const opsGate = deferred();
+    const settled: string[] = [];
+    const track = (label: string, wait: Promise<void> | undefined) => {
+      if (wait) {
+        void wait.then(() => settled.push(label));
+      } else {
+        settled.push(label);
+      }
+    };
     scheduleAgentStartupAdmission({
       agentIds: ["main", "ops"],
       openAgent: async (agentId) => {
-        if (agentId === "main") {
-          await mainGate.promise;
+        if (agentId === "ops") {
+          await opsGate.promise;
         }
       },
       migrateAgent: async () => {},
-      owners: [["ops", "main"]],
+      narrowRequestsToAgent: true,
     });
-    await waitForAgentStartupAdmission("ops");
-    let opsSettled = false;
-    let unknownSettled = false;
-    void waitForAgentStartupAdmissionBeforeRequest({ agentId: "ops" })?.then(() => {
-      opsSettled = true;
-    });
-    void waitForAgentStartupAdmissionBeforeRequest({ agentId: "stranger" })?.then(() => {
-      unknownSettled = true;
-    });
-    await new Promise((resolve) => {
-      setTimeout(resolve, 20);
-    });
-    expect(opsSettled).toBe(false);
-    expect(unknownSettled).toBe(false);
-
-    mainGate.resolve();
     await waitForAgentStartupAdmission("main");
+    track("narrow-main", waitForAgentStartupAdmissionBeforeRequest({ agentId: "main" }));
     await new Promise((resolve) => {
       setTimeout(resolve, 0);
     });
-    expect(opsSettled).toBe(true);
-    expect(unknownSettled).toBe(true);
+    expect(settled).toEqual(["narrow-main"]);
+    opsGate.resolve();
+    await waitForAgentStartupAdmission("ops");
+    resetAgentStartupAdmissionForTest();
+
+    const opsGate2 = deferred();
+    scheduleAgentStartupAdmission({
+      agentIds: ["main", "ops"],
+      openAgent: async (agentId) => {
+        if (agentId === "ops") {
+          await opsGate2.promise;
+        }
+      },
+      migrateAgent: async () => {},
+    });
+    await waitForAgentStartupAdmission("main");
+    track("wide-main", waitForAgentStartupAdmissionBeforeRequest({ agentId: "main" }));
+    track("wide-stranger", waitForAgentStartupAdmissionBeforeRequest({ agentId: "stranger" }));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(settled).toEqual(["narrow-main"]);
+    opsGate2.resolve();
+    await waitForAgentStartupAdmission("ops");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(settled.toSorted()).toEqual(["narrow-main", "wide-main", "wide-stranger"]);
   });
 
-  // review3：一个逻辑员工对应一组物理 owner（共享库 main + 自有旧库 ops）。组里任一 owner
-  // 准入已失败，就立即按那个 owner 的失败原因结束，不再等组里其它仍在准入的 owner。
-  it("一组 owner 里任一已失败 → 立即报该 owner 的失败原因，不陪其余 owner 等", async () => {
-    const mainGate = deferred();
-    const failure = new Error("ops retained database failed");
+  // 失败语义：收窄时请求员工已失败立即 reject；等全部时，请求员工本身是已失败的库 owner，
+  // 则在全部在途准入结束后报它的失败原因（不会被当成成功放行）。
+  it("请求员工准入已失败：收窄时立即报，等全部时结束后报同一原因", async () => {
+    const failure = new Error("main integrity failed");
+    const opsGate = deferred();
     scheduleAgentStartupAdmission({
       agentIds: ["main", "ops"],
       openAgent: async (agentId) => {
         if (agentId === "main") {
-          await mainGate.promise;
-          return;
+          throw failure;
         }
-        throw failure;
+        await opsGate.promise;
       },
       migrateAgent: async () => {},
-      owners: [
-        ["ops", "main"],
-        ["ops", "ops"],
-      ],
     });
-    await expect(waitForAgentStartupAdmission("ops")).rejects.toBe(failure);
-    await expect(waitForAgentStartupAdmissionBeforeRequest({ agentId: "ops" })).rejects.toBe(
-      failure,
+    await expect(waitForAgentStartupAdmission("main")).rejects.toBe(failure);
+    let rejected: unknown;
+    const wide = waitForAgentStartupAdmissionBeforeRequest({ agentId: "main" })?.catch(
+      (error: unknown) => {
+        rejected = error;
+      },
     );
-    mainGate.resolve();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(rejected).toBeUndefined();
+    opsGate.resolve();
+    await wide;
+    expect(rejected).toBe(failure);
   });
 });

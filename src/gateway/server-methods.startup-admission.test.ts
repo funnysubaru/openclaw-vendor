@@ -40,12 +40,13 @@ const cfg = { agents: { entries: { main: {} } } } satisfies OpenClawConfig;
 const scope = { agentId: "main", sessionKey: "agent:main:main", sessionId: "main-1" };
 
 /** 准入里的 open 阶段卡在 gate 上，但会响应调度器 abort（模拟真实工作在关闭时收尾）。 */
-function scheduleGatedAdmission(agentIds: string[]) {
+function scheduleGatedAdmission(agentIds: string[], options: { narrow?: boolean } = {}) {
   const gate = createDeferred<void>();
   scheduleAgentStartupAdmission({
     agentIds,
     openAgent: async (_agentId, signal) => await racePromiseWithAbortSignal(gate.promise, signal),
     migrateAgent: async () => {},
+    narrowRequestsToAgent: options.narrow,
   });
   return gate;
 }
@@ -156,8 +157,10 @@ describe("gateway request entry waits for agent startup admission", () => {
           throw new Error("main integrity failed");
         },
         migrateAgent: async () => {},
+        // 每员工默认库布局（调度方证明了逻辑员工 = 物理 owner）才允许按员工收窄。
+        narrowRequestsToAgent: true,
       });
-      const otherGate = scheduleGatedAdmission(["ops"]);
+      const otherGate = scheduleGatedAdmission(["ops"], { narrow: true });
       try {
         await tick();
         const { request, respond } = dispatch("chat.history", { sessionKey: scope.sessionKey });
@@ -291,25 +294,26 @@ describe("gateway request entry waits for agent startup admission", () => {
     });
   });
 
-  // review3 P2：共享库 + ops 自有旧库同时存在。目标发现按物理库去重后只剩 main/shared 与
-  // ops/旧库，若只从去重后的目标建映射会得到 ops→ops、漏掉 ops→main。让 ops 旧库先完成、
-  // main（shared.sqlite）仍在准入时，ops 的共享库历史请求必须继续等 main。
-  it("共享库 + ops 自有旧库：ops 旧库先完成时，ops 的共享库历史请求仍等 main", async () => {
+  // review3 / review4 P2：共享库 + ops 自有旧库同时存在。让 ops 旧库先完成、main（shared.sqlite）
+  // 仍在准入时，ops 的共享库历史请求必须继续等 main。review4 的变体：ops 已从配置移出，但它在
+  // 共享库里的历史会话仍可读（普通 agent:ops:... sessionKey 可达，未走员工删除流程）。
+  async function expectOpsSharedHistoryWaitsForMain(params: { removeOpsFromConfig: boolean }) {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-      const sharedCfg = {
+      const store = path.join(state.root, "custom", "shared.sqlite");
+      const withOpsCfg = {
         agents: {
           ownership: "explicit",
           defaults: { sessionStore: { agentId: "main" } },
           entries: { main: {}, ops: {} },
         },
-        session: { store: path.join(state.root, "custom", "shared.sqlite") },
+        session: { store },
       } satisfies OpenClawConfig;
-      await state.writeConfig(sharedCfg);
+      await state.writeConfig(withOpsCfg);
       const sharedScope = {
         agentId: "ops",
         sessionKey: "agent:ops:shared",
         sessionId: "ops-shared",
-        storePath: sharedCfg.session.store,
+        storePath: store,
       };
       await upsertSessionEntryCore(sharedScope, { sessionId: sharedScope.sessionId, updatedAt: 1 });
       const sharedOptions = toDatabaseOptions(resolveSqliteReadScope(sharedScope));
@@ -318,12 +322,16 @@ describe("gateway request entry waits for agent startup admission", () => {
       // ops 名下仍保留的默认旧库（真实文件）。
       const opsRetainedPath = openOpenClawAgentDatabase({ agentId: "ops" }).path;
       expect(opsRetainedPath).not.toBe(sharedPath);
+      const scenarioCfg: OpenClawConfig = params.removeOpsFromConfig
+        ? { ...withOpsCfg, agents: { ...withOpsCfg.agents, entries: { main: {} } } }
+        : withOpsCfg;
+      await state.writeConfig(scenarioCfg);
       // 准入前先正常请求一次：确认会话可读，同时让 chat.history 的惰性 handler 模块加载完，
       // 否则冷加载本身就要数秒，"窗口内没响应"会被误当成在等待。
       const warmup = dispatch(
         "chat.history",
         { sessionKey: sharedScope.sessionKey },
-        createDirectChatContext({ getRuntimeConfig: () => sharedCfg }),
+        createDirectChatContext({ getRuntimeConfig: () => scenarioCfg }),
       );
       await warmup.request;
       expect(warmup.respond.mock.calls[0]?.[0]).toBe(true);
@@ -341,7 +349,7 @@ describe("gateway request entry waits for agent startup admission", () => {
         },
       );
       await scheduleBackgroundSessionStartupMigration({
-        cfg: { ...sharedCfg, session: { ...sharedCfg.session, mainKey: "work" } },
+        cfg: { ...scenarioCfg, session: { ...scenarioCfg.session, mainKey: "work" } },
         log: { info: vi.fn(), warn: vi.fn() },
       });
       try {
@@ -351,7 +359,7 @@ describe("gateway request entry waits for agent startup admission", () => {
         const { request, respond } = dispatch(
           "chat.history",
           { sessionKey: sharedScope.sessionKey },
-          createDirectChatContext({ getRuntimeConfig: () => sharedCfg }),
+          createDirectChatContext({ getRuntimeConfig: () => scenarioCfg }),
         );
         let early: unknown;
         await Promise.race([request, tick(2_000)]).catch((error: unknown) => {
@@ -370,5 +378,114 @@ describe("gateway request entry waits for agent startup admission", () => {
         await cancelAgentStartupAdmission();
       }
     });
+  }
+
+  it("共享库 + ops 自有旧库：ops 旧库先完成时，ops 的共享库历史请求仍等 main", async () => {
+    await expectOpsSharedHistoryWaitsForMain({ removeOpsFromConfig: false });
+  });
+
+  it("ops 已移出配置 + 共享库历史 + 自有旧库：历史请求仍等 main", async () => {
+    await expectOpsSharedHistoryWaitsForMain({ removeOpsFromConfig: true });
+  });
+
+  // 收口规则的正向检查：最常见的每员工默认库布局下，调度方能证明逻辑员工 = 物理 owner，
+  // 仍按员工收窄——ops 还在准入时，main 的请求不陪着等（防止证明函数恒为 false、悄悄退化）。
+  it("每员工默认库布局：按员工收窄，ops 准入中 main 的请求不等", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      const perAgentCfg = {
+        agents: { ownership: "explicit", entries: { main: {}, ops: {} } },
+      } satisfies OpenClawConfig;
+      await state.writeConfig(perAgentCfg);
+      for (const agentId of ["main", "ops"]) {
+        await upsertSessionEntryCore(
+          { agentId, sessionKey: `agent:${agentId}:main`, sessionId: `${agentId}-1` },
+          { sessionId: `${agentId}-1`, updatedAt: 1 },
+        );
+      }
+      const opsPath = openOpenClawAgentDatabase({ agentId: "ops" }).path;
+      const warmup = dispatch(
+        "chat.history",
+        { sessionKey: "agent:main:main" },
+        createDirectChatContext({ getRuntimeConfig: () => perAgentCfg }),
+      );
+      await warmup.request;
+      expect(warmup.respond.mock.calls[0]?.[0]).toBe(true);
+      closeOpenClawAgentDatabasesForTest();
+
+      const releaseOps = createDeferred<void>();
+      const actualCheck = integrityWorker.assertSqliteIntegrityInWorker;
+      vi.spyOn(integrityWorker, "assertSqliteIntegrityInWorker").mockImplementation(
+        async (pathname, busyTimeoutMs, signal) => {
+          if (pathname === opsPath) {
+            await releaseOps.promise;
+          }
+          return await actualCheck(pathname, busyTimeoutMs, signal);
+        },
+      );
+      await scheduleBackgroundSessionStartupMigration({
+        cfg: { ...perAgentCfg, session: { mainKey: "work" } },
+        log: { info: vi.fn(), warn: vi.fn() },
+      });
+      try {
+        await waitForAgentStartupAdmission("main");
+        expect(waitForAgentStartupAdmission("ops")).toBeDefined();
+        const { request, respond } = dispatch(
+          "chat.history",
+          { sessionKey: "agent:main:main" },
+          createDirectChatContext({ getRuntimeConfig: () => perAgentCfg }),
+        );
+        await Promise.race([request, tick(2_000)]);
+        expect(respond).toHaveBeenCalledOnce();
+        expect(respond.mock.calls[0]?.[0]).toBe(true);
+      } finally {
+        releaseOps.resolve();
+        vi.restoreAllMocks();
+        await cancelAgentStartupAdmission();
+      }
+    });
+  });
+
+  // 请求参数指向两个不同员工（agentId 是 main、会话键却是 ops 的）时不收窄：只等 main 会漏掉
+  // 真正要读的 ops 库。用一个记录调用时刻的测试方法观察分发层是否放行。
+  it("参数里出现多个员工时不收窄，等全部在途准入", async () => {
+    const gate = scheduleGatedAdmission(["ops"], { narrow: true });
+    scheduleAgentStartupAdmission({
+      agentIds: ["main"],
+      openAgent: async () => {},
+      migrateAgent: async () => {},
+      narrowRequestsToAgent: true,
+    });
+    try {
+      await waitForAgentStartupAdmission("main");
+      const invoked = vi.fn();
+      const respond = vi.fn<RespondFn>();
+      const request = handleGatewayRequest({
+        req: {
+          type: "req",
+          id: "mixed-agents",
+          method: "test.mixed-agents",
+          params: { agentId: "main", target: { sessionKey: "agent:ops:main" } },
+        },
+        respond,
+        client: { connect: { scopes: ["operator.admin"] } } as never,
+        isWebchatConnect: () => false,
+        context: createDirectChatContext({ getRuntimeConfig: () => cfg }),
+        extraHandlers: {
+          "test.mixed-agents": ({ respond: reply }) => {
+            invoked();
+            reply(true, {}, undefined);
+          },
+        },
+      });
+      await Promise.race([request, tick(300)]);
+      expect(invoked).not.toHaveBeenCalled();
+
+      gate.resolve();
+      await request;
+      expect(invoked).toHaveBeenCalledOnce();
+    } finally {
+      gate.resolve();
+      await cancelAgentStartupAdmission();
+    }
   });
 });

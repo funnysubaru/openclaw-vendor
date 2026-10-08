@@ -6,9 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import JSON5 from "json5";
+import { pinRuntimePaths } from "../src/config/paths.js";
 import { resolveEffectiveHomeDir } from "../src/infra/home-dir.js";
 import { SUPERVISOR_HINT_ENV_VARS } from "../src/infra/supervisor-markers.js";
 import { captureFullEnv, deleteTestEnvValue, setTestEnvValue } from "../src/test-utils/env.js";
+import { pinConfigDir } from "../src/utils.js";
 import { readTestHomeSource, resolveTestCorepackHome } from "./test-home-context.mts";
 import {
   isTruthyTestEnvValue as isTruthyEnvValue,
@@ -312,6 +314,27 @@ function followIsolatedHomeInOsHomedir(): () => void {
   };
 }
 
+/**
+ * 按当前 process.env 重新固定 import 期算好的路径常量。
+ *
+ * 为什么需要：src/config/paths.ts 的 STATE_DIR / CONFIG_PATH 与 src/utils.ts 的 CONFIG_DIR
+ * 都是模块加载时按当时的 HOME 算好的 live binding。setup 文件里的静态 import 会被提升到
+ * 本文件安装隔离 HOME 之前执行（如 setup.shared.ts → warning-filter → logging → paths），
+ * worker 里第一个测试文件因此拿到隔离前的值：裸跑 vitest 时就是开发者真实的 ~/.openclaw，
+ * 用包装脚本跑时是 oc-vt-* 下的公共 home，而不是本 worker 的临时 home。
+ * 复用生产代码 gateway 启动时的同一套 pin 函数（pre-bootstrap.ts），不另造一份解析逻辑。
+ *
+ * 传 env 副本：pinRuntimePaths 会把相对 / ~ 形式的 OPENCLAW_STATE_DIR 规范化写回 env，
+ * cleanup 时调用不能改掉刚还原好的调用方环境。
+ * 只覆盖这三个导出常量。拿它们在 import 期派生自己常量的模块（如 sandbox/constants.ts），
+ * 只要在隔离之后才加载就会拿到新值（实测 sandbox/constants.ts 属于这种）；
+ * 若将来 setup 链提前加载了这类模块，它们仍会停在隔离前的值。
+ */
+function pinImportTimePaths(): void {
+  pinRuntimePaths({ ...process.env });
+  pinConfigDir({ ...process.env });
+}
+
 function ensureParentDir(targetPath: string): void {
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
 }
@@ -571,12 +594,16 @@ export function installTestEnv(options?: InstallTestEnvOptions): {
     } else if (live) {
       stageLiveTestState({ env: liveEnvSnapshot, realHome, tempHome });
     }
+    // 隔离环境全部就位后（含 hermetic / live 分支改写的变量）再固定路径常量。
+    pinImportTimePaths();
 
     return {
       tempHome,
       cleanup: () => {
         restoreHomedir();
         restoreEnv(restore);
+        // 还原环境后重新固定，避免常量继续指向即将删除的临时 home。
+        pinImportTimePaths();
         removeHome();
       },
     };
@@ -584,6 +611,7 @@ export function installTestEnv(options?: InstallTestEnvOptions): {
     // Successful live setup keeps profile additions; failed setup restores the caller exactly.
     restoreHomedir();
     rollback.restore();
+    pinImportTimePaths();
     removeHome();
     throw error;
   }

@@ -2,6 +2,8 @@
 // 挂起/失败两种结局、关闭时取消并等待收尾。
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  AgentStartupAdmissionPendingError,
+  assertAgentStartupAdmissionSettled,
   cancelAgentStartupAdmission,
   resetAgentStartupAdmissionForTest,
   scheduleAgentStartupAdmission,
@@ -210,46 +212,70 @@ describe("agent-startup-admission", () => {
     expect(reopened).toBe(true);
   });
 
-  // 死锁回归：openclaw-agent-db.ts 的 withOpenClawAgentDatabaseAsync 第一步就是调
-  // waitForAgentStartupAdmission(options.agentId) 并 await 它拿到的 pending；如果
-  // 调度出的 openAgent/migrateAgent 回调内部对"自己正在处理的那个 agentId"走这同一
-  // 步骤（而不是 withOpenClawAgentDatabaseAsyncSkippingStartupAdmissionWait 绕过
-  // 入口），waitForAgentStartupAdmission 返回的正是自己这个 work 本身——等于自己等
-  // 自己，不靠外部事件永远不会 resolve。
-  //
-  // 这条测试直接用 waitForAgentStartupAdmission（而不是真去调
-  // withOpenClawAgentDatabaseAsync）复现这个核心机制，避免真的触发 sqlite 文件 I/O
-  // ——一旦 migrateAgent 自己通过 race 的超时分支返回，work 会 settle，那时如果换了
-  // 真实的 withOpenClawAgentDatabaseAsync，它遗留的那个"还在等 pending"的调用会在
-  // work settle 后继续往下跑到真正开库那一步，在测试环境里没有意义地碰真实
-  // sqlite 路径；用纯函数 waitForAgentStartupAdmission 复现同一条件，遗留的
-  // `.then()` 延续只是个无副作用的空操作，不会有这个问题。
-  //
-  // 用一个短超时的 Promise.race 把"不靠外部事件永远不会 resolve"变成可在几十毫秒内
-  // 判定的结果，而不是真的把测试进程挂死：换成
-  // withOpenClawAgentDatabaseAsyncSkippingStartupAdmissionWait 的等价绕过逻辑（直接
-  // 跳过 waitForAgentStartupAdmission 这一步）的话，这条测试会从"判定为死锁"反转成
-  // "立刻判定为已解除"，从而变红——证明测试确实在断言正确的那一端。
-  it("调度回调内部如果对同一个 agentId 走等待检查这一步会自己等自己（死锁回归）", async () => {
-    let outcome: "deadlocked" | "resolved" | undefined;
+  // 死锁回归（review P1-1）：准入工作内部（含间接调用链）对自己这个 agentId 查等待 / 同步
+  // 检查都必须放行，否则会拿到自己这个 work，自己等自己；工作外部照常等待 / 拒绝；准入
+  // 结束后，在准入期间派生、活得更久的上下文不能再拿它当豁免凭证。真实 handoff 链路的
+  // 端到端回归见 src/gateway/session-startup-migration.background-admission.test.ts。
+  it("准入工作内部对自己不等待不拒绝，外部照常等待 / 拒绝，结束后豁免失效", async () => {
+    const release = deferred();
+    let lingering: (() => void) | undefined;
+    const inside: unknown[] = [];
     scheduleAgentStartupAdmission({
       agentIds: ["self-wait"],
-      openAgent: async () => {},
-      migrateAgent: async (agentId) => {
-        // 等价于 withOpenClawAgentDatabaseAsync 真正会执行的第一步：此刻
-        // pendingByAgentId 里挂着的正是自己这个 work。
-        const pending = waitForAgentStartupAdmission(agentId);
-        const result = await Promise.race([
-          (pending ?? Promise.resolve()).then(() => "resolved" as const),
-          new Promise<"deadlocked">((resolve) => {
-            setTimeout(() => resolve("deadlocked"), 50);
-          }),
-        ]);
-        outcome = result;
+      openAgent: async () => {
+        // 经一层异步间接调用再查，模拟 handoff → reconcile → 开库这类深层调用。
+        await Promise.resolve();
+        inside.push(waitForAgentStartupAdmission("self-wait"));
+        try {
+          assertAgentStartupAdmissionSettled("self-wait");
+          inside.push("allowed");
+        } catch (error) {
+          inside.push(error);
+        }
+        lingering = () => assertAgentStartupAdmissionSettled("self-wait");
+        await release.promise;
       },
+      migrateAgent: async () => {},
     });
+    const outside = waitForAgentStartupAdmission("self-wait");
+    expect(outside).toBeDefined();
+    expect(() => assertAgentStartupAdmissionSettled("self-wait")).toThrow(
+      AgentStartupAdmissionPendingError,
+    );
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(inside[0]).toBeUndefined();
+    expect(inside[1]).toBe("allowed");
 
+    release.resolve();
+    await outside;
+    expect(waitForAgentStartupAdmission("self-wait")).toBeUndefined();
+    expect(() => assertAgentStartupAdmissionSettled("self-wait")).not.toThrow();
+
+    // 下一轮准入（热重启）开始后，上一轮遗留的上下文不再豁免。
+    const nextRound = deferred();
+    await cancelAgentStartupAdmission();
+    scheduleAgentStartupAdmission({
+      agentIds: ["self-wait"],
+      openAgent: async () => await nextRound.promise,
+      migrateAgent: async () => {},
+    });
+    expect(lingering).toThrow(AgentStartupAdmissionPendingError);
+    nextRound.resolve();
     await waitForAgentStartupAdmission("self-wait");
-    expect(outcome).toBe("deadlocked");
+  });
+
+  it("准入失败后同步检查抛同一个失败原因", async () => {
+    const failure = new Error("integrity failed");
+    scheduleAgentStartupAdmission({
+      agentIds: ["broken"],
+      openAgent: async () => {
+        throw failure;
+      },
+      migrateAgent: async () => {},
+    });
+    await expect(waitForAgentStartupAdmission("broken")).rejects.toBe(failure);
+    expect(() => assertAgentStartupAdmissionSettled("broken")).toThrow(failure);
   });
 });

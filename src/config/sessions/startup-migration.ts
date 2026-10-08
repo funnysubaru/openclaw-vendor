@@ -9,7 +9,6 @@ import {
   closeOpenClawAgentDatabaseByPath,
   isOpenClawAgentDatabaseOpen,
   withOpenClawAgentDatabaseAsync,
-  withOpenClawAgentDatabaseAsyncSkippingStartupAdmissionWait,
   resolveOpenClawAgentSqlitePath,
   type OpenClawAgentDatabaseOptions,
 } from "../../state/openclaw-agent-db.js";
@@ -184,15 +183,16 @@ interface PreparedBackgroundSessionStartupMigrationTarget {
  *   在后台跑。请求如果在后台任务跑完前摸到同一个 agentId，会在
  *   withOpenClawAgentDatabaseAsync 里被 waitForAgentStartupAdmission 挡住等它，
  *   不会跟后台任务抢着并发开同一个 sqlite 文件。
- * - open 阶段内部故意不自己 try/catch：main-key 设置失败会原样抛给调度器，调度器把
- *   这个 agentId 标记为失败（failedByAgentId），migrate 阶段（含 handoffDatabase）
+ * - open 阶段故意不吞错误（只关掉本阶段开出的冷连接再重抛）：main-key 设置失败原样
+ *   抛给调度器，调度器把这个 agentId 标记为失败（failedByAgentId），migrate 阶段（含 handoffDatabase）
  *   整段都不会跑——跟阻塞版"main-key 设置失败仍然尝试 handoff"的 best-effort 语义不
  *   同，这里选择"开都没开成功，就不要再假装能安全移交"的更保守语义。
- * - 两个阶段内部改用 withOpenClawAgentDatabaseAsyncSkippingStartupAdmissionWait
- *   （绕过等待检查的内部入口）——因为这段代码本身就是在处理"自己被调度器登记为正在
- *   准入"的那个 agentId，如果还调普通 withOpenClawAgentDatabaseAsync，会撞上
- *   waitForAgentStartupAdmission 返回的正是自己这个 work promise，变成自己等自己的
- *   死锁。
+ * - 两个阶段内部照常用 withOpenClawAgentDatabaseAsync：调度器把整个准入工作跑在该员工
+ *   的异步上下文作用域里，作用域内（含 handoff → reconcile → runProjectionWrite 这类
+ *   间接开库）对自己这个 agentId 不等待，不会自己等自己（见 agent-startup-admission.ts）。
+ * - 同一个员工可能有多个物理库（配置的自定义库 + 默认目录里保留的库）：按员工聚合全部
+ *   target，open / migrate 各自逐个处理完，员工准入才算完成（review P2：单值 Map 会让
+ *   后遇到的库静默覆盖前一个，被覆盖的那份既不更新 mainKey 也不 handoff）。
  */
 export async function scheduleBackgroundSessionStartupMigration(params: {
   cfg: OpenClawConfig;
@@ -240,7 +240,7 @@ export async function scheduleBackgroundSessionStartupMigration(params: {
   );
 
   const databases = new Set<string>();
-  const itemsByAgentId = new Map<string, PreparedBackgroundSessionStartupMigrationTarget>();
+  const itemsByAgentId = new Map<string, PreparedBackgroundSessionStartupMigrationTarget[]>();
   for (const target of targets) {
     const options = toDatabaseOptions(resolveSqliteReadScope({ ...target, env }));
     const databasePath = resolveOpenClawAgentSqlitePath(options);
@@ -259,13 +259,26 @@ export async function scheduleBackgroundSessionStartupMigration(params: {
     }
     // Key by the (normalized, via options.agentId) agent id — scheduleAgentStartupAdmission
     // normalizes the same way, so openAgent/migrateAgent below always find their target.
-    itemsByAgentId.set(options.agentId, {
+    const item = {
       target,
       options,
       databasePath,
       alreadyOpen: isOpenClawAgentDatabaseOpen(databasePath),
-    });
+    };
+    const items = itemsByAgentId.get(options.agentId);
+    if (items) {
+      items.push(item);
+    } else {
+      itemsByAgentId.set(options.agentId, [item]);
+    }
   }
+  // 没 handoff 成功的冷连接不能留给运行期（调用方只在未 handoff 时调用）：跟阻塞版每个
+  // target 的 finally 同一条规则。
+  const closeColdConnection = (item: PreparedBackgroundSessionStartupMigrationTarget) => {
+    if (!item.alreadyOpen && isOpenClawAgentDatabaseOpen(item.databasePath)) {
+      closeOpenClawAgentDatabaseByPath(item.databasePath);
+    }
+  };
   if (itemsByAgentId.size === 0) {
     return;
   }
@@ -273,56 +286,70 @@ export async function scheduleBackgroundSessionStartupMigration(params: {
   scheduleAgentStartupAdmission({
     agentIds: [...itemsByAgentId.keys()],
     openAgent: async (agentId) => {
-      const item = itemsByAgentId.get(agentId);
-      if (!item) {
-        return;
-      }
-      if (
-        !registeredDatabases.has(`${item.options.agentId}\0${item.databasePath}`) ||
-        !isCanonicalSqliteSessionMainKeyCurrent(item.options, mainKey)
-      ) {
-        await withOpenClawAgentDatabaseAsyncSkippingStartupAdmissionWait(item.options, (database) =>
-          setCanonicalSqliteSessionMainKey(database, mainKey),
-        );
+      const items = itemsByAgentId.get(agentId) ?? [];
+      try {
+        for (const item of items) {
+          if (
+            !registeredDatabases.has(`${item.options.agentId}\0${item.databasePath}`) ||
+            !isCanonicalSqliteSessionMainKeyCurrent(item.options, mainKey)
+          ) {
+            await withOpenClawAgentDatabaseAsync(item.options, (database) =>
+              setCanonicalSqliteSessionMainKey(database, mainKey),
+            );
+          }
+        }
+      } catch (error) {
+        // open 失败后 migrate 阶段不会再跑，这里就把本阶段开出来的冷连接收掉。
+        items.forEach(closeColdConnection);
+        throw error;
       }
     },
     migrateAgent: async (agentId) => {
-      const item = itemsByAgentId.get(agentId);
-      if (!item) {
-        return;
-      }
-      let handedOff = false;
-      try {
+      // 一份库 handoff 失败就不再 handoff 后面的库（失败原样抛给调度器，员工整体不可用），
+      // 但每一份没 handoff 的冷连接都要关掉。
+      let failure: { error: unknown } | undefined;
+      for (const item of itemsByAgentId.get(agentId) ?? []) {
+        let handedOff = false;
         try {
-          // Workspace metadata participates in claim matching. Preserve it during a
-          // partial move so the next attempt can finish removing the source claim.
-          if (worktreeEligible) {
-            const migratedWorktreeSessions = await migrateWorktreeSessions({
-              ...item.target,
-              cfg: params.cfg,
-              env,
-            });
-            if (migratedWorktreeSessions > 0) {
-              params.log.info(
-                `session: recorded canonical workspace for ${migratedWorktreeSessions} managed-worktree session(s) (agent ${item.options.agentId})`,
-              );
+          if (failure) {
+            continue;
+          }
+          try {
+            // Workspace metadata participates in claim matching. Preserve it during a
+            // partial move so the next attempt can finish removing the source claim.
+            if (worktreeEligible) {
+              const migratedWorktreeSessions = await migrateWorktreeSessions({
+                ...item.target,
+                cfg: params.cfg,
+                env,
+              });
+              if (migratedWorktreeSessions > 0) {
+                params.log.info(
+                  `session: recorded canonical workspace for ${migratedWorktreeSessions} managed-worktree session(s) (agent ${item.options.agentId})`,
+                );
+              }
             }
+          } catch (error) {
+            params.log.warn(
+              `session: SQLite startup maintenance failed for ${item.options.agentId}; continuing: ${String(error)}`,
+            );
+          }
+          if (params.handoffDatabase) {
+            // Runtime readiness failures must propagate; only successful handoff
+            // transfers the cold connection beyond this maintenance operation.
+            await params.handoffDatabase(item.options);
+            handedOff = true;
           }
         } catch (error) {
-          params.log.warn(
-            `session: SQLite startup maintenance failed for ${item.options.agentId}; continuing: ${String(error)}`,
-          );
+          failure = { error };
+        } finally {
+          if (!handedOff) {
+            closeColdConnection(item);
+          }
         }
-        if (params.handoffDatabase) {
-          // Runtime readiness failures must propagate; only successful handoff
-          // transfers the cold connection beyond this maintenance operation.
-          await params.handoffDatabase(item.options);
-          handedOff = true;
-        }
-      } finally {
-        if (!item.alreadyOpen && !handedOff && isOpenClawAgentDatabaseOpen(item.databasePath)) {
-          closeOpenClawAgentDatabaseByPath(item.databasePath);
-        }
+      }
+      if (failure) {
+        throw failure.error;
       }
     },
   });

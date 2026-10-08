@@ -8,12 +8,19 @@
 // src/state/openclaw-agent-db-contract.ts）。排队顺序对齐上游 createPermitPool：
 // 纯 FIFO，不做插队——2026-10-06 owner 已拍板不做优先级，按上游行为的子集走。
 //
-// 作用域用全局单例 + 显式 resetAgentStartupAdmissionForTest()，不是 AsyncLocalStorage
-// scope（跟上游不同）：本仓库对"一个进程一份全局运行期状态、测试用显式 reset 清空"
-// 这个模式已经有一大批先例（closeOpenClawAgentDatabasesForTest /
+// 调度器本身用全局单例 + 显式 resetAgentStartupAdmissionForTest()，不是上游那种按启动
+// 序列的 AsyncLocalStorage 实例：本仓库对"一个进程一份全局运行期状态、测试用显式 reset
+// 清空"这个模式已经有一大批先例（closeOpenClawAgentDatabasesForTest /
 // closeOpenClawStateDatabaseForTest 等），生产环境里 Desktop/Server 两种模式都只在
-// 一个进程里跑一个 gateway 实例，不需要 AsyncLocalStorage 那种支持"同进程多个独立
-// 启动序列并存"的开销；测试里多个 kernel 实例顺序跑，靠 reset 钩子隔离即可。
+// 一个进程里跑一个 gateway 实例；测试里多个 kernel 实例顺序跑，靠 reset 钩子隔离即可。
+//
+// 但"当前代码是不是正跑在某个员工自己的准入工作里"必须用 AsyncLocalStorage 判定
+// （对齐上游 agent-database-admission.ts 的 preparation 作用域）：准入工作内部的整条
+// 调用链（设置 mainKey、worktree 迁移、handoff → reconcileSessionTranscriptIndexes →
+// runProjectionWrite → 开库……）都会间接回到 withOpenClawAgentDatabaseAsync / 同步开库
+// 入口。只有按"异步上下文"豁免自己，才能一次性覆盖这些间接调用，不靠在每个调用点换
+// 绕过入口（review P1-1：换了直接调用、漏了间接调用，冷库在真实 handoff 里自己等自己）。
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { createPermitPool } from "../shared/permit-pool.js";
@@ -28,6 +35,22 @@ let opening = createPermitPool(AGENT_STARTUP_OPEN_CONCURRENCY);
 let migrating = createPermitPool(AGENT_STARTUP_MIGRATE_CONCURRENCY);
 const pendingByAgentId = new Map<string, Promise<void>>();
 const failedByAgentId = new Map<string, Error>();
+// active 在该员工的准入工作结束时置 false：准入期间派生、但活得比准入久的后台任务
+// 会继承这份上下文，结束后不能再拿它当豁免凭证（对齐上游 scope.active）。
+const ownAdmission = new AsyncLocalStorage<{ agentId: string; active: boolean }>();
+
+/** 同步打开员工库时撞上该员工的后台启动准入还没完成——调用方稍后重试即可。 */
+export class AgentStartupAdmissionPendingError extends Error {
+  constructor(readonly agentId: string) {
+    super(`Agent ${agentId} database is still being prepared after gateway startup; retry shortly`);
+    this.name = "AgentStartupAdmissionPendingError";
+  }
+}
+
+function isInsideOwnAdmission(agentId: string): boolean {
+  const scope = ownAdmission.getStore();
+  return scope?.active === true && scope.agentId === agentId;
+}
 
 /**
  * 为一批员工库在后台调度"打开 + 迁移"。每个员工各自：先排队进 open 并发池（上限2），
@@ -48,47 +71,52 @@ export function scheduleAgentStartupAdmission(params: {
     if (pendingByAgentId.has(agentId) || failedByAgentId.has(agentId)) {
       continue;
     }
-    const work = (async () => {
-      const releaseOpen = await opening.acquire({ signal });
-      if (!releaseOpen) {
-        return;
-      }
+    const scope = { agentId, active: true };
+    // 整个 work 跑在本员工的准入作用域里，内部任何间接开库都能认出"这是我自己"。
+    const work = ownAdmission.run(scope, async () => {
       try {
-        signal.throwIfAborted();
-        await params.openAgent(agentId, signal);
-      } finally {
-        releaseOpen();
-      }
-      const releaseMigrate = await migrating.acquire({ signal });
-      if (!releaseMigrate) {
-        return;
-      }
-      try {
-        signal.throwIfAborted();
-        await params.migrateAgent(agentId, signal);
-      } finally {
-        releaseMigrate();
-      }
-    })();
-    // pendingByAgentId 存的是 work 本身（会 reject），不是记账用的派生 promise——
-    // 这样任何在它 settle 之前就拿到这个 promise 去等的调用方，失败时真的会看到
-    // reject，不会被下面这条记账链的 .catch() 吞成"看起来成功"。
-    pendingByAgentId.set(agentId, work);
-    work
-      .catch((error: unknown) => {
-        if (signal.aborted) {
+        const releaseOpen = await opening.acquire({ signal });
+        if (!releaseOpen) {
           return;
         }
-        const reason = error instanceof Error ? error : new Error(String(error));
-        failedByAgentId.set(agentId, reason);
-        log.warn("agent startup admission failed; agent stays unavailable", {
-          agentId,
-          reason: reason.message,
-        });
-      })
-      .finally(() => {
+        try {
+          signal.throwIfAborted();
+          await params.openAgent(agentId, signal);
+        } finally {
+          releaseOpen();
+        }
+        const releaseMigrate = await migrating.acquire({ signal });
+        if (!releaseMigrate) {
+          return;
+        }
+        try {
+          signal.throwIfAborted();
+          await params.migrateAgent(agentId, signal);
+        } finally {
+          releaseMigrate();
+        }
+      } catch (error) {
+        if (!signal.aborted) {
+          const reason = error instanceof Error ? error : new Error(String(error));
+          failedByAgentId.set(agentId, reason);
+          log.warn("agent startup admission failed; agent stays unavailable", {
+            agentId,
+            reason: reason.message,
+          });
+        }
+        throw error;
+      } finally {
+        // 状态必须在 work settle 之前同步改完：等待方 await work 之后紧接着就会进开库
+        // 入口再查一次状态，如果这里还挂着 pending，会被误判成"仍在准入"。
+        // （第一句就是 await，所以执行到这里时 work 早已登记进 pendingByAgentId。）
+        scope.active = false;
         pendingByAgentId.delete(agentId);
-      });
+      }
+    });
+    // pendingByAgentId 存的是 work 本身（失败会 reject），等待方能真正看到失败原因。
+    pendingByAgentId.set(agentId, work);
+    // 失败已在上面记账 + 打日志；这里只防"没人等时"的未处理 rejection。
+    work.catch(() => {});
   }
 }
 
@@ -101,11 +129,41 @@ export function scheduleAgentStartupAdmission(params: {
  */
 export function waitForAgentStartupAdmission(agentId: string): Promise<void> | undefined {
   const normalized = normalizeAgentId(agentId);
+  // 本员工自己的准入工作（含它间接调到的整条链）不能等自己，否则 work 永远 settle 不了。
+  if (isInsideOwnAdmission(normalized)) {
+    return undefined;
+  }
   const failure = failedByAgentId.get(normalized);
   if (failure) {
     return Promise.reject(failure);
   }
   return pendingByAgentId.get(normalized);
+}
+
+/**
+ * 同步开库入口用的检查（review P1-2）：同步调用方没法等，而它若在后台准入的完整性检查
+ * 期间新建物理连接，会 revoke 掉准入正在进行的异步打开，准入因此永久失败。所以准入
+ * 未完成时直接拒绝（可重试错误），已失败时抛同一个失败原因——跟异步入口"等待 / 同一
+ * 失败原因"的结局一致，只是"等待"换成"稍后重试"。对齐上游：上游在
+ * openOpenClawAgentDatabaseSteps 顶部 assertAgentDatabaseAdmitted，准入中的员工一律
+ * 拒绝（retryable），准入自身经作用域豁免。
+ */
+export function assertAgentStartupAdmissionSettled(agentId: string): void {
+  // 绝大多数时候调度器是空的；这条判断让热路径上的同步开库几乎零开销。
+  if (pendingByAgentId.size === 0 && failedByAgentId.size === 0) {
+    return;
+  }
+  const normalized = normalizeAgentId(agentId);
+  if (isInsideOwnAdmission(normalized)) {
+    return;
+  }
+  const failure = failedByAgentId.get(normalized);
+  if (failure) {
+    throw failure;
+  }
+  if (pendingByAgentId.has(normalized)) {
+    throw new AgentStartupAdmissionPendingError(normalized);
+  }
 }
 
 /**
@@ -124,8 +182,7 @@ export function waitForAgentStartupAdmission(agentId: string): Promise<void> | u
  */
 export async function cancelAgentStartupAdmission(): Promise<void> {
   controller?.abort(new Error("Gateway stopped during agent database startup admission"));
-  // pendingByAgentId 的条目要等记账链（scheduleAgentStartupAdmission 里的 .finally）跑完才删，所以循环到它清空为止
-  // ——这样清空状态时不会有上一轮的记账回调晚到、误删下一轮同 agentId 的条目。
+  // work 自己在 settle 前就把条目删掉；循环到清空为止，等的是全部 work 真正收尾。
   while (pendingByAgentId.size > 0) {
     await Promise.allSettled(pendingByAgentId.values());
   }

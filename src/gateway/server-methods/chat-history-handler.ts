@@ -26,6 +26,7 @@ import {
 } from "../../infra/diagnostics-timeline.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { scopeLegacySessionKeyToAgent } from "../../routing/session-key.js";
+import { waitForAgentStartupAdmission } from "../../state/agent-startup-admission.js";
 import {
   boundInFlightRunSnapshotForChatHistory,
   projectInFlightRunSnapshot,
@@ -186,6 +187,12 @@ async function handleChatHistoryRequest({
   if (!requestedAgent.ok) {
     respond(false, undefined, requestedAgent.error);
     return;
+  }
+  // ADR-0033 任务84(c)：下面全是同步读库，同步入口在后台启动准入期间只能拒绝。这里先等
+  // 该员工的准入完成（失败则抛同一原因），面板一连上就拉历史时是"稍等后正常返回"。
+  const startupAdmission = waitForAgentStartupAdmission(requestedAgent.agentId);
+  if (startupAdmission) {
+    await startupAdmission;
   }
   const {
     cfg,

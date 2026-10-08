@@ -44,7 +44,6 @@ import { getGatewayPluginMetadataSnapshot } from "../plugins/current-plugin-meta
 import { getTotalQueueSize } from "../process/command-queue.js";
 import { getActiveGatewayRootWorkCount } from "../process/gateway-work-admission.js";
 import { createLazyPromise } from "../shared/lazy-runtime.js";
-import type { OpenClawSchemaVersions } from "../state/openclaw-schema-versions.js";
 import { withArtifactPreservingStateReads } from "../state/openclaw-state-db-readonly.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { assertOpenClawStateWriteAllowedAtPath } from "../state/openclaw-state-ownership.js";
@@ -67,45 +66,6 @@ type GatewayLogger = ReturnType<typeof createSubsystemLogger>;
 type WorkerEnvironmentStartupLoader = () => Promise<
   typeof import("./server-worker-environment-startup.js")
 >;
-
-/**
- * ADR-0033 任务84(a)：构造 state.schema-preflight 这一遍的查询参数，只查全局状态库，
- * 不再逐个员工库重复检查。
- *
- * 员工库已经在本进程更早的 CLI/doctor 就绪检查（doctor-config-preflight-startup.ts 的
- * assertOpenClawDatabasesReady({ operation: "gateway-startup" })）里做过一次完整校验
- * （含完整性 / 迁移就绪），后面 session-migration 阶段打开每个员工库时还会再做一次准入
- * 检查；这里再扫一遍全部员工库纯属重复，是真实数据冷启动偏慢的三段之一（约 9.4 秒 /
- * 15%，详见 ADR-0033 任务84 2026-10-06 记录）。
- *
- * 对齐上游 #165667（perf(gateway): reuse bootstrap admission snapshots）：该 PR 的结论
- * 同样是这两处 state-snapshot 校验本就该共用同一次全局状态库判定、员工库检查不应重复。
- * `preflightOpenClawDatabaseSchemas` 本身已支持 `scope: "state"`（doctor-maintenance.ts
- * 的坏租约诊断路径已经在用，见 src/commands/doctor-maintenance.ts:180），这里只是让
- * 网关启动这个调用点也用上，不新增任何新逻辑分支。抽成独立函数是为了能在
- * server-startup-bootstrap.test-support.ts 里直接断言 scope 字段，不用搭一整套启动夹具。
- */
-function buildStartupDatabaseSchemaPreflightOptions(params: {
-  signal?: AbortSignal;
-  env: NodeJS.ProcessEnv;
-  stateSchemaVersion: number;
-  agentSchemaVersion: number;
-}): {
-  signal?: AbortSignal;
-  env: NodeJS.ProcessEnv;
-  scope: "state";
-  supportedVersions: OpenClawSchemaVersions;
-} {
-  return {
-    signal: params.signal,
-    env: params.env,
-    scope: "state",
-    supportedVersions: {
-      state: params.stateSchemaVersion,
-      agent: params.agentSchemaVersion,
-    },
-  };
-}
 
 function publishGatewayPluginRuntimeConfigAtStartup(params: {
   runtimeConfig: OpenClawConfig;
@@ -192,14 +152,19 @@ export async function prepareGatewayServerBootstrap(input: {
     ]),
   );
   const inspectDatabaseSchemas = (signal?: AbortSignal) =>
-    preflightOpenClawDatabaseSchemas(
-      buildStartupDatabaseSchemaPreflightOptions({
-        signal,
-        env: process.env,
-        stateSchemaVersion: stateDatabase.OPENCLAW_STATE_SCHEMA_VERSION,
-        agentSchemaVersion: agentDatabase.OPENCLAW_AGENT_SCHEMA_VERSION,
-      }),
-    );
+    preflightOpenClawDatabaseSchemas({
+      signal,
+      env: process.env,
+      // ADR-0033 任务84(a)：只查全局状态库。员工库在更早的 CLI/doctor 就绪检查
+      // （assertOpenClawDatabasesReady({ operation: "gateway-startup" })）里已完整校验过，
+      // session-migration 打开每个员工库时还会再做准入；这里再扫一遍是冷启动约 9.4 秒的
+      // 重复劳动。方向对齐上游 #165667；scope:"state" 是现成分支（doctor-maintenance 在用）。
+      scope: "state",
+      supportedVersions: {
+        state: stateDatabase.OPENCLAW_STATE_SCHEMA_VERSION,
+        agent: agentDatabase.OPENCLAW_AGENT_SCHEMA_VERSION,
+      },
+    });
   const databaseSchemas = await startupTrace.measure("state.schema-preflight", () =>
     opts.startupOperation
       ? opts.startupOperation(inspectDatabaseSchemas)
@@ -663,5 +628,4 @@ export async function prepareGatewayServerBootstrap(input: {
 
 export const testing = {
   publishGatewayPluginRuntimeConfigAtStartup,
-  buildStartupDatabaseSchemaPreflightOptions,
 };

@@ -36,7 +36,17 @@ import { resolveSkillsWatchPath, toWatchRoot } from "./refresh-watch-path.js";
 export { registerSkillsChangeListener } from "./refresh-state.js";
 
 type SkillsPathWatchState = {
-  watcher: FSWatcher;
+  // chokidar 后备/非原生平台使用。原生 recursive fs.watch 覆盖这个 root 时为 undefined。
+  watcher?: FSWatcher;
+  // macOS/Windows 的单个原生递归 fs.watch,覆盖整个 skill root。每个 chokidar
+  // FSWatcher 内部会为同一个 root 分配 FSWatcher/WatchHelper/NodeFsHandler/
+  // FSEventWrap 一整组包装对象(2026-10 内存排查实测:90 个 root 时 chokidar
+  // 比原生 fs.watch 的常驻内存开销高一个数量级以上),原生 fs.watch 只是一个
+  // OS 级 handle,没有这层包装,随员工数线性增长时开销小得多。
+  native?: fs.FSWatcher;
+  // 统一的"已拆除"旗标,取代原来到处判断 watcher.closed——因为现在一个 root
+  // 可能由 chokidar 或原生 fs.watch 其中一种在覆盖,判断逻辑不能绑死某一种。
+  disposed: boolean;
   watchRoot: string;
   depth: number;
   // 任务72:一个 workspace 常挂多个 skill root,旧实现里每个 root 的首次
@@ -76,6 +86,36 @@ const MAX_SYMLINK_WATCH_DIRECTORY_SCANS_PER_ROOT = 200;
 const MAX_SYMLINK_WATCH_RAW_ENTRIES_PER_ROOT = 2_000;
 const RAW_SKILL_FILE_POLL_INTERVAL_MS = 100;
 const SKILLS_WATCH_DEBOUNCE_MS = 250;
+// 内存排查(2026-10,ADR-0033 任务72后续):macOS 上每个 chokidar FSWatcher 都会
+// 分配一整组原生包装对象(FSWatcher/WatchHelper/NodeFsHandler/FSEventWrap),
+// 合成探针实测在 90 个 root 规模下单个 chokidar watcher 比单个原生递归
+// fs.watch 的常驻内存开销高一个数量级以上。每个员工的 workspace skill root
+// 是不可共享的独立目录(不像全局/home skills 根那样被多个员工摊薄),所以
+// 员工数越多,这份"每 root 固定开销"就越线性累积。用单个原生递归 fs.watch
+// 替换该 root 的 chokidar watcher 不会减少 root 数量,但能大幅降低每个 root
+// 的常驻内存底座。
+//
+// 只在 darwin/win32 开启(镜像上游 memory-core 原生 watcher 对同类问题
+// #86613 的平台选择,以及 openclaw 上游 #90647 的思路——本仓按现有结构重写,
+// 非逐行搬运):Linux 的 fs.watch({recursive:true}) 底层仍是逐文件 inotify
+// 扇出,既没有 chokidar 的包装开销优势,也没有本仓要解决的常驻内存问题,继续
+// 用 chokidar。任何平台原生 attach 失败都会退回 chokidar(见
+// attachChokidarSkillsWatch 的调用点),不是"原生失败就不再监听"。
+const NATIVE_RECURSIVE_SKILLS_WATCH_PLATFORMS = new Set<NodeJS.Platform>(["darwin", "win32"]);
+
+// 现有 51 个单测全都假设"永远是 chokidar"(mock 的是 chokidar.watch,不是
+// fs.watch),本仓 CI 跑在 ubuntu 上所以它们不会真的撞见原生路径——但本地在
+// macOS/Windows 开发机上跑同一批测试会真的触发原生 fs.watch,断言落空。用
+// 一个仅测试可写的覆盖位,让老测试显式关掉原生路径继续验 chokidar 行为,
+// 新增的原生路径测试显式打开它,不依赖"CI 恰好是 Linux"这种隐性假设。
+let nativeSkillsWatchOverrideForTest: "on" | "off" | undefined;
+
+function nativeRecursiveSkillsWatchSupported(): boolean {
+  if (nativeSkillsWatchOverrideForTest) {
+    return nativeSkillsWatchOverrideForTest === "on";
+  }
+  return NATIVE_RECURSIVE_SKILLS_WATCH_PLATFORMS.has(process.platform);
+}
 // One watcher per unique watched directory. Agent workspaces that include the
 // same shared skill root (the global skills dir, the home skills dir, or a
 // configured extra/plugin dir) subscribe to the same watcher instead of each
@@ -83,6 +123,20 @@ const SKILLS_WATCH_DEBOUNCE_MS = 250;
 // rather than with agent count.
 const pathWatchers = new Map<string, SkillsPathWatchState>();
 let nativeWatchCapacityFailed = false;
+// chokidar 与原生 fs.watch 两种后端撞到系统 watch 容量上限时的共同处理:
+// 全局只告警一次、拆掉全部 watcher,之后改由 agent 准备阶段刷新技能。
+function handleSkillsWatchCapacityExhausted(capacityCode: string): void {
+  if (nativeWatchCapacityFailed) {
+    return;
+  }
+  nativeWatchCapacityFailed = true;
+  log.warn(
+    `skills native watcher capacity exhausted (${capacityCode}); refreshing skills during agent preparation`,
+  );
+  for (const active of pathWatchers.values()) {
+    void teardownSkillsPathWatcher(active);
+  }
+}
 // Watch targets each workspace is currently subscribed to, used to reconcile
 // subscriptions and to detect watch-target changes across calls.
 const workspaceWatchTargets = new Map<string, WatchTarget[]>();
@@ -440,9 +494,11 @@ function readFileStabilitySnapshot(filePath: string): FileStabilitySnapshot | un
 async function waitForStableSkillFile(
   filePath: string,
   stabilityMs: number,
-  watcher: FSWatcher,
+  // 原来直接接 chokidar 的 FSWatcher 只为了读 .closed;原生 fs.watch 路径没有
+  // 这个对象,改成由调用方传一个取值函数,两种后端共用同一份稳定性等待逻辑。
+  isDisposed: () => boolean,
 ): Promise<void> {
-  if (watcher.closed || stabilityMs <= 0) {
+  if (isDisposed() || stabilityMs <= 0) {
     return;
   }
   let previous = readFileStabilitySnapshot(filePath);
@@ -456,7 +512,7 @@ async function waitForStableSkillFile(
       setTimeout(resolve, delayMs);
     });
     // Closing a watcher retires raw polling, even while the file keeps changing.
-    const next = watcher.closed ? undefined : readFileStabilitySnapshot(filePath);
+    const next = isDisposed() ? undefined : readFileStabilitySnapshot(filePath);
     if (!next) {
       return;
     }
@@ -481,34 +537,12 @@ function resolveSkillsWatcherUsePolling(): boolean {
 
 function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
   const usePolling = resolveSkillsWatcherUsePolling();
-  // Chokidar's missing-root fallback retains only the final basename, so it
-  // misses creation through multiple absent parents. Watch the existing prefix
-  // and restrict traversal to the logical root and its ancestor chain.
-  const watcher = runInSkillsWatcherContext(() =>
-    chokidar.watch(target.watchRoot, {
-      ignoreInitial: true,
-      followSymlinks: false,
-      usePolling,
-      // Skill root precedence and grouped discovery use the same bounded depth,
-      // so watcher invalidation must observe that whole decision surface.
-      depth:
-        target.depth +
-        path.relative(target.watchRoot, target.path).split(path.sep).filter(Boolean).length,
-      awaitWriteFinish: {
-        stabilityThreshold: SKILLS_WATCH_DEBOUNCE_MS,
-        pollInterval: 100,
-      },
-      ignored: (watchPath, stats) =>
-        shouldIgnoreSkillsWatchPath(watchPath, stats, usePolling) ||
-        (!isPathInside(target.path, watchPath) && !isPathInside(watchPath, target.path)),
-    }),
-  );
 
   const state: SkillsPathWatchState = {
-    watcher,
     watchRoot: target.watchRoot,
     depth: target.depth,
     initialScan: "pending",
+    disposed: false,
     subscribers: new Set<string>(),
   };
 
@@ -522,10 +556,12 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
   };
 
   // 只有某个 subscriber 的全部 target 都结算完(ready/error)才发一次;
-  // state 被新 watcher 取代或已 closed 时放弃,避免对作废的 watcher 发布。
+  // state 被新 watcher 取代或已拆除(disposed)时放弃,避免对作废的 watcher 发布。
+  // disposed 是跨 chokidar/原生 fs.watch 两种后端的统一判据,不再直接读
+  // watcher.closed——原生 fs.watch 覆盖这个 root 时根本没有 chokidar watcher。
   const settleInitialScan = (result: "ready" | "error") => {
     if (
-      watcher.closed ||
+      state.disposed ||
       pathWatchers.get(target.path) !== state ||
       state.initialScan === "ready" ||
       state.initialScan === result
@@ -537,7 +573,7 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
       const targets = workspaceWatchTargets.get(watcherKey);
       const allSettled = targets?.every((entry) => {
         const current = pathWatchers.get(entry.path);
-        return current && !current.watcher.closed && current.initialScan !== "pending";
+        return current && !current.disposed && current.initialScan !== "pending";
       });
       if (allSettled) {
         publishChange(watcherKey);
@@ -547,7 +583,7 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
 
   const schedule = (changedPath?: string) => {
     // File-stability work may finish after this subscription has been closed.
-    if (watcher.closed) {
+    if (state.disposed) {
       return;
     }
     state.pendingPath = changedPath ?? state.pendingPath;
@@ -564,71 +600,216 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
     }, SKILLS_WATCH_DEBOUNCE_MS);
   };
   const scheduleRawSkillFile = (changedPath: string) => {
-    void waitForStableSkillFile(changedPath, SKILLS_WATCH_DEBOUNCE_MS, watcher)
+    void waitForStableSkillFile(changedPath, SKILLS_WATCH_DEBOUNCE_MS, () => state.disposed)
       .catch((err: unknown) => {
         log.warn(`skills watcher stability check failed (${changedPath}): ${String(err)}`);
       })
       .then(() => schedule(changedPath));
   };
 
-  // ignoreInitial suppresses writes discovered before native watches are ready.
-  // 不再让每个 root 的 ready 各自广播;汇总到 settleInitialScan,对齐上游
-  // PR #146480 的思路(按本仓结构重写,非逐行搬运)。
-  watcher.on("ready", () => settleInitialScan("ready"));
-  watcher.on("all", (_event, changedPath) => {
-    if (isPathInside(target.path, changedPath) || isPathInside(changedPath, target.path)) {
-      schedule(changedPath);
-    }
-  });
-  watcher.on("raw", (_eventName, rawPath, details) => {
-    const rawPathText = rawPathToString(rawPath);
-    if (!rawPathText) {
-      const watchedPath = getRawWatchedPath(details);
-      if (watchedPath && isPathInside(target.path, watchedPath)) {
-        schedule(watchedPath);
-      }
+  // chokidar 后备/非原生平台路径:原来的实现原样保留,只是从"watcher 变量"
+  // 改成读/写共享的 state.watcher + state.disposed,好让原生 fs.watch 失败时
+  // 能复用同一套 schedule/settleInitialScan 退回这条路径。
+  const attachChokidarSkillsWatch = () => {
+    if (state.disposed || state.watcher) {
       return;
     }
-    const changedPath = resolveRawSkillsWatchPath(rawPathText, details);
-    if (
-      changedPath &&
-      isPathInside(target.path, changedPath) &&
-      isSkillFileWatchPath(changedPath)
-    ) {
-      if (usePolling) {
+    // Chokidar's missing-root fallback retains only the final basename, so it
+    // misses creation through multiple absent parents. Watch the existing prefix
+    // and restrict traversal to the logical root and its ancestor chain.
+    const watcher = runInSkillsWatcherContext(() =>
+      chokidar.watch(target.watchRoot, {
+        ignoreInitial: true,
+        followSymlinks: false,
+        usePolling,
+        // Skill root precedence and grouped discovery use the same bounded depth,
+        // so watcher invalidation must observe that whole decision surface.
+        depth:
+          target.depth +
+          path.relative(target.watchRoot, target.path).split(path.sep).filter(Boolean).length,
+        awaitWriteFinish: {
+          stabilityThreshold: SKILLS_WATCH_DEBOUNCE_MS,
+          pollInterval: 100,
+        },
+        ignored: (watchPath, stats) =>
+          shouldIgnoreSkillsWatchPath(watchPath, stats, usePolling) ||
+          (!isPathInside(target.path, watchPath) && !isPathInside(watchPath, target.path)),
+      }),
+    );
+    state.watcher = watcher;
+
+    // ignoreInitial suppresses writes discovered before native watches are ready.
+    // 不再让每个 root 的 ready 各自广播;汇总到 settleInitialScan,对齐上游
+    // PR #146480 的思路(按本仓结构重写,非逐行搬运)。
+    watcher.on("ready", () => settleInitialScan("ready"));
+    watcher.on("all", (_event, changedPath) => {
+      if (isPathInside(target.path, changedPath) || isPathInside(changedPath, target.path)) {
+        schedule(changedPath);
+      }
+    });
+    watcher.on("raw", (_eventName, rawPath, details) => {
+      const rawPathText = rawPathToString(rawPath);
+      if (!rawPathText) {
+        const watchedPath = getRawWatchedPath(details);
+        if (watchedPath && isPathInside(target.path, watchedPath)) {
+          schedule(watchedPath);
+        }
         return;
       }
-      scheduleRawSkillFile(changedPath);
-    }
-  });
-  watcher.on("error", (err) => {
-    if (watcher.closed) {
-      return;
-    }
-    const capacityCode = usePolling ? undefined : getFileWatchCapacityCode(err);
-    if (capacityCode) {
-      if (!nativeWatchCapacityFailed) {
-        nativeWatchCapacityFailed = true;
-        log.warn(
-          `skills native watcher capacity exhausted (${capacityCode}); refreshing skills during agent preparation`,
-        );
-        for (const active of pathWatchers.values()) {
-          void teardownSkillsPathWatcher(active);
+      const changedPath = resolveRawSkillsWatchPath(rawPathText, details);
+      if (
+        changedPath &&
+        isPathInside(target.path, changedPath) &&
+        isSkillFileWatchPath(changedPath)
+      ) {
+        if (usePolling) {
+          return;
         }
+        scheduleRawSkillFile(changedPath);
       }
-      return;
+    });
+    watcher.on("error", (err) => {
+      if (state.disposed) {
+        return;
+      }
+      const capacityCode = usePolling ? undefined : getFileWatchCapacityCode(err);
+      if (capacityCode) {
+        handleSkillsWatchCapacityExhausted(capacityCode);
+        return;
+      }
+      log.warn(`skills watcher error (${target.path}): ${String(err)}`);
+      // 一个 root 扫描失败不该让同一 workspace 的其它健康 root 永远等不到
+      // 结算——用 "error" 结算这个 target,其余 target 该怎么判还怎么判。
+      settleInitialScan("error");
+    });
+  };
+
+  // 内存排查修复:macOS/Windows 上用单个原生递归 fs.watch 覆盖整个 root,
+  // 不开 chokidar,省掉 chokidar 每个 root 固定的包装对象开销(见上面
+  // NATIVE_RECURSIVE_SKILLS_WATCH_PLATFORMS 的注释)。usePolling 时沿用
+  // chokidar(轮询语义和原生事件不是一回事,不在本次改动范围)。
+  const attachNativeSkillsWatch = (): boolean => {
+    if (state.disposed || usePolling || !nativeRecursiveSkillsWatchSupported()) {
+      return false;
     }
-    log.warn(`skills watcher error (${target.path}): ${String(err)}`);
-    // 一个 root 扫描失败不该让同一 workspace 的其它健康 root 永远等不到
-    // 结算——用 "error" 结算这个 target,其余 target 该怎么判还怎么判。
-    settleInitialScan("error");
-  });
+    let native: fs.FSWatcher;
+    try {
+      // 与 chokidar 路径一样经 runInSkillsWatcherContext 创建:watcher 是跨会话
+      // 共享、长期存活的句柄,若直接在当前 turn 里 fs.watch,后续文件事件、稳定性
+      // 定时器和技能刷新通知都会继承并一直持有那个 turn 的 AsyncLocalStorage 数据。
+      native = runInSkillsWatcherContext(() =>
+        fs.watch(target.watchRoot, { recursive: true }, (_eventType, filename) => {
+          if (state.disposed) {
+            return;
+          }
+          const name = rawPathToString(filename);
+          if (!name) {
+            // 文件名缺失(部分平台的部分事件会这样):无法判断具体改了哪个
+            // 文件,保守起见整棵树都当作变了,语义上对应 chokidar raw 事件里
+            // rawPath 为空时走 watchedPath 兜底的那一支。
+            schedule();
+            return;
+          }
+          const full = path.join(target.watchRoot, name);
+          if (!(isPathInside(target.path, full) || isPathInside(full, target.path))) {
+            return;
+          }
+          let stats: fs.Stats | undefined;
+          try {
+            stats = fs.lstatSync(full);
+          } catch {
+            stats = undefined;
+          }
+          // 直接复用 chokidar 的 ignored 判据,两种后端过滤口径一致:
+          // node_modules/.git/.venv 等忽略目录里的变动不刷新;现存常规文件也被
+          // "忽略",其中只有 SKILL.md 这类文件走稳定性等待再刷新(对应 chokidar
+          // 的 raw 事件分支,isSkillFileWatchPath 对忽略目录同样返回 false)。
+          if (shouldIgnoreSkillsWatchPath(full, stats)) {
+            if (stats && isSkillFileWatchPath(full)) {
+              scheduleRawSkillFile(full);
+            }
+            return;
+          }
+          // 目录/符号链接的增删,或路径已经不存在(常规文件被删除也会落到这
+          // 里,因为 lstatSync 失败拿不到 stats)——对应 chokidar 的
+          // add/addDir/unlink/unlinkDir,直接触发刷新,不用等稳定性。
+          schedule(full);
+        }),
+      );
+    } catch (err) {
+      log.warn(
+        `skills native watcher could not start on ${target.watchRoot}: ${String(err)}; falling back to chokidar`,
+      );
+      return false;
+    }
+    state.native = native;
+    native.on("error", (err) => {
+      if (state.disposed || state.native !== native) {
+        return;
+      }
+      const capacityCode = getFileWatchCapacityCode(err);
+      if (capacityCode) {
+        handleSkillsWatchCapacityExhausted(capacityCode);
+        return;
+      }
+      log.warn(`skills native watcher error (${target.watchRoot}): ${String(err)}`);
+      // Node 文档:原生 fs.watch 出错后这个 watcher 实例不再可用。关掉它,
+      // 补一次刷新覆盖可能错过的事件,再退回 chokidar 继续覆盖这个 root,
+      // 而不是让它从此失去监听。
+      state.native = undefined;
+      try {
+        native.close();
+      } catch {
+        // best effort
+      }
+      // 换到 chokidar 后备时重新进入"初始扫描中":后备用 ignoreInitial:true,
+      // 扫描期间新出现的技能只会被初始扫描吸收、不发事件,必须靠它的 ready 再结算
+      // 一次补发失效通知;若仍停在原生阶段留下的 "ready",那次 ready 会被
+      // settleInitialScan 的守卫丢掉,技能快照可能一直停在旧版本。
+      state.initialScan = "pending";
+      schedule();
+      attachChokidarSkillsWatch();
+    });
+    // 原生 fs.watch 没有"初始扫描"这个阶段——attach 成功就立刻能收事件,
+    // 不像 chokidar 要等 ready。用 queueMicrotask 推迟到 createSkillsPathWatcher
+    // 返回、调用方把这个 state 写进 pathWatchers 之后才结算,否则
+    // settleInitialScan 里 `pathWatchers.get(target.path) !== state` 的守卫
+    // 会在 state 还没登记时误判成"已作废"而丢弹这次结算。
+    // 结算前确认仍是这个原生 watcher 在覆盖:若它在微任务前已出错并切到 chokidar,
+    // 这次结算会提前把后备扫描标成 ready,必须放弃。
+    queueMicrotask(() => {
+      if (state.native === native) {
+        settleInitialScan("ready");
+      }
+    });
+    return true;
+  };
+
+  if (!attachNativeSkillsWatch()) {
+    attachChokidarSkillsWatch();
+  }
 
   return state;
 }
 
 async function teardownSkillsPathWatcher(state: SkillsPathWatchState): Promise<void> {
+  // disposed 先置位:两种后端的 close 都是尽力而为、可能抛错/可能是异步的,
+  // 任何还在飞的回调(含正在跑的 scheduleRawSkillFile 稳定性等待)靠这个旗标
+  // 立刻放弃,不依赖 close() 真正落地的时机。
+  state.disposed = true;
   clearTimeout(state.timer);
+  if (state.native) {
+    const native = state.native;
+    state.native = undefined;
+    try {
+      native.close();
+    } catch {
+      // Closing watchers is best effort, including during replacement and shutdown.
+    }
+  }
+  if (!state.watcher) {
+    return;
+  }
   try {
     const wasClosed = state.watcher.closed;
     const closing = state.watcher.close();
@@ -813,7 +994,14 @@ export async function closeSkillsWatchers(resetState = false): Promise<void> {
 
 if (process.env.VITEST || process.env.NODE_ENV === "test") {
   (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.skillsRefreshTestApi")] = {
-    resetSkillsRefreshForTest: () => closeSkillsWatchers(true),
+    resetSkillsRefreshForTest: () => {
+      // 每个测试文件 afterEach 都会调 reset,顺手清掉覆盖位,不必各自再写一行。
+      nativeSkillsWatchOverrideForTest = undefined;
+      return closeSkillsWatchers(true);
+    },
+    setNativeSkillsWatchOverrideForTest: (forced: "on" | "off" | undefined) => {
+      nativeSkillsWatchOverrideForTest = forced;
+    },
   };
 }
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

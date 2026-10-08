@@ -53,6 +53,8 @@ describe("ensureSkillsWatcher ready coalescing", () => {
   });
 
   beforeEach(async () => {
+    // 这批用例验 chokidar 路径:显式关掉原生 fs.watch,不依赖宿主机 OS(原因见 refresh.test-support.ts)。
+    refreshTestSupport.setNativeSkillsWatchOverrideForTest("off");
     watchMock.mockClear();
     createdWatchers.length = 0;
     fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-watch-ready-coalesce-"));

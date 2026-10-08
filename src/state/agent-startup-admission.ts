@@ -28,14 +28,6 @@ let opening = createPermitPool(AGENT_STARTUP_OPEN_CONCURRENCY);
 let migrating = createPermitPool(AGENT_STARTUP_MIGRATE_CONCURRENCY);
 const pendingByAgentId = new Map<string, Promise<void>>();
 const failedByAgentId = new Map<string, Error>();
-// 跟 pendingByAgentId 不同：这里的条目直到 settle 都不删，关闭时要等的是"所有调度过
-// 的后台工作"，不只是"当前还没结束的那些"（两者在稳态下是同一批，但在关闭发生在
-// settle 回调跑完之前的那一小段窗口里会不一致，用独立集合更不容易出 race）。
-const tracked = new Set<Promise<unknown>>();
-
-function toError(value: unknown): Error {
-  return value instanceof Error ? value : new Error(String(value));
-}
 
 /**
  * 为一批员工库在后台调度"打开 + 迁移"。每个员工各自：先排队进 open 并发池（上限2），
@@ -81,14 +73,13 @@ export function scheduleAgentStartupAdmission(params: {
     // pendingByAgentId 存的是 work 本身（会 reject），不是记账用的派生 promise——
     // 这样任何在它 settle 之前就拿到这个 promise 去等的调用方，失败时真的会看到
     // reject，不会被下面这条记账链的 .catch() 吞成"看起来成功"。
-    tracked.add(work);
     pendingByAgentId.set(agentId, work);
     work
       .catch((error: unknown) => {
         if (signal.aborted) {
           return;
         }
-        const reason = toError(error);
+        const reason = error instanceof Error ? error : new Error(String(error));
         failedByAgentId.set(agentId, reason);
         log.warn("agent startup admission failed; agent stays unavailable", {
           agentId,
@@ -97,7 +88,6 @@ export function scheduleAgentStartupAdmission(params: {
       })
       .finally(() => {
         pendingByAgentId.delete(agentId);
-        tracked.delete(work);
       });
   }
 }
@@ -134,28 +124,25 @@ export function waitForAgentStartupAdmission(agentId: string): Promise<void> | u
  */
 export async function cancelAgentStartupAdmission(): Promise<void> {
   controller?.abort(new Error("Gateway stopped during agent database startup admission"));
-  while (tracked.size > 0) {
-    await Promise.allSettled(tracked);
+  // pendingByAgentId 的条目要等记账链（scheduleAgentStartupAdmission 里的 .finally）跑完才删，所以循环到它清空为止
+  // ——这样清空状态时不会有上一轮的记账回调晚到、误删下一轮同 agentId 的条目。
+  while (pendingByAgentId.size > 0) {
+    await Promise.allSettled(pendingByAgentId.values());
   }
   clearAgentStartupAdmissionState();
 }
 
-/** 真正做清空的内部实现，cancelAgentStartupAdmission 与测试专用 reset 共用。 */
 function clearAgentStartupAdmissionState(): void {
   controller = undefined;
   opening = createPermitPool(AGENT_STARTUP_OPEN_CONCURRENCY);
   migrating = createPermitPool(AGENT_STARTUP_MIGRATE_CONCURRENCY);
   pendingByAgentId.clear();
   failedByAgentId.clear();
-  tracked.clear();
 }
 
 /**
- * 测试专用：清空全局单例状态，不走 AsyncLocalStorage 的理由见文件顶部注释。跟
- * cancelAgentStartupAdmission 不同的是这里不 abort、不等收尾——测试场景里通常
- * 没有真正跑着的后台任务要等，直接清空状态即可，避免测试每次都要走一次
- * Promise.allSettled 的异步等待。
+ * 测试专用：清空全局单例状态（不走 AsyncLocalStorage 的理由见文件顶部注释）。跟
+ * cancelAgentStartupAdmission 不同，这里不 abort、不等收尾——测试场景里通常没有真正
+ * 跑着的后台任务要等，直接清空即可。
  */
-export function resetAgentStartupAdmissionForTest(): void {
-  clearAgentStartupAdmissionState();
-}
+export const resetAgentStartupAdmissionForTest = clearAgentStartupAdmissionState;

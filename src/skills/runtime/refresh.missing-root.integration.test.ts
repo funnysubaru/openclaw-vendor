@@ -133,6 +133,11 @@ it("refreshes skills created beneath an initially missing project skills root", 
   syncBuiltinESMExports();
   const { ensureSkillsWatcher, closeSkillsWatchers, registerSkillsChangeListener } =
     await import("./refresh.js");
+  const { setNativeSkillsWatchOverrideForTest } = await import("./refresh.test-support.js");
+  // 这条用例靠 spy nativeFs.watch 验证 chokidar 内部会给 workspace root 和
+  // 嵌套的 skill 子目录各开一次 fs.watch;原生递归 fs.watch 路径只对整棵树
+  // 开一次,会让这条断言失真,显式关掉验证 chokidar 行为本身。
+  setNativeSkillsWatchOverrideForTest("off");
   const changes: string[] = [];
   const unregister = registerSkillsChangeListener((event) => {
     if (event.workspaceDir === workspaceDir && event.reason === "watch" && event.changedPath) {
@@ -176,6 +181,7 @@ it("refreshes skills created beneath an initially missing project skills root", 
     await closeSkillsWatchers();
     watchObserver.mockRestore();
     syncBuiltinESMExports();
+    setNativeSkillsWatchOverrideForTest(undefined);
     await fs.rm(root, { recursive: true, force: true });
   }
 });

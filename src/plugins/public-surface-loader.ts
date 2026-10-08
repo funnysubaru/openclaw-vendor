@@ -40,10 +40,10 @@ type PublicSurfaceLocation = {
 // 不会因为 cwd / env 变化产生假命中——一旦 bundledPluginsDir 的值真的变了（override、
 // disabled、cwd 等任何会影响它的输入变了），字符串不相等，直接走回 path.resolve 重算。
 let lastResolvedBundledPluginsDirInput: string | undefined;
-let lastResolvedBundledPluginsDirOutput: string | undefined;
+let lastResolvedBundledPluginsDirOutput = "";
 function resolveBundledPluginsDirAbsoluteMemoized(bundledPluginsDir: string): string {
   if (bundledPluginsDir === lastResolvedBundledPluginsDirInput) {
-    return lastResolvedBundledPluginsDirOutput as string;
+    return lastResolvedBundledPluginsDirOutput;
   }
   const resolved = path.resolve(bundledPluginsDir);
   lastResolvedBundledPluginsDirInput = bundledPluginsDir;

@@ -36,22 +36,21 @@ type SourceCheckoutDependencyDiagnostic = {
 // public-surface-loader.ts 的 createResolutionKey 自己也会直接调用它）。按原始输入字符串做 size-1
 // 记忆化：只读 env.OPENCLAW_DISABLE_BUNDLED_PLUGINS 这一个属性，结果只取决于这一个值，跟是从哪个
 // env 对象读到的无关，所以按值而不是按 env 对象身份做缓存是安全的——这个值在一次进程生命周期内
-// 几乎不变，变了字符串就不相等，直接重算，没有任何假命中风险。
+// 几乎不变，变了字符串就不相等，直接重算，没有任何假命中风险。初始值 (undefined → false) 本身
+// 就是「没设这个变量」的正确答案，所以不需要额外的"是否已缓存过"标记。
 let lastAreBundledPluginsDisabledInput: string | undefined;
 let lastAreBundledPluginsDisabledOutput = false;
-let lastAreBundledPluginsDisabledInputSeen = false;
 
 /** Returns true when env disables bundled plugin discovery. */
 export function areBundledPluginsDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const input = env.OPENCLAW_DISABLE_BUNDLED_PLUGINS;
-  if (lastAreBundledPluginsDisabledInputSeen && input === lastAreBundledPluginsDisabledInput) {
+  if (input === lastAreBundledPluginsDisabledInput) {
     return lastAreBundledPluginsDisabledOutput;
   }
   const raw = normalizeOptionalLowercaseString(input);
   const result = raw === "1" || raw === "true";
   lastAreBundledPluginsDisabledInput = input;
   lastAreBundledPluginsDisabledOutput = result;
-  lastAreBundledPluginsDisabledInputSeen = true;
   return result;
 }
 

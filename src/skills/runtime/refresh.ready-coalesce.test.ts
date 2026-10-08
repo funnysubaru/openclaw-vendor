@@ -27,6 +27,25 @@ async function createFixtureDirectory(relativePath: string): Promise<string> {
   return directory;
 }
 
+// 订阅 skills 变更广播,返回一个随事件增长的数组,供断言"发了几次、发给谁"。
+function recordSkillsChanges(): SkillsChangeEvent[] {
+  const seen: SkillsChangeEvent[] = [];
+  refreshModule.registerSkillsChangeListener((change) => {
+    seen.push(change);
+  });
+  return seen;
+}
+
+// 让除 last 以外的全部 watcher 先 ready——包括 resolveWatchTargets 给
+// workspace 自身目录建的那个,只数 extraDirs 会漏掉它。
+function emitReadyExcept(last: (typeof createdWatchers)[number]): void {
+  for (const watcher of createdWatchers) {
+    if (watcher !== last) {
+      watcher.emit("ready");
+    }
+  }
+}
+
 describe("ensureSkillsWatcher ready coalescing", () => {
   beforeAll(async () => {
     refreshModule = await import("./refresh.js");
@@ -55,10 +74,7 @@ describe("ensureSkillsWatcher ready coalescing", () => {
     const secondWorkspace = await createFixtureDirectory("second-workspace");
     const sharedRoot = await createFixtureDirectory("shared");
     const config = { skills: { load: { extraDirs: [sharedRoot] } } };
-    const seen: SkillsChangeEvent[] = [];
-    refreshModule.registerSkillsChangeListener((change) => {
-      seen.push(change);
-    });
+    const seen = recordSkillsChanges();
     refreshModule.ensureSkillsWatcher({ workspaceDir: fixtureWorkspaceDir, config });
     refreshModule.ensureSkillsWatcher({ workspaceDir: secondWorkspace, config });
     seen.length = 0;
@@ -82,19 +98,12 @@ describe("ensureSkillsWatcher ready coalescing", () => {
     const secondWorkspace = await createFixtureDirectory("second-workspace");
     const sharedRoot = await createFixtureDirectory("shared");
     const config = { skills: { load: { extraDirs: [sharedRoot] } } };
-    const seen: SkillsChangeEvent[] = [];
-    refreshModule.registerSkillsChangeListener((change) => {
-      seen.push(change);
-    });
+    const seen = recordSkillsChanges();
     refreshModule.ensureSkillsWatcher({ workspaceDir: fixtureWorkspaceDir, config });
     refreshModule.ensureSkillsWatcher({ workspaceDir: secondWorkspace, config });
     seen.length = 0;
     const sharedWatcher = watchForSkillRoot(sharedRoot).watcher;
-    for (const watcher of createdWatchers) {
-      if (watcher !== sharedWatcher) {
-        watcher.emit("ready");
-      }
-    }
+    emitReadyExcept(sharedWatcher);
     await vi.advanceTimersByTimeAsync(250);
     expect(seen).toEqual([]);
 
@@ -117,23 +126,12 @@ describe("ensureSkillsWatcher ready coalescing", () => {
     const rootB = await createFixtureDirectory("multi-root-b");
     const rootC = await createFixtureDirectory("multi-root-c");
     const config = { skills: { load: { extraDirs: [rootA, rootB, rootC] } } };
-    const seen: SkillsChangeEvent[] = [];
-    refreshModule.registerSkillsChangeListener((change) => {
-      seen.push(change);
-    });
+    const seen = recordSkillsChanges();
     refreshModule.ensureSkillsWatcher({ workspaceDir: fixtureWorkspaceDir, config });
     seen.length = 0;
 
-    // resolveWatchTargets 除了 extraDirs 的三个 root,还会给 workspace 自己
-    // 的目录建一个 watcher——所以"全部结算"要覆盖 createdWatchers 里的
-    // 每一个,不能只数 extraDirs 那三个,否则漏了 workspace 自身的 target
-    // 永远卡在 pending、断言会假阳性通过。
     const watcherC = watchForSkillRoot(rootC).watcher;
-    for (const watcher of createdWatchers) {
-      if (watcher !== watcherC) {
-        watcher.emit("ready");
-      }
-    }
+    emitReadyExcept(watcherC);
     await vi.advanceTimersByTimeAsync(250);
     expect(seen).toEqual([]);
 

@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 import { assertSqliteIntegrityInWorker } from "../infra/sqlite-integrity-worker.js";
 import { assertSqliteIntegrity, type SqliteIntegrityOperation } from "../infra/sqlite-integrity.js";
 import { normalizeAgentId } from "../routing/session-key.js";
@@ -69,8 +70,14 @@ export function createOpenClawAgentDatabaseAdmissionOwner(
     operation: (database: OpenClawAgentDatabase) => T | Promise<T>,
     /** Synchronous live authority for the initiating open and this caller's operation. */
     assertCurrent?: () => void,
+    /**
+     * 调用方的停止信号（对齐上游同名参数）：中止后本调用立即以 AbortError 结束；若它是最后
+     * 一个等待者且物理打开还没发布，连同进行中的完整性检查一起中止（见下方 finally）。
+     */
+    signal?: AbortSignal,
   ): Promise<T> {
     try {
+      signal?.throwIfAborted();
       assertCurrent?.();
     } catch (error) {
       // oxlint-disable-next-line typescript/prefer-promise-reject-errors -- Caller assertions retain their original thrown value.
@@ -88,15 +95,16 @@ export function createOpenClawAgentDatabaseAdmissionOwner(
     }
     if (existing?.controller.signal.aborted) {
       return existing.promise.then(
-        () => withOpenClawAgentDatabaseAsync(options, operation, assertCurrent),
-        () => withOpenClawAgentDatabaseAsync(options, operation, assertCurrent),
+        () => withOpenClawAgentDatabaseAsync(options, operation, assertCurrent, signal),
+        () => withOpenClawAgentDatabaseAsync(options, operation, assertCurrent, signal),
       );
     }
     const pending =
       existing ?? startOpenClawAgentDatabaseAdmission(options, agentId, pathname, assertCurrent);
     pending.operations += 1;
-    return pending.promise
+    return racePromiseWithAbortSignal(pending.promise, signal)
       .then((database) => {
+        signal?.throwIfAborted();
         pending.controller.signal.throwIfAborted();
         if (cache.databases.get(pathname) !== database || !database.db.isOpen) {
           throw new Error(`Agent database closed before its admitted operation: ${pathname}`);
@@ -112,6 +120,12 @@ export function createOpenClawAgentDatabaseAdmissionOwner(
         // settlement, including wrapper/adoption awaits before it reaches the writer.
         pending.operations -= 1;
         if (!pending.operations) {
+          // 对齐上游：最后一个等待者离开（例如被自己的 signal 中止）而物理打开还没发布时，
+          // 没人再要这次打开，直接中止它——进行中的完整性检查 worker 跟着停，关停 / 热重启
+          // 不必干等大库检查自然跑完。已发布的打开有 releaseBorrow，不受影响。
+          if (!pending.releaseBorrow) {
+            pending.controller.abort(new Error("Agent database admission has no waiting callers"));
+          }
           pending.releaseBorrow?.();
         }
       });

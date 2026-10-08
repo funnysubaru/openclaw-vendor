@@ -202,18 +202,28 @@ function initializeFreshSharedAuthStore(env: NodeJS.ProcessEnv): void {
   noteCommittedSharedAuthStoreOwnership({ location: "state-db" }, env);
 }
 
-export function prepareFreshSharedAuthStoreWrite(params: {
+/** 只判断这次写入是否落到共享库，不做初始化（供写入前的准入等待预先算出目标库）。 */
+export function isSharedAuthStoreWrite(params: {
   agentDir: string | undefined;
   allowExplicitMain: boolean;
   env: NodeJS.ProcessEnv;
 }): boolean {
   // A main-agent credential is shared; explicit main writes must follow the shared target.
   // On legacy roots both routes already resolve to the same file, so redirecting is a no-op.
-  const isSharedWrite =
+  return (
     params.agentDir === undefined ||
     (params.allowExplicitMain &&
       path.resolve(resolveUserPath(params.agentDir, params.env)) ===
-        path.resolve(resolveSharedMainAuthAgentDir(params.env)));
+        path.resolve(resolveSharedMainAuthAgentDir(params.env)))
+  );
+}
+
+export function prepareFreshSharedAuthStoreWrite(params: {
+  agentDir: string | undefined;
+  allowExplicitMain: boolean;
+  env: NodeJS.ProcessEnv;
+}): boolean {
+  const isSharedWrite = isSharedAuthStoreWrite(params);
   if (isSharedWrite) {
     initializeFreshSharedAuthStore(params.env);
   }

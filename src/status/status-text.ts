@@ -32,6 +32,10 @@ import type { ThinkLevel } from "../auto-reply/thinking.js";
 import { toAgentModelListLike } from "../config/model-input.js";
 import type { SessionEntry } from "../config/sessions.js";
 import { hasSessionAutoModelFallbackProvenance } from "../config/sessions/model-override-provenance.js";
+import {
+  resolveSqliteReadScope,
+  toDatabaseOptions,
+} from "../config/sessions/session-accessor.sqlite-scope.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   formatUsageWindowSummary,
@@ -42,6 +46,10 @@ import { resolveActiveProviderThinkingProfile } from "../plugins/provider-thinki
 import { normalizeAccountId } from "../routing/account-id.js";
 import { resolveNormalizedAccountEntry } from "../routing/account-lookup.js";
 import { createLazyPromise } from "../shared/lazy-runtime.js";
+import {
+  hasAgentStartupAdmissionState,
+  waitForAgentDatabaseStartupAdmission,
+} from "../state/agent-startup-admission.js";
 import {
   listTasksForAgentIdForStatus,
   listTasksForSessionKeyForStatus,
@@ -286,6 +294,29 @@ async function resolveRuntimePluginHealthLine(): Promise<string | undefined> {
   } catch {
     return "⚠️ Plugins: health unavailable";
   }
+}
+
+/**
+ * ADR-0033 任务84(c) selfreview3：下面 buildStatusMessageParts 读转录用量是同步开该会话所在的
+ * 员工库。session_status 查别的员工的会话、而那个员工库还在后台启动准入时，同步开库会被兜底
+ * 拒绝、用量静默显示成 "?"。这里先按该会话的物理库 owner 等准入完成。等待失败或被关停中止
+ * 时不抛，照旧交给读取自带的降级；非启动期调度器空闲，直接返回。
+ */
+async function waitForStatusTranscriptDatabaseAdmission(scope: {
+  agentId: string;
+  sessionKey?: string;
+  storePath?: string;
+}): Promise<void> {
+  if (!hasAgentStartupAdmissionState()) {
+    return;
+  }
+  let databaseAgentId: string;
+  try {
+    databaseAgentId = toDatabaseOptions(resolveSqliteReadScope(scope)).agentId;
+  } catch {
+    return;
+  }
+  await waitForAgentDatabaseStartupAdmission(databaseAgentId)?.catch(() => {});
 }
 
 // Public status text builder for CLI/chat status commands. It resolves dynamic
@@ -634,6 +665,13 @@ export async function buildStatusReplyParts(
               ? "active-or-bundled"
               : "active",
         });
+  if ((params.includeTranscriptUsage ?? true) && sessionEntry?.sessionId) {
+    await waitForStatusTranscriptDatabaseAdmission({
+      agentId: statusAgentId,
+      sessionKey,
+      storePath,
+    });
+  }
   return buildStatusMessageParts({
     config: cfg,
     agent: {

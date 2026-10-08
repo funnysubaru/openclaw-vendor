@@ -396,8 +396,11 @@ export async function recoverPendingRestartContinuationDeliveries(params: {
   log?: SessionDeliveryRecoveryLogger;
   maxEnqueuedAt?: number;
   resolveGatewayContext?: import("./server-methods/types.js").GatewayContextResolver;
+  /** 停止信号：关闭时打断在员工库启动准入上的等待。 */
+  signal?: AbortSignal;
 }) {
   await recoverPendingSessionDeliveries({
+    ...(params.signal ? { signal: params.signal } : {}),
     deliver: (entry, context = {}) =>
       deliverQueuedSessionDelivery({
         deps: params.deps,

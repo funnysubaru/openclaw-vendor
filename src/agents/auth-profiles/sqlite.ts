@@ -21,6 +21,10 @@ import { isPathInside } from "../../infra/path-guards.js";
 import { resolveSqliteDatabaseFilePaths } from "../../infra/sqlite-files.js";
 import { readSqliteUserVersion } from "../../infra/sqlite-user-version.js";
 import { registerSqliteCacheExitClose } from "../../infra/sqlite-wal.js";
+import {
+  hasAgentStartupAdmissionState,
+  waitForAgentDatabaseStartupAdmission,
+} from "../../state/agent-startup-admission.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import {
   deferOpenClawAgentPostCommitPublication,
@@ -43,7 +47,10 @@ import {
   resolveSharedAuthStorePath,
   type SharedAuthStoreOwnership,
 } from "./path-resolve.js";
-import { prepareFreshSharedAuthStoreWrite } from "./shared-store-bootstrap.js";
+import {
+  isSharedAuthStoreWrite,
+  prepareFreshSharedAuthStoreWrite,
+} from "./shared-store-bootstrap.js";
 
 type AgentAuthProfileDatabase = Pick<
   OpenClawAgentKyselyDatabase,
@@ -672,22 +679,53 @@ export function writePersistedAuthProfileStateRaw(
   runAuthProfileWriteTransaction(agentDir, write);
 }
 
-/** Runs an auth-profile database write transaction for store/state updates. */
-export function runAuthProfileWriteTransaction<T>(
-  agentDir: string | undefined,
-  operation: (database: AuthProfileDatabase, owner: PreparedAuthProfileStoreOwner) => T,
-  options: {
-    env?: NodeJS.ProcessEnv;
-    sharedStoreWrite?: boolean;
-    stateDir?: string;
-  } = {},
-): T {
-  const env = {
+type AuthProfileWriteOptions = {
+  env?: NodeJS.ProcessEnv;
+  sharedStoreWrite?: boolean;
+  stateDir?: string;
+};
+
+function resolveAuthProfileWriteEnv(options: AuthProfileWriteOptions): NodeJS.ProcessEnv {
+  return {
     ...(options.env ?? process.env),
     ...(!options.env && options.stateDir
       ? { OPENCLAW_STATE_DIR: options.stateDir, OPENCLAW_AGENT_DIR: undefined }
       : {}),
   };
+}
+
+/**
+ * 能 await 的 auth 写入方在调用同步的 runAuthProfileWriteTransaction 之前先调用（ADR-0033
+ * 任务84(c) selfreview2 P2）：写入目标若是某个员工库（含其它员工的库：继承来的 owner 凭据、
+ * 落在员工库里的共享库），且它还在后台启动准入，就先等它完成；已失败则 reject 同一原因。
+ * 目标库的推算与 runAuthProfileWriteTransaction 一致，只是不做共享库初始化。目标是状态库
+ * （state-db 共享库）、或调度器空闲时没有要等的，返回 undefined（调用方不必 await）。
+ */
+export function waitForAuthProfileDatabaseStartupAdmission(
+  agentDir: string | undefined,
+  options: AuthProfileWriteOptions = {},
+): Promise<void> | undefined {
+  // 非启动期调度器空闲：不推算目标库，调用方也不多一次 await（同步快速路径）。
+  if (!hasAgentStartupAdmissionState()) {
+    return undefined;
+  }
+  const env = resolveAuthProfileWriteEnv(options);
+  const shared = isSharedAuthStoreWrite({
+    agentDir,
+    allowExplicitMain: options.sharedStoreWrite === true,
+    env,
+  });
+  const target = resolveAuthProfileDatabaseOptions(shared ? undefined : agentDir, env);
+  return target.kind === "agent" ? waitForAgentDatabaseStartupAdmission(target.agentId) : undefined;
+}
+
+/** Runs an auth-profile database write transaction for store/state updates. */
+export function runAuthProfileWriteTransaction<T>(
+  agentDir: string | undefined,
+  operation: (database: AuthProfileDatabase, owner: PreparedAuthProfileStoreOwner) => T,
+  options: AuthProfileWriteOptions = {},
+): T {
+  const env = resolveAuthProfileWriteEnv(options);
   const sharedStoreWrite = prepareFreshSharedAuthStoreWrite({
     agentDir,
     allowExplicitMain: options.sharedStoreWrite === true,

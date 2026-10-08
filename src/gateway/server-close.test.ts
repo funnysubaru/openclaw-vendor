@@ -54,6 +54,7 @@ const mocks = vi.hoisted(() => ({
   getAcpSessionManager: vi.fn(() => ({})),
   fenceSessionSuspensionWritesForGatewayShutdown: vi.fn(),
   closePluginStateDatabase: vi.fn<() => Promise<void>>(async () => undefined),
+  cancelAgentStartupAdmission: vi.fn<() => Promise<void>>(async () => undefined),
 }));
 const WEBSOCKET_CLOSE_GRACE_MS = 1_000;
 const WEBSOCKET_CLOSE_FORCE_CONTINUE_MS = 250;
@@ -72,6 +73,10 @@ vi.mock("../channels/plugins/index.js", async () => ({
 
 vi.mock("../hooks/gmail-watcher.js", () => ({
   stopGmailWatcher: mocks.stopGmailWatcher,
+}));
+
+vi.mock("../state/agent-startup-admission.js", () => ({
+  cancelAgentStartupAdmission: mocks.cancelAgentStartupAdmission,
 }));
 
 vi.mock("../hooks/internal-hooks.js", async () => {
@@ -258,6 +263,8 @@ describe("createGatewayCloseHandler", () => {
     mocks.fenceSessionSuspensionWritesForGatewayShutdown.mockReset();
     mocks.closePluginStateDatabase.mockReset();
     mocks.closePluginStateDatabase.mockResolvedValue(undefined);
+    mocks.cancelAgentStartupAdmission.mockReset();
+    mocks.cancelAgentStartupAdmission.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -547,6 +554,38 @@ describe("createGatewayCloseHandler", () => {
     expect(deps.heartbeatRunner.stop).toHaveBeenCalledTimes(1);
     expect(deps.stopMediaCleanup).toHaveBeenCalledTimes(1);
     expect(deps.chatRunState.clear).toHaveBeenCalledTimes(1);
+  });
+
+  // ADR-0033 任务84(c)：关闭（也覆盖不退出进程的 gateway-restart）必须取消还没跑完
+  // 的后台员工库准入并等它收尾——否则调度器的模块级全局单例状态会在下一轮启动时
+  // 继续背着上一轮的陈旧 pendingByAgentId/failedByAgentId（见
+  // agent-startup-admission.ts 里 cancelAgentStartupAdmission 自己的注释）。这里只
+  // 验证关闭流程确实调用了它、且排在真正断开数据库连接的 acp-session-manager 步骤
+  // 之前——不重复 agent-startup-admission.test.ts 已经覆盖的调度器内部行为。
+  it("cancels background agent startup admission before disposing the ACP session manager", async () => {
+    const deps = createGatewayCloseTestDeps();
+    const close = createGatewayCloseHandler(deps);
+
+    const result = await close({ reason: "test" });
+
+    expect(result.warnings).toStrictEqual([]);
+    expect(mocks.cancelAgentStartupAdmission).toHaveBeenCalledTimes(1);
+    const cancelOrder = mocks.cancelAgentStartupAdmission.mock.invocationCallOrder[0];
+    const acpDisposeOrder = mocks.disposeAcpSessionManagerInstance.mock.invocationCallOrder[0];
+    expect(cancelOrder).toBeDefined();
+    expect(acpDisposeOrder).toBeDefined();
+    expect(cancelOrder!).toBeLessThan(acpDisposeOrder!);
+  });
+
+  it("records a warning but keeps shutting down when agent startup admission cancellation fails", async () => {
+    mocks.cancelAgentStartupAdmission.mockRejectedValueOnce(new Error("drain timed out"));
+    const deps = createGatewayCloseTestDeps();
+    const close = createGatewayCloseHandler(deps);
+
+    const result = await close({ reason: "test" });
+
+    expect(result.warnings).toContain("agent-startup-admission");
+    expect(mocks.disposeAcpSessionManagerInstance).toHaveBeenCalledTimes(1);
   });
 
   it("waits for in-flight media cleanup before shutdown completes", async () => {

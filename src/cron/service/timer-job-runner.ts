@@ -1,6 +1,8 @@
+import { isAbortError } from "../../infra/abort-signal.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import type { CommandLaneTaskMarker } from "../../process/command-queue.js";
 import { createDeferredCore } from "../../shared/deferred.js";
+import { waitForAgentStartupAdmissionBeforeRequest } from "../../state/agent-startup-admission.js";
 import {
   bindCronJobAdmittedRun,
   type CronActiveJobMarker,
@@ -220,6 +222,44 @@ async function executeJobCoreWithTimeoutUnfinalized(
       : undefined;
   const jobTimeoutMs = resolveCronJobTimeoutMs(job);
   try {
+    // ADR-0033 任务84(c)：员工库后台启动准入未完成时先等它，再进真正读员工库的执行。
+    // 此时 runningAtMs 已由 activateQueuedCronRun 写入并广播 started，面板显示"运行中"；
+    // 等待放在作业超时计时之前，不吃作业自己的超时预算。
+    // - 该员工准入已失败：本次运行按同一原因记为 error 结束（不无限等）。
+    // - 关闭 / 热重启（调度器 cancel）或操作员取消本次运行：按既有"运行被打断"路径结束，
+    //   与"Gateway restarting."中断同一形态，runningAtMs 由结局写回清掉，不会卡在运行中。
+    const startupAdmission = waitForAgentStartupAdmissionBeforeRequest({
+      agentId: opts?.runReceipt?.agentId ?? opts?.activeJobMarker?.agentId,
+      signals: [runAbortController.signal],
+    });
+    if (startupAdmission) {
+      const refused = await startupAdmission.then(
+        () => undefined,
+        (error: unknown) => ({ error }),
+      );
+      if (refused) {
+        if (isAbortError(refused.error)) {
+          if (!runAbortController.signal.aborted) {
+            runAbortController.abort(
+              refused.error instanceof Error ? refused.error.cause : refused.error,
+            );
+          }
+          return await createInterruptionOutcome("cancelled");
+        }
+        const error = formatErrorMessage(refused.error);
+        return withPrimaryWebhookInterruption({
+          job,
+          result: {
+            status: "error",
+            error,
+            diagnostics: createCronRunDiagnosticsFromError("cron-setup", error, {
+              nowMs: state.deps.nowMs,
+            }),
+          },
+          error: `cron webhook delivery cancelled: ${error}`,
+        });
+      }
+    }
     const timeout = createDeferredCore<CronRunTimeout>();
 
     // Detached agent runs report setup phases separately; defer the wall-clock

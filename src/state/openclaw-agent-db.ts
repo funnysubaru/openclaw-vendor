@@ -42,6 +42,11 @@ import {
   registerAgentDeletionDatabaseCleanup,
 } from "./agent-deletion-cleanup.js";
 import { readAgentDeletionJournal } from "./agent-deletion-journal.js";
+import {
+  assertAgentStartupAdmissionSettled,
+  getAgentStartupAdmissionWorkSignal,
+  waitForAgentStartupAdmission,
+} from "./agent-startup-admission.js";
 import { createOpenClawAgentDatabaseAdmissionOwner } from "./openclaw-agent-db-admission.js";
 import type {
   OpenClawAgentDatabase,
@@ -187,14 +192,49 @@ export function openOpenClawAgentDatabase(
 }
 
 export type { OpenClawAgentDatabaseWriteAdmission } from "./openclaw-agent-db-admission.js";
-export const { withOpenClawAgentDatabaseAsync, withOpenClawAgentDatabaseAdmission } =
-  createOpenClawAgentDatabaseAdmissionOwner(openOpenClawAgentDatabaseSteps);
+
+const {
+  withOpenClawAgentDatabaseAsync: withOpenClawAgentDatabaseAsyncAfterStartupAdmission,
+  withOpenClawAgentDatabaseAdmission,
+} = createOpenClawAgentDatabaseAdmissionOwner(openOpenClawAgentDatabaseSteps);
+export { withOpenClawAgentDatabaseAdmission };
+
+/**
+ * ADR-0033 任务84(c)：全部异步开库的收口点。按数据库物理 owner（options.agentId）检查后台
+ * 启动准入：还在准入就先等它，已失败就抛同一个失败原因。请求的主要等待点在请求入口
+ * （waitForAgentStartupAdmissionBeforeRequest：RPC 分发、HTTP、渠道、cron、heartbeat、
+ * 投递恢复），这里是入口之后仍走异步开库的路径的兜底；同步开库的兜底见
+ * openOpenClawAgentDatabaseSteps 顶部的 assertAgentStartupAdmissionSettled。
+ */
+export async function withOpenClawAgentDatabaseAsync<T>(
+  options: OpenClawAgentDatabaseOptions,
+  operation: (database: OpenClawAgentDatabase) => T | Promise<T>,
+  assertCurrent?: () => void,
+  signal?: AbortSignal,
+): Promise<T> {
+  const pending = waitForAgentStartupAdmission(options.agentId);
+  if (pending) {
+    await pending;
+  }
+  // 在后台准入工作内部发起的开库默认绑定调度器的停止信号：关停 / 热重启时进行中的完整性
+  // 检查立即中止（selfreview P2-1）。
+  return withOpenClawAgentDatabaseAsyncAfterStartupAdmission(
+    options,
+    operation,
+    assertCurrent,
+    signal ?? getAgentStartupAdmissionWorkSignal(),
+  );
+}
 
 function* openOpenClawAgentDatabaseSteps(
   options: OpenClawAgentDatabaseOptions,
   pending?: PendingAgentDatabaseOpen,
 ): SqliteIntegrityOperation<OpenClawAgentDatabase> {
   const agentId = normalizeAgentId(options.agentId);
+  // ADR-0033 任务84(c)：同步开库撞上该员工未完成的后台启动准入时直接拒绝，不往下走到
+  // revokePendingAgentDatabaseOpen 去撤销准入（见 assertAgentStartupAdmissionSettled）。
+  // 异步入口已在外层等完准入才进到这里；准入自己的工作经异步上下文豁免。
+  assertAgentStartupAdmissionSettled(agentId);
   const databaseOptions = { ...options, agentId };
   const pathname = resolveOpenClawAgentSqlitePath(databaseOptions);
   getAgentDeletionDatabaseCleanup(databaseOptions)?.assertCurrent();

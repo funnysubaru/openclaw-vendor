@@ -17,6 +17,7 @@ import { clearActivePluginRegistry } from "../plugins/runtime.js";
 import type { PluginServicesHandle } from "../plugins/services.js";
 import { AsyncWorkScope } from "../shared/async-work-scope.js";
 import { drainGlobalSingletonLifecycleState } from "../shared/global-singleton.js";
+import { cancelAgentStartupAdmission } from "../state/agent-startup-admission.js";
 import {
   collectGatewayProcessMemoryUsageMb,
   markGatewayRestartTrace,
@@ -419,6 +420,14 @@ export async function completeGatewayClose(
     if (params.bonjourStop) {
       await shutdownStep("bonjour", () => params.bonjourStop!(), warnings);
     }
+    // ADR-0033 任务84(c)：关闭/重启前先取消还没跑完的后台员工库准入（open+migrate）
+    // 并等它真正收尾，再清空调度器的全局单例状态（agent-startup-admission.ts 的
+    // cancelAgentStartupAdmission 自己做）。必须排在 ai-session-resources /
+    // agent-harnesses 等真正关数据库连接的步骤之前——否则后台任务可能正摸着一个
+    // 员工库，被这些步骤抢先关掉连接。也必须覆盖"gateway-restart"这种不退出进程的
+    // 热重启：调度器状态是模块级全局单例，不清掉的话下一轮启动会被上一轮的陈旧
+    // pendingByAgentId/failedByAgentId 坑到（见该函数自己的注释）。
+    await shutdownStep("agent-startup-admission", cancelAgentStartupAdmission, warnings);
     // ACPX owns agent-process cleanup, so plugin teardown must not overtake
     // the manager drain even when cancellation and handle close are slow.
     await measureCloseStep("acp-session-manager", () =>

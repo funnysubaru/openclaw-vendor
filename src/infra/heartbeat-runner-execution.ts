@@ -28,6 +28,7 @@ import { CommandLane } from "../process/lanes.js";
 import { normalizeAgentId, parseAgentSessionKey } from "../routing/session-key.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { isCronRunSessionKey } from "../sessions/session-key-utils.js";
+import { waitForAgentStartupAdmissionBeforeRequest } from "../state/agent-startup-admission.js";
 import { getAgentEventLifecycleGeneration } from "./agent-events.js";
 import { formatErrorMessage } from "./errors.js";
 import { isWithinActiveHours } from "./heartbeat-active-hours.js";
@@ -57,6 +58,7 @@ import {
 } from "./heartbeat-wake-policy.js";
 import {
   areHeartbeatsEnabled,
+  getHeartbeatWakeAbortSignal,
   HEARTBEAT_SKIP_CRON_IN_PROGRESS,
   HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT,
   type HeartbeatScheduledTask,
@@ -152,6 +154,27 @@ export async function resolveHeartbeatWakeStage(opts: HeartbeatRunOptions) {
   }
   if (!allowsUnscheduledTarget && !resolveHeartbeatIntervalMs(cfg, undefined, heartbeat)) {
     return { kind: "skipped", reason: "disabled" } as const;
+  }
+  // ADR-0033 任务84(c)：下面的预检与执行都要读该员工的库；后台启动准入未完成时先等它，
+  // 不撞同步开库入口的可重试兜底。准入失败 / 网关关闭时跳过本次（下一次照常调度）。
+  const startupAdmission = waitForAgentStartupAdmissionBeforeRequest({
+    agentId,
+    signals: [getHeartbeatWakeAbortSignal()],
+  });
+  if (startupAdmission) {
+    const refused = await startupAdmission.then(
+      () => false,
+      (error: unknown) => {
+        log.warn("heartbeat: skipped, agent database startup admission did not complete", {
+          agentId,
+          err: formatErrorMessage(error),
+        });
+        return true;
+      },
+    );
+    if (refused) {
+      return { kind: "skipped", reason: "agent-database-unavailable" } as const;
+    }
   }
 
   const startedAt = opts.deps?.nowMs?.() ?? Date.now();

@@ -277,12 +277,14 @@ describe("server-runtime-services", () => {
       cfg: {},
       log: deliveryLog,
       shouldContinue: expect.any(Function),
+      signal: expect.any(AbortSignal),
     });
     expect(hoisted.recoverPendingRestartContinuationDeliveries).toHaveBeenCalledWith({
       deps: {},
       maxEnqueuedAt: 123,
       log: sessionDeliveryLog,
       resolveGatewayContext,
+      signal: expect.any(AbortSignal),
     });
     const runtimeParams = hoisted.startSessionDeliveryRuntime.mock.calls[0]?.[0] as
       | {

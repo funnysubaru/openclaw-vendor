@@ -13,6 +13,8 @@ import {
   gatewayStartupUnavailableDetails,
   GATEWAY_STARTUP_RETRY_AFTER_MS,
 } from "../../packages/gateway-protocol/src/startup-unavailable.js";
+import { isAbortError } from "../infra/abort-signal.js";
+import { formatErrorMessage } from "../infra/errors.js";
 import { getActivePluginHttpRouteRegistry, getActivePluginRegistry } from "../plugins/runtime.js";
 import {
   getPluginRuntimeGatewayRequestScope,
@@ -25,6 +27,11 @@ import {
   tryBeginGatewayPreparedRestartRootWorkAdmission,
   tryBeginGatewayRootWorkAdmission,
 } from "../process/gateway-work-admission.js";
+import { normalizeAgentId, parseAgentSessionKey } from "../routing/session-key.js";
+import {
+  classifyAgentStartupAdmissionError,
+  waitForAgentStartupAdmissionBeforeRequest,
+} from "../state/agent-startup-admission.js";
 import { formatControlPlaneActor, resolveControlPlaneActor } from "./control-plane-audit.js";
 import {
   consumeControlPlaneWriteBudget,
@@ -470,6 +477,12 @@ export async function runWithGatewayRequestEnvelope<T>(
       if (staleInstall) {
         return await options.reject(staleInstall.error);
       }
+      // 员工库后台启动准入的同步兜底错误（selfreview P2-3）：在这里集中转成协议错误回包，
+      // 不再原样抛到外层（外层会转成不可重试的 UNAVAILABLE 并记 error 日志）。
+      const admissionError = startupAdmissionErrorShape(error);
+      if (admissionError) {
+        return await options.reject(admissionError);
+      }
       throw error;
     }
   }
@@ -481,6 +494,76 @@ export async function runWithGatewayRequestEnvelope<T>(
   } finally {
     rootWorkAdmission.release();
   }
+}
+
+/**
+ * 员工库后台启动准入期间免等的方法（显式白名单，只此一个）：给客户端连接心跳用——Yuiclaw
+ * 面板每 25 秒发一次、10 秒没回就判掉线重连，准入窗口一长，等待会让心跳超时、连接级联重连。
+ * last-heartbeat 的 handler 只读进程内存里最近一次 heartbeat 事件，不读任何员工库。
+ * 往这里加新方法前必须确认它的 handler 及整条调用链同样不读员工库：读的话会在准入完成前
+ * 读到未迁移的数据，或撞上同步开库入口的可重试兜底。
+ */
+const STARTUP_ADMISSION_EXEMPT_METHODS: ReadonlySet<string> = new Set(["last-heartbeat"]);
+
+/**
+ * 后台启动准入相关错误的统一协议形态（selfreview P2-3）：准入未完成的同步兜底 → 可重试的
+ * UNAVAILABLE；准入已失败 → 不可重试的 UNAVAILABLE（原因原样）。都按正常回包处理，不记
+ * error 日志。不是准入错误返回 undefined。
+ */
+function startupAdmissionErrorShape(error: unknown): ErrorShape | undefined {
+  const classified = classifyAgentStartupAdmissionError(error);
+  return classified
+    ? errorShape(ErrorCodes.UNAVAILABLE, formatErrorMessage(classified.error), {
+        retryable: classified.kind === "pending",
+      })
+    : undefined;
+}
+
+/**
+ * 员工库启动准入期间允许按员工收窄等待的方法（显式声明，默认一律等全部；selfreview P2-2）。
+ * 不再扫描参数猜目标：附带的会话键、消息正文里恰好以 agent:<id>: 开头的文本、无前缀键
+ * （解析到默认员工）都会让猜测收窄到错的员工。收录条件（新增方法前必须确认同样成立）：
+ * - 目标就是 sessionKey 指向的那一个会话，handler 在进入运行之前只碰该员工的库；
+ * - 运行中如果跨员工：要么经 RPC 重新进入口等待（子 agent、sessions_send 等工具），要么
+ *   在跨员工访问之前 await 对方库的准入（OAuth 刷新栅栏 / owner / 共享凭据库写入、
+ *   session_status 的用量读取，见 waitForAgentDatabaseStartupAdmission）。只读连接池
+ *   （auth 读取、*ReadOnly 会话读取）的跨员工读不经闸门；但并非所有"读"都走只读池——
+ *   会话投影快照等读路径用的是可写的同步开库，会经过同步闸门，在准入窗口内由兜底拒绝。
+ * chat.send / agent 是面板与 LINE 首轮对话的入口（selfreview2）：收窄后首轮只等本员工准入。
+ * agent 不给 sessionKey 时按渠道 / 绑定选员工，入口算不出来——下面要求必须有带前缀的
+ * sessionKey，所以这种情况自然等全部。sessions.list 等本身跨员工的方法不能收录。
+ */
+const STARTUP_ADMISSION_SESSION_KEY_SCOPED_METHODS: ReadonlySet<string> = new Set([
+  "chat.history",
+  "chat.message.get",
+  "chat.send",
+  "agent",
+]);
+
+/**
+ * 声明过的方法才可能收窄：sessionKey 必须带 agent:<id>: 前缀（无前缀键要按配置解析默认员工，
+ * 入口这里不做这件事，直接等全部）；同时给了 agentId 的必须与会话键的员工一致，否则等全部。
+ * 是否真的收窄还取决于存储布局能否证明逻辑员工 = 物理 owner（见等待 helper）。
+ */
+function resolveStartupAdmissionAgentId(method: string, params: unknown): string | undefined {
+  if (!STARTUP_ADMISSION_SESSION_KEY_SCOPED_METHODS.has(method) || !isRecord(params)) {
+    return undefined;
+  }
+  const sessionAgentId =
+    typeof params.sessionKey === "string"
+      ? parseAgentSessionKey(params.sessionKey)?.agentId
+      : undefined;
+  if (!sessionAgentId) {
+    return undefined;
+  }
+  if (
+    params.agentId !== undefined &&
+    (typeof params.agentId !== "string" ||
+      normalizeAgentId(params.agentId) !== normalizeAgentId(sessionAgentId))
+  ) {
+    return undefined;
+  }
+  return sessionAgentId;
 }
 
 /** Authorizes and dispatches one gateway JSON-RPC-style request. */
@@ -522,6 +605,33 @@ export async function handleGatewayRequest(
       const error = errorShape(ErrorCodes.INVALID_REQUEST, `unknown method: ${req.method}`);
       respond(false, undefined, error);
       return;
+    }
+    // ADR-0033 任务84(c)：员工库后台启动准入未完成时，请求在进 handler 前透明等待（handler
+    // 里大量同步读员工库，同步入口只能拒绝不能等）。放在 root work 准入之前，等待期间不占
+    // 重启 / 挂起要排空的 root work；入口租约关闭（close 前奏）或请求中止都会立即打断等待。
+    // continuation 是已在跑的工作的回包，不等；白名单方法见 STARTUP_ADMISSION_EXEMPT_METHODS。
+    if (opts.admission !== "continuation" && !STARTUP_ADMISSION_EXEMPT_METHODS.has(req.method)) {
+      const startupAdmission = waitForAgentStartupAdmissionBeforeRequest({
+        agentId: resolveStartupAdmissionAgentId(req.method, req.params),
+        signals: [signal, context.requestEntryLifetime?.signal],
+      });
+      if (startupAdmission) {
+        try {
+          await startupAdmission;
+        } catch (error) {
+          // 中止 = 网关正在关闭 / 请求已撤销，可重试；准入失败按同一分类报不可重试。
+          respond(
+            false,
+            undefined,
+            startupAdmissionErrorShape(error) ??
+              errorShape(ErrorCodes.UNAVAILABLE, formatErrorMessage(error), {
+                retryable: isAbortError(error),
+              }),
+          );
+          return;
+        }
+        entry?.assertOpen();
+      }
     }
     // Every session mutation owner uses these pre-commit assertions. Compose the
     // host lifetime here so individual handlers cannot lose it across an await.

@@ -1,6 +1,8 @@
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { isAbortError } from "../../infra/abort-signal.js";
 import { resolvePathViaExistingAncestorSync } from "../../infra/boundary-path.js";
 import { toErrorObject } from "../../infra/errors.js";
+import { waitForAgentDatabaseStartupAdmission } from "../../state/agent-startup-admission.js";
 import { isUserModelAuthProfileId } from "../../state/user-model-account-id.js";
 import {
   listCandidateAuthProfileStores,
@@ -127,6 +129,32 @@ async function listPeerCandidates(params: {
 }
 
 /**
+ * 写某个 peer 员工的 auth 库之前，等它的后台启动准入（ADR-0033 任务84(c) selfreview2 / 3）。
+ *
+ * 取舍（fail-closed）：peer 准入已失败、而它确实持有这份凭据（Yuiclaw 把订阅凭据广播进每个
+ * 员工库，这是常态）时，这次刷新失败，不跳过它。跳过的话它保留着旧的 refresh token，重启后
+ * 会拿旧 token 再刷一次，可能触发 OAuth 提供方的 refresh token 重用检测、把整个凭据族作废；
+ * 相比之下"刷新失败、重启 gateway 后恢复"代价更小。上游同样 fail-closed：peer 库被准入拒绝时
+ * 栅栏写抛错、回滚已认领的 peer 后整体失败。错误里点名员工并提示重启。
+ * 关停 / 热重启的中止原样抛出。
+ */
+async function waitForOAuthRefreshPeerAdmission(
+  candidate: CandidateAuthProfileStore,
+): Promise<void> {
+  try {
+    await waitForAgentDatabaseStartupAdmission(candidate.agentId);
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
+    throw new Error(
+      `OAuth refresh cannot fence agent "${candidate.agentId}": its database (${candidate.databasePath}) failed startup admission. Restart the gateway to retry that agent's admission, then retry the refresh.`,
+      { cause: error },
+    );
+  }
+}
+
+/**
  * Replace every provable historical peer generation with the owner's exact
  * pending fence. Reads and writes are sequential, so no two databases share a
  * transaction.
@@ -143,6 +171,8 @@ export async function fenceOAuthRefreshPeers(params: {
   const claims: OAuthRefreshPeerClaim[] = [];
   try {
     for (const candidate of await listPeerCandidates(params)) {
+      // 只读加载走只读连接池、不经准入闸门；等待只放在"确认要写 / 要认领"这个员工库之前
+      // （见 waitForOAuthRefreshPeerAdmission），不持有这份凭据的员工既不等也不受其准入失败影响。
       const store = loadCandidateAuthProfileStore(candidate);
       if (!store) {
         continue;
@@ -152,6 +182,8 @@ export async function fenceOAuthRefreshPeers(params: {
         continue;
       }
       if (isExactOAuthCredential(credential, params.fence)) {
+        // 已是同一栅栏的 claim：之后的同步 settle / fail 会写它，先等它准入。
+        await waitForOAuthRefreshPeerAdmission(candidate);
         claims.push({ candidate });
         continue;
       }
@@ -174,6 +206,9 @@ export async function fenceOAuthRefreshPeers(params: {
       }
       let claimed = false;
       const original = { ...credential };
+      // 确认是要认领的历史同代际 peer，马上同步写它的库：先等它的后台启动准入。等待期间库内
+      // 状态若变了也安全——下面是带 updater 的比对写，不匹配就不认领。
+      await waitForOAuthRefreshPeerAdmission(candidate);
       const updated = updateCandidateAuthProfileStore({
         candidate,
         profileId: params.profileId,
@@ -422,6 +457,8 @@ export async function removeOAuthRefreshGenerationPeers(params: {
     if (!removable) {
       continue;
     }
+    // 确认该员工持有这一代凭据、要删除它：写库之前先等它的后台启动准入。
+    await waitForOAuthRefreshPeerAdmission(candidate);
     updateCandidateAuthProfileStore({
       candidate,
       preserveProfileState: true,

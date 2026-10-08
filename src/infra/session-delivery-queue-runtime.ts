@@ -23,7 +23,13 @@ type SessionDeliveryRuntime = {
 };
 
 const RUNTIME_RELOAD_RETRY_MS = 1_000;
-let runtime: (SessionDeliveryRuntime & { runningEntries: Map<string, Promise<void>> }) | undefined;
+let runtime:
+  | (SessionDeliveryRuntime & {
+      runningEntries: Map<string, Promise<void>>;
+      /** stop 时中止，打断排空中在员工库启动准入上的等待（review2 P2-2）。 */
+      stopController: AbortController;
+    })
+  | undefined;
 let runtimeGeneration = 0;
 const scheduledEntries = new Map<string, { timer: ReturnType<typeof setTimeout>; dueAt: number }>();
 let pendingScanTimer: ReturnType<typeof setTimeout> | undefined;
@@ -121,6 +127,7 @@ async function runScheduledSessionDelivery(id: string, generation: number): Prom
       log: activeRuntime.log,
       deliver: activeRuntime.deliver,
       onSettled: activeRuntime.onSettled,
+      signal: activeRuntime.stopController.signal,
     });
   } catch (error) {
     activeRuntime.log.error(`session delivery: runtime drain failed for ${id}: ${String(error)}`);
@@ -148,10 +155,15 @@ export function startSessionDeliveryRuntime(params: SessionDeliveryRuntime): () 
   runtimeGeneration += 1;
   const generation = runtimeGeneration;
   clearScheduledEntries();
-  const activeRuntime = { ...params, runningEntries: new Map<string, Promise<void>>() };
+  const activeRuntime = {
+    ...params,
+    runningEntries: new Map<string, Promise<void>>(),
+    stopController: new AbortController(),
+  };
   runtime = activeRuntime;
   let stopPromise: Promise<void> | undefined;
   return () => {
+    activeRuntime.stopController.abort();
     if (runtimeGeneration === generation) {
       runtimeGeneration += 1;
       runtime = undefined;

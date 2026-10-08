@@ -159,6 +159,9 @@ function startPendingOutboundDeliveryRecovery(params: {
   log: GatewayRuntimeServiceLogger;
 }): () => Promise<void> {
   let stopped = false;
+  // stop 时中止：打断恢复里还在等员工库启动准入的那一步（review2 P2-2），否则关闭前置阶段
+  // 等恢复任务退出时会被慢准入拖住（准入取消排在更后面的关闭步骤里）。
+  const stopController = new AbortController();
   let migrationPending = true;
   let initialPass = true;
   let inFlight: Promise<void> | null = null;
@@ -225,6 +228,7 @@ function startPendingOutboundDeliveryRecovery(params: {
           log: logRecovery,
           cfg,
           shouldContinue: () => !stopped,
+          signal: stopController.signal,
         });
         return;
       }
@@ -238,6 +242,7 @@ function startPendingOutboundDeliveryRecovery(params: {
         deliver: deliverWithCurrentConversationAuthority,
         selectEntry: () => ({ match: true, bypassBackoff: false }),
         shouldContinue: () => !stopped,
+        signal: stopController.signal,
       });
     }, "runtime:delivery-recovery").catch((err: unknown) =>
       params.log.error(`Delivery recovery failed: ${String(err)}`),
@@ -257,6 +262,7 @@ function startPendingOutboundDeliveryRecovery(params: {
   recover();
   return () => {
     stopped = true;
+    stopController.abort();
     clearInterval(retryTimer);
     if (stopPromise) {
       return stopPromise;
@@ -324,6 +330,8 @@ function startPendingSessionDeliveryRuntime(params: {
             deps: params.deps,
             log: logRecovery,
             maxEnqueuedAt: params.maxEnqueuedAt,
+            // stop 会 abort 这个 signal，打断恢复在员工库启动准入上的等待（review2 P2-2）。
+            signal,
             ...(params.resolveGatewayContext
               ? { resolveGatewayContext: params.resolveGatewayContext }
               : {}),

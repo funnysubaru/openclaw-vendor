@@ -7,6 +7,8 @@ import type {
 } from "../../channels/message/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
+import { waitForAgentStartupAdmissionBeforeRequest } from "../../state/agent-startup-admission.js";
+import { isAbortError } from "../abort-signal.js";
 import {
   createDeliveryRecoveryCoordinator,
   createEmptyDeliveryRecoverySummary,
@@ -1121,7 +1123,7 @@ async function drainQueuedEntry(opts: {
   }
 }
 
-type QueuedRecoveryContext =
+type QueuedRecoveryContext = (
   | {
       kind: "startup";
       summary: DeliveryRecoverySummary;
@@ -1134,7 +1136,11 @@ type QueuedRecoveryContext =
       logLabel: string;
       selectEntry: (entry: QueuedDelivery, now: number) => DeliveryRecoveryDrainDecision;
       shouldContinue?: () => boolean;
-    };
+    }
+) & {
+  /** 恢复任务自身的停止信号：关闭前置阶段先停恢复任务，必须能打断它在准入上的等待。 */
+  signal?: AbortSignal;
+};
 
 /** Startup and reconnect share custody, admission, retry, and settlement ordering. */
 async function processQueuedRecovery(
@@ -1226,6 +1232,27 @@ async function processQueuedRecovery(
     }
     return "stop";
   }
+  // ADR-0033 任务84(c)：投递会读写该员工的会话库；后台启动准入未完成时先等它，不撞同步
+  // 开库入口的可重试兜底。等不到（准入失败 / 网关关闭）就原样留下这条，不计重试次数，
+  // 下一轮恢复再处理。
+  // 订阅恢复任务自身的停止信号（review2 P2-2）：关闭前置阶段先 await 恢复任务退出，之后才
+  // 轮到 cancelAgentStartupAdmission；只订阅调度器取消的话，关闭会被慢准入拖住。
+  const startupAdmission = waitForAgentStartupAdmissionBeforeRequest({
+    agentId: entry.session?.agentId,
+    signals: [context.signal],
+  });
+  if (startupAdmission) {
+    const refused = await startupAdmission.then(
+      () => undefined,
+      (error: unknown) => ({ error }),
+    );
+    if (refused) {
+      log.warn(
+        `${label} deferred: agent database startup admission did not complete: ${formatErrorMessage(refused.error)}`,
+      );
+      return isAbortError(refused.error) ? "stop" : "continue";
+    }
+  }
   // Pacing is the final await before a new durable attempt is admitted. A
   // lifecycle fence here leaves the untouched row and retry metadata intact.
   if (context.shouldContinue?.() === false) {
@@ -1269,6 +1296,8 @@ export async function drainPendingDeliveriesCore(opts: {
   deliver: DeliverFn;
   selectEntry: (entry: QueuedDelivery, now: number) => DeliveryRecoveryDrainDecision;
   shouldContinue?: () => boolean;
+  /** 恢复任务停止信号，见 QueuedRecoveryContext.signal。 */
+  signal?: AbortSignal;
 }): Promise<void> {
   const drained = await recoveryCoordinator.withDrain(opts.drainKey, async () => {
     const now = Date.now();
@@ -1291,6 +1320,7 @@ export async function drainPendingDeliveriesCore(opts: {
             logLabel: opts.logLabel,
             selectEntry: opts.selectEntry,
             ...(opts.shouldContinue ? { shouldContinue: opts.shouldContinue } : {}),
+            ...(opts.signal ? { signal: opts.signal } : {}),
           },
         ),
     });
@@ -1313,6 +1343,8 @@ export async function recoverPendingDeliveries(opts: {
   /** Maximum wall-clock time for recovery in ms. Remaining entries are deferred to next startup. Default: 60 000. */
   maxRecoveryMs?: number;
   shouldContinue?: () => boolean;
+  /** 恢复任务停止信号，见 QueuedRecoveryContext.signal。 */
+  signal?: AbortSignal;
 }): Promise<DeliveryRecoverySummary> {
   const pending = await loadUnfinishedDeliveries(opts.stateDir);
   if (pending.length === 0) {
@@ -1347,6 +1379,7 @@ export async function recoverPendingDeliveries(opts: {
           deadline,
           onDeadlineExceeded,
           ...(opts.shouldContinue ? { shouldContinue: opts.shouldContinue } : {}),
+          ...(opts.signal ? { signal: opts.signal } : {}),
         },
       ),
   });

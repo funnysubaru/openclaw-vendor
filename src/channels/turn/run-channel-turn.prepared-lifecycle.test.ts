@@ -2,6 +2,10 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import type { FinalizedMsgContext } from "../../auto-reply/templating.js";
+import {
+  cancelAgentStartupAdmission,
+  scheduleAgentStartupAdmission,
+} from "../../state/agent-startup-admission.js";
 import type { RecordInboundSession } from "../session.types.js";
 import { hasFinalChannelTurnDispatch } from "./dispatch-result.js";
 import { runChannelTurn } from "./run-channel-turn.js";
@@ -88,6 +92,54 @@ describe("prepared channel turn lifecycle", () => {
       throw new Error("expected dispatch");
     }
     expect(result.dispatchResult.queuedFinal).toBe(true);
+  });
+
+  // ADR-0033 任务84(c) 方案 B：渠道入站（如 LINE 消息）在写会话前等该员工的后台启动
+  // 准入完成，对齐上游 channels/turn/execution.ts 的 waitForAgentPreparation。
+  it("waits for the agent's background startup admission before recording the session", async () => {
+    const events: string[] = [];
+    let releaseOpen!: () => void;
+    const openGate = new Promise<void>((resolve) => {
+      releaseOpen = resolve;
+    });
+    scheduleAgentStartupAdmission({
+      agentIds: ["main"],
+      openAgent: async () => await openGate,
+      migrateAgent: async () => {},
+    });
+    try {
+      const turn = runChannelTurn({
+        channel: "test",
+        raw: { id: "msg-1", text: "hello" },
+        adapter: {
+          ingest: () => ({ id: "msg-1", rawText: "hello" }),
+          resolveTurn: () => ({
+            channel: "test",
+            routeSessionKey: "agent:main:test:peer",
+            storePath,
+            ctxPayload: createCtx(),
+            recordInboundSession: createRecordInboundSession(events),
+            runDispatch: async () => {
+              events.push("dispatch");
+              return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } };
+            },
+            runDispatchLifecycle: { turnAdoptionLifecycle: undefined, onDispatchSkipped: vi.fn() },
+          }),
+        },
+      });
+      await new Promise((resolve) => {
+        setTimeout(resolve, 50);
+      });
+      expect(events).toEqual([]);
+
+      events.push("admitted");
+      releaseOpen();
+      await turn;
+      expect(events).toEqual(["admitted", "record", "dispatch"]);
+    } finally {
+      releaseOpen();
+      await cancelAgentStartupAdmission();
+    }
   });
 
   it("rejects prepared turns that omit dispatch lifecycle ownership when the caller adopts a durable ingress claim", async () => {

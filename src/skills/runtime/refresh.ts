@@ -694,43 +694,48 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
     }
     let native: fs.FSWatcher;
     try {
-      native = fs.watch(target.watchRoot, { recursive: true }, (_eventType, filename) => {
-        if (state.disposed) {
-          return;
-        }
-        const name = rawPathToString(filename);
-        if (!name) {
-          // 文件名缺失(部分平台的部分事件会这样):无法判断具体改了哪个
-          // 文件,保守起见整棵树都当作变了,语义上对应 chokidar raw 事件里
-          // rawPath 为空时走 watchedPath 兜底的那一支。
-          schedule();
-          return;
-        }
-        const full = path.join(target.watchRoot, name);
-        if (!(isPathInside(target.path, full) || isPathInside(full, target.path))) {
-          return;
-        }
-        let stats: fs.Stats | undefined;
-        try {
-          stats = fs.lstatSync(full);
-        } catch {
-          stats = undefined;
-        }
-        // 直接复用 chokidar 的 ignored 判据,两种后端过滤口径一致:
-        // node_modules/.git/.venv 等忽略目录里的变动不刷新;现存常规文件也被
-        // "忽略",其中只有 SKILL.md 这类文件走稳定性等待再刷新(对应 chokidar
-        // 的 raw 事件分支,isSkillFileWatchPath 对忽略目录同样返回 false)。
-        if (shouldIgnoreSkillsWatchPath(full, stats)) {
-          if (stats && isSkillFileWatchPath(full)) {
-            scheduleRawSkillFile(full);
+      // 与 chokidar 路径一样经 runInSkillsWatcherContext 创建:watcher 是跨会话
+      // 共享、长期存活的句柄,若直接在当前 turn 里 fs.watch,后续文件事件、稳定性
+      // 定时器和技能刷新通知都会继承并一直持有那个 turn 的 AsyncLocalStorage 数据。
+      native = runInSkillsWatcherContext(() =>
+        fs.watch(target.watchRoot, { recursive: true }, (_eventType, filename) => {
+          if (state.disposed) {
+            return;
           }
-          return;
-        }
-        // 目录/符号链接的增删,或路径已经不存在(常规文件被删除也会落到这
-        // 里,因为 lstatSync 失败拿不到 stats)——对应 chokidar 的
-        // add/addDir/unlink/unlinkDir,直接触发刷新,不用等稳定性。
-        schedule(full);
-      });
+          const name = rawPathToString(filename);
+          if (!name) {
+            // 文件名缺失(部分平台的部分事件会这样):无法判断具体改了哪个
+            // 文件,保守起见整棵树都当作变了,语义上对应 chokidar raw 事件里
+            // rawPath 为空时走 watchedPath 兜底的那一支。
+            schedule();
+            return;
+          }
+          const full = path.join(target.watchRoot, name);
+          if (!(isPathInside(target.path, full) || isPathInside(full, target.path))) {
+            return;
+          }
+          let stats: fs.Stats | undefined;
+          try {
+            stats = fs.lstatSync(full);
+          } catch {
+            stats = undefined;
+          }
+          // 直接复用 chokidar 的 ignored 判据,两种后端过滤口径一致:
+          // node_modules/.git/.venv 等忽略目录里的变动不刷新;现存常规文件也被
+          // "忽略",其中只有 SKILL.md 这类文件走稳定性等待再刷新(对应 chokidar
+          // 的 raw 事件分支,isSkillFileWatchPath 对忽略目录同样返回 false)。
+          if (shouldIgnoreSkillsWatchPath(full, stats)) {
+            if (stats && isSkillFileWatchPath(full)) {
+              scheduleRawSkillFile(full);
+            }
+            return;
+          }
+          // 目录/符号链接的增删,或路径已经不存在(常规文件被删除也会落到这
+          // 里,因为 lstatSync 失败拿不到 stats)——对应 chokidar 的
+          // add/addDir/unlink/unlinkDir,直接触发刷新,不用等稳定性。
+          schedule(full);
+        }),
+      );
     } catch (err) {
       log.warn(
         `skills native watcher could not start on ${target.watchRoot}: ${String(err)}; falling back to chokidar`,
@@ -757,6 +762,11 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
       } catch {
         // best effort
       }
+      // 换到 chokidar 后备时重新进入"初始扫描中":后备用 ignoreInitial:true,
+      // 扫描期间新出现的技能只会被初始扫描吸收、不发事件,必须靠它的 ready 再结算
+      // 一次补发失效通知;若仍停在原生阶段留下的 "ready",那次 ready 会被
+      // settleInitialScan 的守卫丢掉,技能快照可能一直停在旧版本。
+      state.initialScan = "pending";
       schedule();
       attachChokidarSkillsWatch();
     });
@@ -765,7 +775,13 @@ function createSkillsPathWatcher(target: WatchTarget): SkillsPathWatchState {
     // 返回、调用方把这个 state 写进 pathWatchers 之后才结算,否则
     // settleInitialScan 里 `pathWatchers.get(target.path) !== state` 的守卫
     // 会在 state 还没登记时误判成"已作废"而丢弹这次结算。
-    queueMicrotask(() => settleInitialScan("ready"));
+    // 结算前确认仍是这个原生 watcher 在覆盖:若它在微任务前已出错并切到 chokidar,
+    // 这次结算会提前把后备扫描标成 ready,必须放弃。
+    queueMicrotask(() => {
+      if (state.native === native) {
+        settleInitialScan("ready");
+      }
+    });
     return true;
   };
 

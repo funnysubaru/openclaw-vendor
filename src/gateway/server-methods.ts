@@ -28,7 +28,10 @@ import {
   tryBeginGatewayRootWorkAdmission,
 } from "../process/gateway-work-admission.js";
 import { normalizeAgentId, parseAgentSessionKey } from "../routing/session-key.js";
-import { waitForAgentStartupAdmissionBeforeRequest } from "../state/agent-startup-admission.js";
+import {
+  classifyAgentStartupAdmissionError,
+  waitForAgentStartupAdmissionBeforeRequest,
+} from "../state/agent-startup-admission.js";
 import { formatControlPlaneActor, resolveControlPlaneActor } from "./control-plane-audit.js";
 import {
   consumeControlPlaneWriteBudget,
@@ -474,6 +477,12 @@ export async function runWithGatewayRequestEnvelope<T>(
       if (staleInstall) {
         return await options.reject(staleInstall.error);
       }
+      // 员工库后台启动准入的同步兜底错误（selfreview P2-3）：在这里集中转成协议错误回包，
+      // 不再原样抛到外层（外层会转成不可重试的 UNAVAILABLE 并记 error 日志）。
+      const admissionError = startupAdmissionErrorShape(error);
+      if (admissionError) {
+        return await options.reject(admissionError);
+      }
       throw error;
     }
   }
@@ -497,38 +506,54 @@ export async function runWithGatewayRequestEnvelope<T>(
 const STARTUP_ADMISSION_EXEMPT_METHODS: ReadonlySet<string> = new Set(["last-heartbeat"]);
 
 /**
- * 请求只涉及"一个"员工时返回它，供等待 helper 收窄（是否真的收窄还取决于存储布局能否证明
- * 逻辑员工 = 物理 owner）。扫描参数里的 agentId 和所有形如 agent:<id>:... 的会话键（含数组与
- * 浅层嵌套对象，覆盖 sessionKey / key / keys / parentSessionKey 等各种字段名）：恰好一个
- * 员工才返回；一个都没有、或出现多个不同员工（例如 agentId 与会话键指向不同员工）都返回
- * undefined，由 helper 等全部在途准入——宁可多等，不按可能不完整的线索收窄。
+ * 后台启动准入相关错误的统一协议形态（selfreview P2-3）：准入未完成的同步兜底 → 可重试的
+ * UNAVAILABLE；准入已失败 → 不可重试的 UNAVAILABLE（原因原样）。都按正常回包处理，不记
+ * error 日志。不是准入错误返回 undefined。
  */
-function resolveStartupAdmissionAgentId(params: unknown): string | undefined {
-  const agentIds = new Set<string>();
-  const visit = (value: unknown, key: string | undefined, depth: number) => {
-    if (typeof value === "string") {
-      const agentId =
-        key === "agentId" ? value.trim() || undefined : parseAgentSessionKey(value)?.agentId;
-      if (agentId) {
-        agentIds.add(normalizeAgentId(agentId));
-      }
-      return;
-    }
-    if (depth >= 3) {
-      return;
-    }
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        visit(item, key, depth + 1);
-      }
-    } else if (isRecord(value)) {
-      for (const [childKey, child] of Object.entries(value)) {
-        visit(child, childKey, depth + 1);
-      }
-    }
-  };
-  visit(params, undefined, 0);
-  return agentIds.size === 1 ? [...agentIds][0] : undefined;
+function startupAdmissionErrorShape(error: unknown): ErrorShape | undefined {
+  const classified = classifyAgentStartupAdmissionError(error);
+  return classified
+    ? errorShape(ErrorCodes.UNAVAILABLE, formatErrorMessage(classified.error), {
+        retryable: classified.kind === "pending",
+      })
+    : undefined;
+}
+
+/**
+ * 员工库启动准入期间允许按员工收窄等待的方法（显式声明，默认一律等全部；selfreview P2-2）。
+ * 不再扫描参数猜目标：附带的会话键、消息正文里恰好以 agent:<id>: 开头的文本、无前缀键
+ * （解析到默认员工）都会让猜测收窄到错的员工。这里只收录"目标就是 sessionKey 指向的那一个
+ * 会话、handler 只读该会话所在员工库"的读方法；新增方法前必须确认同样成立。
+ */
+const STARTUP_ADMISSION_SESSION_KEY_SCOPED_METHODS: ReadonlySet<string> = new Set([
+  "chat.history",
+  "chat.message.get",
+]);
+
+/**
+ * 声明过的方法才可能收窄：sessionKey 必须带 agent:<id>: 前缀（无前缀键要按配置解析默认员工，
+ * 入口这里不做这件事，直接等全部）；同时给了 agentId 的必须与会话键的员工一致，否则等全部。
+ * 是否真的收窄还取决于存储布局能否证明逻辑员工 = 物理 owner（见等待 helper）。
+ */
+function resolveStartupAdmissionAgentId(method: string, params: unknown): string | undefined {
+  if (!STARTUP_ADMISSION_SESSION_KEY_SCOPED_METHODS.has(method) || !isRecord(params)) {
+    return undefined;
+  }
+  const sessionAgentId =
+    typeof params.sessionKey === "string"
+      ? parseAgentSessionKey(params.sessionKey)?.agentId
+      : undefined;
+  if (!sessionAgentId) {
+    return undefined;
+  }
+  if (
+    params.agentId !== undefined &&
+    (typeof params.agentId !== "string" ||
+      normalizeAgentId(params.agentId) !== normalizeAgentId(sessionAgentId))
+  ) {
+    return undefined;
+  }
+  return sessionAgentId;
 }
 
 /** Authorizes and dispatches one gateway JSON-RPC-style request. */
@@ -577,20 +602,21 @@ export async function handleGatewayRequest(
     // continuation 是已在跑的工作的回包，不等；白名单方法见 STARTUP_ADMISSION_EXEMPT_METHODS。
     if (opts.admission !== "continuation" && !STARTUP_ADMISSION_EXEMPT_METHODS.has(req.method)) {
       const startupAdmission = waitForAgentStartupAdmissionBeforeRequest({
-        agentId: resolveStartupAdmissionAgentId(req.params),
+        agentId: resolveStartupAdmissionAgentId(req.method, req.params),
         signals: [signal, context.requestEntryLifetime?.signal],
       });
       if (startupAdmission) {
         try {
           await startupAdmission;
         } catch (error) {
-          // 中止 = 网关正在关闭 / 请求已撤销，可重试；否则是该员工准入失败，原样报出原因。
+          // 中止 = 网关正在关闭 / 请求已撤销，可重试；准入失败按同一分类报不可重试。
           respond(
             false,
             undefined,
-            errorShape(ErrorCodes.UNAVAILABLE, formatErrorMessage(error), {
-              retryable: isAbortError(error),
-            }),
+            startupAdmissionErrorShape(error) ??
+              errorShape(ErrorCodes.UNAVAILABLE, formatErrorMessage(error), {
+                retryable: isAbortError(error),
+              }),
           );
           return;
         }

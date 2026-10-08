@@ -1,6 +1,7 @@
 // ADR-0033 任务84(c) 方案 B 回归：员工库后台启动准入未完成时，请求在入口透明等待，
 // 而不是撞上同步开库入口的可重试错误；等待能被关闭 / 热重启打断，失败的员工立即返回
 // 同一原因。走真实分发层 handleGatewayRequest + 真实 handler + 真实临时 SQLite。
+import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -182,12 +183,12 @@ describe("gateway request entry waits for agent startup admission", () => {
   });
 
   it("HTTP 用户路由在准入进行中先等待，cancel 时返回 503", async () => {
-    const res = {
+    const res = Object.assign(new EventEmitter(), {
       statusCode: 200,
       setHeader: vi.fn(),
       end: vi.fn(),
       req: { socket: {} },
-    } as unknown as ServerResponse;
+    }) as unknown as ServerResponse;
     const gate = scheduleGatedAdmission(["main"]);
     const run = vi.fn(async () => true);
     const waited = runWithGatewayHttpWorkAdmission(res, run);
@@ -204,6 +205,17 @@ describe("gateway request entry waits for agent startup admission", () => {
     await expect(cancelled).resolves.toBe(true);
     expect(run).toHaveBeenCalledOnce();
     expect(res.statusCode).toBe(503);
+
+    // 客户端在等待期间断开：立即停止等待，不执行路由、也不再写响应。
+    scheduleGatedAdmission(["late"]);
+    const endCalls = vi.mocked(res.end).mock.calls.length;
+    const abandoned = runWithGatewayHttpWorkAdmission(res, run);
+    await tick();
+    res.emit("close");
+    await expect(Promise.race([abandoned, tick(500).then(() => "blocked")])).resolves.toBe(true);
+    expect(run).toHaveBeenCalledOnce();
+    expect(vi.mocked(res.end).mock.calls.length).toBe(endCalls);
+    await cancelAgentStartupAdmission();
   });
 
   it("免等白名单：心跳方法 last-heartbeat 在准入中立即返回，白名单外的方法仍等待", async () => {
@@ -445,8 +457,8 @@ describe("gateway request entry waits for agent startup admission", () => {
     });
   });
 
-  // 请求参数指向两个不同员工（agentId 是 main、会话键却是 ops 的）时不收窄：只等 main 会漏掉
-  // 真正要读的 ops 库。用一个记录调用时刻的测试方法观察分发层是否放行。
+  // 只有显式声明了按 sessionKey 收窄的方法才可能收窄（selfreview P2-2）：未声明的方法即使
+  // 参数里看得出员工（agentId 是 main、嵌套会话键是 ops）也等全部在途准入。
   it("参数里出现多个员工时不收窄，等全部在途准入", async () => {
     const gate = scheduleGatedAdmission(["ops"], { narrow: true });
     scheduleAgentStartupAdmission({

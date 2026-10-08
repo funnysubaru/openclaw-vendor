@@ -44,6 +44,7 @@ import {
 import { readAgentDeletionJournal } from "./agent-deletion-journal.js";
 import {
   assertAgentStartupAdmissionSettled,
+  getAgentStartupAdmissionWorkSignal,
   waitForAgentStartupAdmission,
 } from "./agent-startup-admission.js";
 import { createOpenClawAgentDatabaseAdmissionOwner } from "./openclaw-agent-db-admission.js";
@@ -199,22 +200,30 @@ const {
 export { withOpenClawAgentDatabaseAdmission };
 
 /**
- * ADR-0033 任务84(c)：所有异步打开员工库的调用方都走这一个函数（包括真正发请求的
- * 时候），所以在真正开库之前先在这里插一刀——如果这个 agentId 的后台启动准入还没
- * 完成，就先等它（或者如果它已经失败，直接把同一个失败原因抛给这次调用）。这样
- * "请求打到还没准备好的员工时等待其准入完成"这条规则只用改这一处，不用在每个调用
- * withOpenClawAgentDatabaseAsync 的业务代码里分别加等待逻辑。
+ * ADR-0033 任务84(c)：全部异步开库的收口点。按数据库物理 owner（options.agentId）检查后台
+ * 启动准入：还在准入就先等它，已失败就抛同一个失败原因。请求的主要等待点在请求入口
+ * （waitForAgentStartupAdmissionBeforeRequest：RPC 分发、HTTP、渠道、cron、heartbeat、
+ * 投递恢复），这里是入口之后仍走异步开库的路径的兜底；同步开库的兜底见
+ * openOpenClawAgentDatabaseSteps 顶部的 assertAgentStartupAdmissionSettled。
  */
 export async function withOpenClawAgentDatabaseAsync<T>(
   options: OpenClawAgentDatabaseOptions,
   operation: (database: OpenClawAgentDatabase) => T | Promise<T>,
   assertCurrent?: () => void,
+  signal?: AbortSignal,
 ): Promise<T> {
   const pending = waitForAgentStartupAdmission(options.agentId);
   if (pending) {
     await pending;
   }
-  return withOpenClawAgentDatabaseAsyncAfterStartupAdmission(options, operation, assertCurrent);
+  // 在后台准入工作内部发起的开库默认绑定调度器的停止信号：关停 / 热重启时进行中的完整性
+  // 检查立即中止（selfreview P2-1）。
+  return withOpenClawAgentDatabaseAsyncAfterStartupAdmission(
+    options,
+    operation,
+    assertCurrent,
+    signal ?? getAgentStartupAdmissionWorkSignal(),
+  );
 }
 
 function* openOpenClawAgentDatabaseSteps(

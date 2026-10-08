@@ -36,6 +36,9 @@ let opening = createPermitPool(AGENT_STARTUP_OPEN_CONCURRENCY);
 let migrating = createPermitPool(AGENT_STARTUP_MIGRATE_CONCURRENCY);
 const pendingByAgentId = new Map<string, Promise<void>>();
 const failedByAgentId = new Map<string, Error>();
+// 记录过的准入失败原因（同一个 Error 对象会经同步 / 异步兜底原样抛给请求），供协议层把它
+// 识别成"准入失败、不可重试"（selfreview P2-3）。WeakSet：状态清空后不再持有。
+let admissionFailures = new WeakSet<Error>();
 // 请求入口能否只等「请求里那个员工」（review2~4 收口）。准入按数据库物理 owner 登记，请求
 // 入口拿到的却是逻辑员工；共享库 / 自定义库 / 保留旧库等配置下两者可以不同，而"逻辑员工 →
 // 全部物理库"的关系无法在启动时可靠穷举（每一轮 review 都找到新的漏网组合）。所以规则改成
@@ -53,6 +56,17 @@ export class AgentStartupAdmissionPendingError extends Error {
     super(`Agent ${agentId} database is still being prepared after gateway startup; retry shortly`);
     this.name = "AgentStartupAdmissionPendingError";
   }
+}
+
+/**
+ * 当前异步上下文正处在某个员工的准入工作里时，返回调度器的停止信号（selfreview P2-1）。
+ * 准入工作内部所有开库（设置 mainKey、worktree 迁移、handoff → reconcile → 开库）都经
+ * withOpenClawAgentDatabaseAsync / reconcile 两个收口点取这个信号，cancel 时进行中的完整性
+ * 检查和 reconcile worker 立即中止，不用在每个调用点各传一遍。准入结束后作用域失效，
+ * 派生出去的后台任务不会继承这个信号。
+ */
+export function getAgentStartupAdmissionWorkSignal(): AbortSignal | undefined {
+  return ownAdmission.getStore()?.active ? controller?.signal : undefined;
 }
 
 function isInsideOwnAdmission(agentId: string): boolean {
@@ -113,6 +127,7 @@ export function scheduleAgentStartupAdmission(params: {
         if (!signal.aborted) {
           const reason = error instanceof Error ? error : new Error(String(error));
           failedByAgentId.set(agentId, reason);
+          admissionFailures.add(reason);
           log.warn("agent startup admission failed; agent stays unavailable", {
             agentId,
             reason: reason.message,
@@ -193,19 +208,43 @@ export function waitForAgentStartupAdmissionBeforeRequest(
   return racePromiseWithAbortSignal(target, AbortSignal.any(signals));
 }
 
-/** 等全部在途准入结束；requestedAgentId 本身若是已失败的库 owner，结束后报它的失败原因。 */
+/**
+ * 等全部在途准入结束；requestedAgentId 本身若是已失败的库 owner（等待前已失败，或在等待
+ * 期间失败），结束后报它的失败原因。
+ */
 function waitForAllAgentStartupAdmissions(requestedAgentId?: string): Promise<void> | undefined {
-  const failure = requestedAgentId
-    ? failedByAgentId.get(normalizeAgentId(requestedAgentId))
-    : undefined;
+  const requested = requestedAgentId ? normalizeAgentId(requestedAgentId) : undefined;
+  const failureOf = () => (requested ? failedByAgentId.get(requested) : undefined);
   if (pendingByAgentId.size === 0) {
+    const failure = failureOf();
     return failure ? Promise.reject(failure) : undefined;
   }
   return Promise.allSettled(pendingByAgentId.values()).then(() => {
+    const failure = failureOf();
     if (failure) {
       throw failure;
     }
   });
+}
+
+/**
+ * 协议层集中分类用（selfreview P2-3）：沿 cause 链找后台启动准入相关的错误。
+ * "pending" = 准入未完成的同步兜底（可重试）；"failed" = 准入已失败的原因（不可重试）。
+ */
+export function classifyAgentStartupAdmissionError(
+  error: unknown,
+): { kind: "pending" | "failed"; error: Error } | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth < 8 && current instanceof Error; depth += 1) {
+    if (current instanceof AgentStartupAdmissionPendingError) {
+      return { kind: "pending", error: current };
+    }
+    if (admissionFailures.has(current)) {
+      return { kind: "failed", error: current };
+    }
+    current = current.cause;
+  }
+  return undefined;
 }
 
 /**
@@ -263,6 +302,7 @@ function clearAgentStartupAdmissionState(): void {
   migrating = createPermitPool(AGENT_STARTUP_MIGRATE_CONCURRENCY);
   pendingByAgentId.clear();
   failedByAgentId.clear();
+  admissionFailures = new WeakSet<Error>();
   narrowRequestsToAgent = undefined;
 }
 

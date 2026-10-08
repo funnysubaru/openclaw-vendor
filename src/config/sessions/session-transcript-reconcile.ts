@@ -11,6 +11,7 @@ import { isPathInside } from "../../infra/path-guards.js";
 import { runtimeProcessEntrypoints } from "../../infra/runtime-process-entrypoints.js";
 import { resolveRuntimeWorkerUrl } from "../../infra/runtime-worker-url.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { getAgentStartupAdmissionWorkSignal } from "../../state/agent-startup-admission.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly.js";
 import {
   borrowOpenClawAgentDatabase,
@@ -284,6 +285,11 @@ export async function reconcileSessionTranscriptIndexes(
 async function reconcilePreparedTranscriptIndexes(
   params: PreparedReconcileParams,
 ): Promise<SessionTranscriptReconcileResult> {
+  // 在后台启动准入的 handoff 里运行时，绑定调度器的停止信号（selfreview P2-1）：关停 /
+  // 热重启时不再干等 worker 跑完整个计划，按"worker 未正常结束"的既有收尾路径释放租约。
+  // 开库那一步经 withOpenClawAgentDatabaseAsync 自动绑定同一信号。准入之外调用时为 undefined。
+  const abortSignal = getAgentStartupAdmissionWorkSignal();
+  abortSignal?.throwIfAborted();
   const databasePath = resolveOpenClawAgentSqlitePath(params);
   const databaseOptions: ReconcileDatabaseOptions = {
     agentId: params.agentId,
@@ -467,6 +473,15 @@ async function reconcilePreparedTranscriptIndexes(
             reject(new Error(`session transcript reconcile worker exited with code ${code}`)),
           );
         });
+        if (abortSignal) {
+          const onAbort = () => settle(() => reject(abortSignal.reason));
+          if (abortSignal.aborted) {
+            onAbort();
+          } else {
+            abortSignal.addEventListener("abort", onAbort, { once: true });
+            worker.once("exit", () => abortSignal.removeEventListener("abort", onAbort));
+          }
+        }
       });
       outcome = ok(value);
     } catch (error) {

@@ -50,14 +50,27 @@ export async function runWithGatewayHttpWorkAdmission(
   // 插件静态资源等）也会在启动后这几秒里一起等——跟改动前"准入完成才开始监听"的体验
   // 一致，换来的是不用逐个路由判断。等待放在 root work 准入之前，不阻塞重启 / 挂起排空；
   // 关闭时调度器 abort 会让等待立即结束并返回 503。
-  const startupAdmission = waitForAgentStartupAdmissionBeforeRequest();
-  if (startupAdmission) {
-    try {
-      await startupAdmission;
-    } catch {
-      reject();
-      return true;
+  // 客户端在等待期间断开（res 'close' 先于响应结束）就停止等待、直接放手，不再等准入
+  // 结束后才发现没人要这个响应。
+  const disconnected = new AbortController();
+  const onClose = () => disconnected.abort();
+  res.once("close", onClose);
+  try {
+    const startupAdmission = waitForAgentStartupAdmissionBeforeRequest({
+      signals: [disconnected.signal],
+    });
+    if (startupAdmission) {
+      try {
+        await startupAdmission;
+      } catch {
+        if (!disconnected.signal.aborted) {
+          reject();
+        }
+        return true;
+      }
     }
+  } finally {
+    res.off("close", onClose);
   }
   return await runWithGatewayBoundaryWorkAdmission("http:request", reject, async () => {
     try {

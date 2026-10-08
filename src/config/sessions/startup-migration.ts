@@ -206,7 +206,7 @@ function provesOneToOneAgentStorage(
 
 /** One per-agent row prepared by scheduleBackgroundSessionStartupMigration below. */
 interface PreparedBackgroundSessionStartupMigrationTarget {
-  target: ReturnType<typeof resolveAllAgentSessionStoreTargetsSync>[number];
+  target: SessionStoreTarget;
   options: OpenClawAgentDatabaseOptions;
   databasePath: string;
   alreadyOpen: boolean;
@@ -227,9 +227,9 @@ interface PreparedBackgroundSessionStartupMigrationTarget {
  *   的完整性扫描——这是真正慢的部分）与 migrate（worktree 迁移 + handoff）分别排进
  *   scheduleAgentStartupAdmission 的 open/migrate 两个并发池（上限对齐上游
  *   AGENT_DATABASE_PREFLIGHT_CONCURRENCY=2 / AGENT_DATABASE_PREPARATION_CONCURRENCY=4）
- *   在后台跑。请求如果在后台任务跑完前摸到同一个 agentId，会在
- *   withOpenClawAgentDatabaseAsync 里被 waitForAgentStartupAdmission 挡住等它，
- *   不会跟后台任务抢着并发开同一个 sqlite 文件。
+ *   在后台跑。请求在各入口经 waitForAgentStartupAdmissionBeforeRequest 等待准入完成
+ *   （能证明逻辑员工 = 物理 owner 时只等该员工，否则等全部），不会跟后台任务抢着并发开
+ *   同一个 sqlite 文件；入口之后的异步 / 同步开库另有兜底（见 openclaw-agent-db.ts）。
  * - open 阶段故意不吞错误（只关掉本阶段开出的冷连接再重抛）：main-key 设置失败原样
  *   抛给调度器，调度器把这个 agentId 标记为失败（failedByAgentId），migrate 阶段（含 handoffDatabase）
  *   整段都不会跑——跟阻塞版"main-key 设置失败仍然尝试 handoff"的 best-effort 语义不

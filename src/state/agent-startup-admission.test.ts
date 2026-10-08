@@ -367,4 +367,28 @@ describe("agent-startup-admission", () => {
     await wide;
     expect(rejected).toBe(failure);
   });
+
+  // selfreview 次要项：等全部模式下，请求员工若在等待期间才准入失败，结束后同样报它的原因
+  // （不是只看调用那一刻）。
+  it("等全部模式：请求员工在等待期间失败，结束后报同一原因", async () => {
+    const failure = new Error("main failed while waiting");
+    const mainGate = deferred();
+    const opsGate = deferred();
+    scheduleAgentStartupAdmission({
+      agentIds: ["main", "ops"],
+      openAgent: async (agentId) => {
+        if (agentId === "main") {
+          await mainGate.promise;
+          throw failure;
+        }
+        await opsGate.promise;
+      },
+      migrateAgent: async () => {},
+    });
+    const wide = waitForAgentStartupAdmissionBeforeRequest({ agentId: "main" });
+    expect(wide).toBeDefined();
+    mainGate.resolve();
+    opsGate.resolve();
+    await expect(wide).rejects.toBe(failure);
+  });
 });

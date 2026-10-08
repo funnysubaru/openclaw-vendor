@@ -13,6 +13,8 @@ import {
   gatewayStartupUnavailableDetails,
   GATEWAY_STARTUP_RETRY_AFTER_MS,
 } from "../../packages/gateway-protocol/src/startup-unavailable.js";
+import { isAbortError } from "../infra/abort-signal.js";
+import { formatErrorMessage } from "../infra/errors.js";
 import { getActivePluginHttpRouteRegistry, getActivePluginRegistry } from "../plugins/runtime.js";
 import {
   getPluginRuntimeGatewayRequestScope,
@@ -25,6 +27,8 @@ import {
   tryBeginGatewayPreparedRestartRootWorkAdmission,
   tryBeginGatewayRootWorkAdmission,
 } from "../process/gateway-work-admission.js";
+import { parseAgentSessionKey } from "../routing/session-key.js";
+import { waitForAgentStartupAdmissionBeforeRequest } from "../state/agent-startup-admission.js";
 import { formatControlPlaneActor, resolveControlPlaneActor } from "./control-plane-audit.js";
 import {
   consumeControlPlaneWriteBudget,
@@ -483,6 +487,22 @@ export async function runWithGatewayRequestEnvelope<T>(
   }
 }
 
+/**
+ * 请求参数里能直接看出目标员工时（agentId，或 agent:<id>: 形式的 sessionKey）只等这一个
+ * 员工；看不出就返回 undefined，由等待 helper 等全部在途准入。
+ */
+function resolveStartupAdmissionAgentId(params: unknown): string | undefined {
+  if (!isRecord(params)) {
+    return undefined;
+  }
+  if (typeof params.agentId === "string" && params.agentId.trim()) {
+    return params.agentId;
+  }
+  return typeof params.sessionKey === "string"
+    ? parseAgentSessionKey(params.sessionKey)?.agentId
+    : undefined;
+}
+
 /** Authorizes and dispatches one gateway JSON-RPC-style request. */
 export async function handleGatewayRequest(
   opts: GatewayRequestOptions & {
@@ -522,6 +542,32 @@ export async function handleGatewayRequest(
       const error = errorShape(ErrorCodes.INVALID_REQUEST, `unknown method: ${req.method}`);
       respond(false, undefined, error);
       return;
+    }
+    // ADR-0033 任务84(c)：员工库后台启动准入未完成时，请求在进 handler 前透明等待（handler
+    // 里大量同步读员工库，同步入口只能拒绝不能等）。放在 root work 准入之前，等待期间不占
+    // 重启 / 挂起要排空的 root work；入口租约关闭（close 前奏）或请求中止都会立即打断等待。
+    // continuation 是已在跑的工作的回包，不等。
+    if (opts.admission !== "continuation") {
+      const startupAdmission = waitForAgentStartupAdmissionBeforeRequest({
+        agentId: resolveStartupAdmissionAgentId(req.params),
+        signals: [signal, context.requestEntryLifetime?.signal],
+      });
+      if (startupAdmission) {
+        try {
+          await startupAdmission;
+        } catch (error) {
+          // 中止 = 网关正在关闭 / 请求已撤销，可重试；否则是该员工准入失败，原样报出原因。
+          respond(
+            false,
+            undefined,
+            errorShape(ErrorCodes.UNAVAILABLE, formatErrorMessage(error), {
+              retryable: isAbortError(error),
+            }),
+          );
+          return;
+        }
+        entry?.assertOpen();
+      }
     }
     // Every session mutation owner uses these pre-commit assertions. Compose the
     // host lifetime here so individual handlers cannot lose it across an await.

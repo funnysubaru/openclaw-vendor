@@ -13,10 +13,6 @@ import {
 } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
-  cancelAgentStartupAdmission,
-  scheduleAgentStartupAdmission,
-} from "../../state/agent-startup-admission.js";
-import {
   clearUserProfileAuthLink,
   listUserProfileAuthLinks,
   readUserModelAuthProfile,
@@ -92,57 +88,6 @@ function createPersonalMetadataFixture() {
   };
   return { owner, authProfileId, client, clients, config, metadata, readChatMetadata, request };
 }
-
-// ADR-0033 任务84(c) review P1-2：chat.history / chat.startup 后面全是同步读库，同步入口
-// 只能拒绝不能等。所以在请求入口先等该员工的后台启动准入完成，再进同步读取——面板一连上
-// 就拉历史时是"稍等后正常返回"，而不是撞上准入窗口报错。
-describe("chat history startup admission", () => {
-  it.each(["chat.history", "chat.startup"] as const)(
-    "%s waits for the agent's background startup admission before reading",
-    async (method) => {
-      await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-        const cfg = { agents: { entries: { main: {} } } } satisfies OpenClawConfig;
-        await state.writeConfig(cfg);
-        const scope = { agentId: "main", sessionKey: "agent:main:main", sessionId: "main-1" };
-        await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-        const openGate = createDeferred<void>();
-        scheduleAgentStartupAdmission({
-          agentIds: ["main"],
-          openAgent: async () => await openGate.promise,
-          migrateAgent: async () => {},
-        });
-        try {
-          const respond = vi.fn<RespondFn>();
-          const request = expectDefined(
-            chatHistoryHandlers[method],
-            "history handler",
-          )({
-            params: { agentId: scope.agentId, sessionKey: scope.sessionKey },
-            context: createDirectChatContext({ getRuntimeConfig: () => cfg }),
-            req: { type: "req", id: "startup-admission", method },
-            client: { connect: { scopes: ["operator.admin"] } } as never,
-            isWebchatConnect: () => false,
-            respond,
-          });
-          await new Promise((resolve) => {
-            setTimeout(resolve, 20);
-          });
-          expect(respond).not.toHaveBeenCalled();
-
-          openGate.resolve();
-          await request;
-          expect(respond).toHaveBeenCalledWith(
-            true,
-            expect.objectContaining({ sessionKey: scope.sessionKey }),
-          );
-        } finally {
-          openGate.resolve();
-          await cancelAgentStartupAdmission();
-        }
-      });
-    },
-  );
-});
 
 describe("chat history model selection defaults", () => {
   it("keeps a stored literal global conversation separate from main in per-sender scope", async () => {

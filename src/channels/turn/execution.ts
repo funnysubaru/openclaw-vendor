@@ -8,6 +8,8 @@ import {
   runWithDiagnosticTraceContext,
 } from "../../infra/diagnostic-trace-context.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { parseAgentSessionKey } from "../../routing/session-key.js";
+import { waitForAgentStartupAdmissionBeforeRequest } from "../../state/agent-startup-admission.js";
 import { isRecentOutboundMessageIdentity } from "../message/outbound-echo.js";
 import { recordChannelBotPairLoopAndCheckSuppression } from "./bot-loop-protection.js";
 import {
@@ -253,6 +255,14 @@ async function runPreparedChannelTurnCoreInTrace<
   // path before the next group turn can replay stale context.
   try {
     const recordSessionKey = resolveRecordSessionKey(params);
+    // ADR-0033 任务84(c)：渠道入站（如 LINE 消息）在写会话前先等该员工的后台启动准入完成，
+    // 对齐上游同一位置的 waitForAgentPreparation；准入失败 / 关闭中止会抛出，走原有失败路径。
+    const startupAdmission = waitForAgentStartupAdmissionBeforeRequest({
+      agentId: params.ctxPayload.AgentId ?? parseAgentSessionKey(params.routeSessionKey)?.agentId,
+    });
+    if (startupAdmission) {
+      await startupAdmission;
+    }
     if (params.ctxPayload.SessionTranscriptContext) {
       const { mergeSessionTranscriptContext } =
         await import("../inbound-event/session-transcript-context.runtime.js");

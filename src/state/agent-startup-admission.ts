@@ -21,6 +21,7 @@
 // 入口。只有按"异步上下文"豁免自己，才能一次性覆盖这些间接调用，不靠在每个调用点换
 // 绕过入口（review P1-1：换了直接调用、漏了间接调用，冷库在真实 handoff 里自己等自己）。
 import { AsyncLocalStorage } from "node:async_hooks";
+import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { createPermitPool } from "../shared/permit-pool.js";
@@ -138,6 +139,44 @@ export function waitForAgentStartupAdmission(agentId: string): Promise<void> | u
     return Promise.reject(failure);
   }
   return pendingByAgentId.get(normalized);
+}
+
+/**
+ * 请求入口（RPC 分发 / HTTP 用户路由 / 渠道入站）用的等待：入口后面往往是同步读员工库，
+ * 同步入口自己没法等，所以在进入请求前先在这里等准入（owner 2026-10-08 选 B：透明等待，
+ * 不让请求撞上同步开库入口的可重试错误）。
+ * - 给了 agentId：只等这一个员工；它已失败就立即 reject 同一原因，不陪别的员工等。
+ * - 没给 agentId（入口说不清要读哪个员工）：等当前所有在途准入结束（allSettled），失败的
+ *   员工留给后续开库入口按员工报同一原因。
+ * - 关闭 / 热重启：调度器的 abort（cancelAgentStartupAdmission）和调用方传入的 signals
+ *   （请求入口租约关闭、请求自身中止）任一触发都立即以 AbortError 结束，不卡住关闭。
+ * - 在任何员工自己的准入工作里调用直接放行：准入工作若绕回请求入口，等全部会等到自己。
+ * 没有需要等的就返回 undefined，调用方不多付一个 await。
+ */
+export function waitForAgentStartupAdmissionBeforeRequest(
+  params: { agentId?: string; signals?: ReadonlyArray<AbortSignal | undefined> } = {},
+): Promise<void> | undefined {
+  if (
+    (pendingByAgentId.size === 0 && failedByAgentId.size === 0) ||
+    ownAdmission.getStore()?.active
+  ) {
+    return undefined;
+  }
+  const target = params.agentId
+    ? waitForAgentStartupAdmission(params.agentId)
+    : pendingByAgentId.size > 0
+      ? Promise.allSettled(pendingByAgentId.values()).then(() => undefined)
+      : undefined;
+  if (!target) {
+    return undefined;
+  }
+  const signals = [controller?.signal, ...(params.signals ?? [])].filter(
+    (signal): signal is AbortSignal => signal !== undefined,
+  );
+  // signal 已中止时竞速会直接返回、不再订阅 target；先挂一个空处理，免得失败原因变成
+  // 未处理 rejection（等待方照样从竞速结果里拿到失败）。
+  target.catch(() => {});
+  return racePromiseWithAbortSignal(target, AbortSignal.any(signals));
 }
 
 /**

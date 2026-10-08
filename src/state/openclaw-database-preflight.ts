@@ -11,7 +11,6 @@ import {
   getNodeSqliteKysely,
 } from "../infra/kysely-sync.js";
 import { openNodeSqliteDatabase, resolveImmutableSqliteFileUri } from "../infra/node-sqlite.js";
-import { hasNodeErrorCode } from "../infra/path-guards.js";
 import { assertSqliteIntegrity } from "../infra/sqlite-integrity.js";
 import {
   collectSqliteSchemaIssues,
@@ -28,11 +27,12 @@ import { isValidAgentId } from "../routing/session-key.js";
 import { OPENCLAW_AGENT_SCHEMA_VERSION } from "./openclaw-agent-db-contract.js";
 import { assertOpenClawAgentDatabaseForMaintenance } from "./openclaw-agent-db-maintenance.js";
 import { isPersistentOpenClawAgentDatabasePath } from "./openclaw-agent-db-registry.js";
+import { assertOpenClawAgentCurrentRuntimeSchema } from "./openclaw-agent-db-schema-helpers.js";
 import {
-  assertOpenClawAgentCurrentRuntimeSchema,
-  assertCanonicalAgentPersistenceVersion,
-  readExistingAgentSchemaMeta,
-} from "./openclaw-agent-db-schema-helpers.js";
+  inspectAgentDatabaseCandidateForPreflight,
+  inspectPreflightCandidatePresence,
+  readWriterAppVersion,
+} from "./openclaw-agent-preflight-candidate.js";
 import type {
   DeferredStateSchemaPublication,
   IncompatibleOpenClawDatabase,
@@ -166,6 +166,9 @@ export async function assertOpenClawDatabasesReady(
     ...(options.operation === "gateway-startup"
       ? {
           requireStartupMigrationReadiness: true,
+          // ADR-0033 任务84(b)：冷启动这一遍只读版本号/元数据，完整性扫描交给随后
+          // session-migration 真正打开每个员工库时去做（那一步本来就会做一次）。
+          deferAgentIntegrityToAdmission: true,
           // Inspect candidate owners from preserved snapshots: runtime target
           // resolution opens custom stores directly and can create WAL sidecars.
           configuredAgentDatabaseTargets: [],
@@ -205,19 +208,6 @@ export async function assertOpenClawDatabasesReady(
   throw new Error(
     `${action} because persisted database readiness could not be verified: ${shown.join("; ")}${omitted > 0 ? `; +${omitted} more` : ""}. ${options.operation === "doctor" ? "Stop OpenClaw processes, then restore the affected database from a verified backup." : "Stop the Gateway and other OpenClaw processes, run openclaw doctor --fix, then retry."}`,
   );
-}
-
-function readWriterAppVersion(database: DatabaseSync): string | undefined {
-  try {
-    const row = database
-      .prepare("SELECT app_version FROM schema_meta WHERE meta_key = 'primary' LIMIT 1")
-      .get() as { app_version?: unknown } | undefined;
-    return typeof row?.app_version === "string" && row.app_version.length > 0
-      ? row.app_version
-      : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function readRegisteredAgentDatabases(
@@ -452,6 +442,14 @@ export async function preflightOpenClawDatabaseSchemas(options: {
   supportedVersions: OpenClawSchemaVersions;
   verifyCurrentSchemaShape?: boolean;
   requireStartupMigrationReadiness?: boolean;
+  /**
+   * ADR-0033 任务84(b)：只读版本号 + 便宜元数据，不整库拷贝、不做完整性扫描
+   * （`PRAGMA integrity_check` + 外键检查）。对齐上游 #145541 方向：完整性检查推迟到
+   * 真正打开员工库时（session-migration 经 openclaw-agent-db-admission.ts 的
+   * assertSqliteIntegrityInWorker 本来就会做一次），这里再扫一遍是重复劳动。只有
+   * gateway 正常启动传 true；Doctor 不受影响（doctor 调用不传这个 flag）。
+   */
+  deferAgentIntegrityToAdmission?: boolean;
   configuredAgentDatabaseTargets?:
     | readonly { agentId: string; path: string }[]
     | ((
@@ -466,19 +464,7 @@ export async function preflightOpenClawDatabaseSchemas(options: {
   let stateDatabase: DatabaseSync | undefined;
   let closeStateSchemaReadAdmission: (() => void) | undefined;
   let stateSnapshot: Awaited<ReturnType<typeof prepareSqliteReadOnlyLocation>> | undefined;
-  const inspectCandidatePresence = (
-    databasePath: string,
-  ): { status: "present" | "absent" } | { status: "indeterminate"; reason: string } => {
-    try {
-      statSync(databasePath);
-      return { status: "present" };
-    } catch (error) {
-      return hasNodeErrorCode(error, "ENOENT")
-        ? { status: "absent" }
-        : { status: "indeterminate", reason: formatErrorMessage(error) };
-    }
-  };
-  const statePresence = inspectCandidatePresence(statePath);
+  const statePresence = inspectPreflightCandidatePresence(statePath);
   if (statePresence.status === "indeterminate") {
     result.indeterminate.push({ kind: "state", path: statePath, reason: statePresence.reason });
     return result;
@@ -647,97 +633,16 @@ export async function preflightOpenClawDatabaseSchemas(options: {
   ];
   const inspectedAgentPaths = new Set<string>();
   const inspectedAgentTargets = new Set<string>();
+  // 逐候选的检查逻辑搬去了 openclaw-agent-preflight-candidate.ts（纯粹是为了不让这个
+  // 文件顶过 oxlint 的 max-lines 阈值），所有结果通过改写 result/两个 Set 传回。
   for (const row of inspectionTargets) {
-    const agentPath = row.path;
-    const presence = inspectCandidatePresence(agentPath);
-    if (presence.status === "absent") {
-      continue;
-    }
-    if (presence.status === "indeterminate") {
-      result.indeterminate.push({ kind: "agent", path: agentPath, reason: presence.reason });
-      continue;
-    }
-    let agentDatabase: DatabaseSync | undefined;
-    let agentSnapshot: Awaited<ReturnType<typeof prepareSqliteReadOnlyLocation>> | undefined;
-    try {
-      // Preserve SQLite's filesystem traversal through symlink/.. locators.
-      const realAgentPath = realpathSync.native(agentPath);
-      const inspectionKey = `${realAgentPath}\0${row.agentId ?? ""}`;
-      if (
-        inspectedAgentTargets.has(inspectionKey) ||
-        (row.agentId === undefined && inspectedAgentPaths.has(realAgentPath))
-      ) {
-        continue;
-      }
-      inspectedAgentPaths.add(realAgentPath);
-      inspectedAgentTargets.add(inspectionKey);
-      // Live agents keep committing during inspection. Online backup preserves
-      // database/WAL contents while allowing SQLite to update SHM read marks.
-      agentSnapshot = await prepareSqliteReadOnlyLocation(realAgentPath, {
-        signal: options.signal,
-      });
-      options.signal?.throwIfAborted();
-      agentDatabase = openNodeSqliteDatabase(agentSnapshot.location, {
-        readOnly: true,
-      });
-      agentDatabase.exec(`PRAGMA busy_timeout = ${OPENCLAW_SQLITE_BUSY_TIMEOUT_MS};`);
-      const agentVersion = readSqliteUserVersion(agentDatabase);
-      if (agentVersion < options.supportedVersions.agent) {
-        (result.pendingMigrations ??= []).push({
-          kind: "agent",
-          path: agentPath,
-          ...(row.agentId !== undefined ? { agentId: row.agentId } : {}),
-          foundVersion: agentVersion,
-          supportedVersion: options.supportedVersions.agent,
-        });
-      }
-      if (agentVersion <= options.supportedVersions.agent) {
-        if (options.requireStartupMigrationReadiness) {
-          assertSqliteIntegrity(agentDatabase, agentPath);
-          assertCanonicalAgentPersistenceVersion(agentDatabase, agentPath, agentVersion);
-        }
-        const agentId =
-          row.agentId ??
-          (options.requireStartupMigrationReadiness
-            ? readExistingAgentSchemaMeta(agentDatabase)?.agentId
-            : undefined);
-        if (
-          options.verifyCurrentSchemaShape === true &&
-          agentId != null &&
-          (!options.requireStartupMigrationReadiness || agentVersion > 0)
-        ) {
-          assertOpenClawAgentDatabaseForMaintenance(agentDatabase, {
-            agentId,
-            pathname: agentPath,
-          });
-        }
-        continue;
-      }
-      const writerAppVersion = readWriterAppVersion(agentDatabase);
-      result.incompatible.push({
-        kind: "agent",
-        path: agentPath,
-        ...(row.agentId !== undefined ? { agentId: row.agentId } : {}),
-        foundVersion: agentVersion,
-        supportedVersion: options.supportedVersions.agent,
-        ...(writerAppVersion ? { writerAppVersion } : {}),
-      });
-    } catch (error) {
-      if (options.signal?.aborted || options.requireStartupMigrationReadiness) {
-        throw error;
-      }
-      result.indeterminate.push({
-        kind: "agent",
-        path: agentPath,
-        reason: formatErrorMessage(error),
-      });
-    } finally {
-      try {
-        agentDatabase?.close();
-      } finally {
-        agentSnapshot?.cleanup();
-      }
-    }
+    await inspectAgentDatabaseCandidateForPreflight({
+      row,
+      options,
+      result,
+      inspectedAgentPaths,
+      inspectedAgentTargets,
+    });
   }
   return result;
 }

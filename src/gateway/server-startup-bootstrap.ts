@@ -155,6 +155,11 @@ export async function prepareGatewayServerBootstrap(input: {
     preflightOpenClawDatabaseSchemas({
       signal,
       env: process.env,
+      // ADR-0033 任务84(a)：只查全局状态库。员工库在更早的 CLI/doctor 就绪检查
+      // （assertOpenClawDatabasesReady({ operation: "gateway-startup" })）里已完整校验过，
+      // session-migration 打开每个员工库时还会再做准入；这里再扫一遍是冷启动约 9.4 秒的
+      // 重复劳动。方向对齐上游 #165667；scope:"state" 是现成分支（doctor-maintenance 在用）。
+      scope: "state",
       supportedVersions: {
         state: stateDatabase.OPENCLAW_STATE_SCHEMA_VERSION,
         agent: agentDatabase.OPENCLAW_AGENT_SCHEMA_VERSION,

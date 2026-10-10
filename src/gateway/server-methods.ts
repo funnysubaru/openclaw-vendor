@@ -532,12 +532,23 @@ function startupAdmissionErrorShape(error: unknown): ErrorShape | undefined {
  * chat.send / agent 是面板与 LINE 首轮对话的入口（selfreview2）：收窄后首轮只等本员工准入。
  * agent 不给 sessionKey 时按渠道 / 绑定选员工，入口算不出来——下面要求必须有带前缀的
  * sessionKey，所以这种情况自然等全部。sessions.list 等本身跨员工的方法不能收录。
+ * chat.abort 是面板 Stop 的入口（Yuiclaw #424 review P2）：等全部时，一个无关员工还在检查 /
+ * 迁移，已经在跑的对话就停不下来（面板先乐观标成已停止，模型和工具实际还在跑）。收窄的依据：
+ * - 要停的运行既然已经在跑，它所在员工的库一定已准入，收窄后通常一拍都不用等；
+ * - handler 先 abort 本员工运行的内存 controller（级联 kill 的 beforeKill，早于任何子 agent
+ *   清理），再处理子 agent；子 agent 在别的员工下时，读子会话走只读池，落库（abortedLastRun）
+ *   走异步写、按库主人等准入，子 agent 的登记表在全局状态库、不经员工库闸门。所以跨员工清理
+ *   最多让回包晚到或报"子 agent 取消不完整"，不会挡住本员工运行的停止，也不会读到未迁移数据。
+ * 只收 chat.abort：sessions.abort 的目标可以只给 runId、由 handler 自己反查会话（入口算不出
+ * 员工），还会清队列、退役 MCP 运行时，面板也不调用，仍等全部。共享库等证明不了一员工一库的
+ * 布局下，chat.abort 仍等全部（已知取舍，见 waitForAgentStartupAdmissionBeforeRequest）。
  */
 const STARTUP_ADMISSION_SESSION_KEY_SCOPED_METHODS: ReadonlySet<string> = new Set([
   "chat.history",
   "chat.message.get",
   "chat.send",
   "agent",
+  "chat.abort",
 ]);
 
 /**

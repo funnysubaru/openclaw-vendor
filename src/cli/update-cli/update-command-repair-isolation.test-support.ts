@@ -144,6 +144,8 @@ export async function writeRepairCandidate(candidate: string, configChange: bool
     "node-sqlite.mjs",
     "node-runtime-update.mjs",
     "node-runtime-recovery.mjs",
+    // openclaw.mjs statically imports this at its top, unconditionally.
+    "node-compile-cache.mjs",
     "package.json",
   ]) {
     await fs.copyFile(path.join(process.cwd(), file), path.join(candidate, file));

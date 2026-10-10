@@ -32,6 +32,13 @@ async function makeLauncherFixture(fixtureRoots: string[]): Promise<string> {
     path.resolve(process.cwd(), "node-sqlite.mjs"),
     path.join(fixtureRoot, "node-sqlite.mjs"),
   );
+  // openclaw.mjs statically imports this at its top, unconditionally - a fixture
+  // missing it fails every test in this file with ERR_MODULE_NOT_FOUND before any
+  // launcher logic even runs (not a compile-cache-specific failure mode).
+  await fs.copyFile(
+    path.resolve(process.cwd(), "node-compile-cache.mjs"),
+    path.join(fixtureRoot, "node-compile-cache.mjs"),
+  );
   await fs.mkdir(path.join(fixtureRoot, "dist"), { recursive: true });
   return fixtureRoot;
 }
@@ -1492,6 +1499,68 @@ describe("openclaw launcher", () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toBe("cache:enabled;respawn:0");
   });
+
+  it(
+    "adopts an inherited NODE_COMPILE_CACHE after the packaged respawn and retires a stale sibling " +
+      "(ALREADY_ENABLED regression, review on openclaw-vendor#137)",
+    async () => {
+      // Yuiclaw's gateway launcher sets NODE_COMPILE_CACHE on the child env
+      // before spawning it, exactly like this test does. Node auto-enables
+      // from that inherited raw base at process bootstrap, before
+      // openclaw.mjs's own code runs; the mandatory respawn into the
+      // qualified namespace directory then makes openclaw.mjs's own
+      // enableCompileCache() call report ALREADY_ENABLED, not ENABLED, for
+      // that exact directory. Before the fix, only ENABLED was accepted, so
+      // ownership was never registered and retention maintenance never ran -
+      // on the launcher's actual, everyday path, not an edge case.
+      const fixtureRoot = await makeLauncherFixture(fixtureRoots);
+      await fs.writeFile(path.join(fixtureRoot, "package.json"), '{"version":"2026.4.29"}\n');
+      const cacheBase = path.join(fixtureRoot, ".node-compile-cache");
+      const staleDirectory = path.join(cacheBase, "openclaw", "2026.4.29", "0000000000000000");
+      const staleFile = path.join(staleDirectory, "stale.bin");
+      await fs.mkdir(staleDirectory, { recursive: true });
+      await fs.writeFile(staleFile, "stale");
+      // Poll (with a referenced sleep, so this process stays alive long enough
+      // for the unref'd retention worker to actually run) instead of trusting
+      // a fixed delay: a real regression leaves the stale file in place and
+      // this loop simply runs out its bounded deadline.
+      await fs.writeFile(
+        path.join(fixtureRoot, "dist", "entry.js"),
+        [
+          'import module from "node:module";',
+          'import { readFile } from "node:fs/promises";',
+          'import { setTimeout as sleep } from "node:timers/promises";',
+          `const staleFile = ${JSON.stringify(staleFile)};`,
+          "const deadline = Date.now() + 5000;",
+          "while (Date.now() < deadline) {",
+          "  try {",
+          "    await readFile(staleFile);",
+          "  } catch {",
+          "    break;",
+          "  }",
+          "  await sleep(20);",
+          "}",
+          "process.stdout.write(",
+          '  `${module.getCompileCacheDir?.() ? "cache:enabled" : "cache:disabled"};respawned:${process.env.OPENCLAW_PACKAGED_COMPILE_CACHE_RESPAWNED ?? "0"}`,',
+          ");",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const result = spawnSync(process.execPath, [path.join(fixtureRoot, "openclaw.mjs")], {
+        cwd: fixtureRoot,
+        env: launcherEnv({ NODE_COMPILE_CACHE: cacheBase }),
+        encoding: "utf8",
+      });
+
+      expect(result.status).toBe(0);
+      // Confirms the packaged respawn into the qualified namespace directory
+      // actually happened - this is the process where enableCompileCache()
+      // observes ALREADY_ENABLED.
+      expect(result.stdout).toBe("cache:enabled;respawned:1");
+      await expect(fs.stat(staleFile)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
 
   it.runIf(process.platform !== "win32")(
     "does not respawn native hook relays for packaged compile-cache scoping",

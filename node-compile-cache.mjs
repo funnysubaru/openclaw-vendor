@@ -48,6 +48,26 @@ export function resolveOpenClawCompileCacheDirectory({ installRoot, env = proces
   return resolveSafeNodeCompileCacheDirectory(path.join(base, "openclaw", version, marker));
 }
 
+// Fork-local fix (not present upstream as of this writing - checked `git log
+// <our-pin>..upstream/main -- <these files>`, zero hits): Node reports
+// ALREADY_ENABLED, not ENABLED, whenever a compile cache was already active
+// before our own enableCompileCache() call ran - which is the *normal* case
+// for Yuiclaw's gateway launcher, since it sets NODE_COMPILE_CACHE on the
+// child environment before spawning, so Node auto-enables from that
+// inherited env var at process bootstrap, before any of our JS runs. Callers
+// must accept ALREADY_ENABLED too, but only after confirming the directory
+// that's actually active belongs to the OpenClaw namespace they just
+// resolved - never adopt some other unrelated cache (or Node's own
+// reported version/arch leaf) as "ours".
+export function isUnderOpenClawCompileCacheNamespace(activeDirectory, namespaceDirectory) {
+  if (activeDirectory === undefined) {
+    return false;
+  }
+  const active = path.resolve(activeDirectory);
+  const namespace = path.resolve(namespaceDirectory);
+  return active === namespace || active.startsWith(`${namespace}${path.sep}`);
+}
+
 export function resolveSafeNodeCompileCacheDirectory(directory) {
   // Node can hang at 240/245 characters (and 283 for other path structures):
   // https://github.com/nodejs/node/issues/66438. Leave room for Node's cache leaf.

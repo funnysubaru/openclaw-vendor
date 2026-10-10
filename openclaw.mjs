@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  isUnderOpenClawCompileCacheNamespace,
   maintainOpenClawCompileCache,
   resolveOpenClawCompileCacheDirectory,
 } from "./node-compile-cache.mjs";
@@ -651,8 +652,22 @@ if (
     if (directory) {
       const baseDirectory = path.resolve(directory);
       const result = module.enableCompileCache(directory);
-      const enabled = module.constants?.compileCacheStatus?.ENABLED;
-      if (enabled !== undefined && result?.status === enabled) {
+      const statuses = module.constants?.compileCacheStatus;
+      // Yuiclaw's gateway launcher sets NODE_COMPILE_CACHE on this process's own
+      // env before spawning it, so Node auto-enables from that inherited value
+      // at bootstrap - before this line ever runs - and enableCompileCache()
+      // reports ALREADY_ENABLED for it, not ENABLED. That is the launcher's
+      // normal path, not an edge case: accept ALREADY_ENABLED too, but only
+      // once the directory actually active is confirmed to live inside the
+      // OpenClaw namespace just resolved (never adopt some unrelated cache, or
+      // Node's own reported version/arch leaf, as ours).
+      const accepted =
+        statuses !== undefined &&
+        (result?.status === statuses.ENABLED || result?.status === statuses.ALREADY_ENABLED);
+      if (
+        accepted &&
+        isUnderOpenClawCompileCacheNamespace(module.getCompileCacheDir?.(), baseDirectory)
+      ) {
         // Bootstrap adapter for src/infra/node-compile-cache-env.ts: preserve the first
         // successful input without importing runtime code before cache activation.
         const key = Symbol.for("openclaw.nodeCompileCacheBase");

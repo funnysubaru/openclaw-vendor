@@ -1,6 +1,7 @@
 import * as module from "node:module";
 import path from "node:path";
 import {
+  isUnderOpenClawCompileCacheNamespace,
   maintainOpenClawCompileCache,
   resolveSafeNodeCompileCacheDirectory,
 } from "../../node-compile-cache.mjs";
@@ -14,12 +15,33 @@ function compileCacheOwner() {
   return resolveGlobalSingleton<{ baseDirectory?: string }>(COMPILE_CACHE_BASE_KEY, () => ({}));
 }
 
-/** Enable through OpenClaw, retaining only the input to a successful first enable. */
+/**
+ * Enable through OpenClaw, retaining only the input to a successful first enable.
+ *
+ * Yuiclaw's gateway launcher sets `NODE_COMPILE_CACHE` on the child environment
+ * *before* spawning, so Node auto-enables the cache from that inherited env var
+ * at process bootstrap - before this call ever runs. `enableCompileCache()`
+ * then reports `ALREADY_ENABLED`, not `ENABLED`, for the exact same directory
+ * this module would have resolved on its own. Treating only `ENABLED` as
+ * success (the upstream behavior as of this writing - no later upstream commit
+ * addresses this) means owner registration and retention maintenance never run
+ * on this path, which is the launcher's actual, everyday path in Yuiclaw - not
+ * an edge case. Accept `ALREADY_ENABLED` too, but only once the directory
+ * that's actually active is confirmed to live inside the OpenClaw namespace we
+ * just resolved; a cache some unrelated code enabled under a different
+ * directory must not be adopted as ours.
+ */
 export function enableOwnedNodeCompileCache(directory: string): void {
   const baseDirectory = path.resolve(directory);
   const result = module.enableCompileCache(directory);
-  const enabled = module.constants?.compileCacheStatus?.ENABLED;
-  if (enabled !== undefined && result?.status === enabled) {
+  const statuses = module.constants?.compileCacheStatus;
+  const accepted =
+    statuses !== undefined &&
+    (result?.status === statuses.ENABLED || result?.status === statuses.ALREADY_ENABLED);
+  if (
+    accepted &&
+    isUnderOpenClawCompileCacheNamespace(module.getCompileCacheDir?.(), baseDirectory)
+  ) {
     compileCacheOwner().baseDirectory ??= baseDirectory;
     void maintainOpenClawCompileCache(baseDirectory);
   }

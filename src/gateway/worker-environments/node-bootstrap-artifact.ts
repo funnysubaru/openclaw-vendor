@@ -41,6 +41,10 @@ import { runTasksWithConcurrency } from "../../utils/run-with-concurrency.js";
 
 const BOOTSTRAP_LAUNCHER_FILES = [
   "openclaw.mjs",
+  // openclaw.mjs statically imports this at its top, unconditionally - a
+  // worker bootstrap artifact missing it fails to start at all
+  // (ERR_MODULE_NOT_FOUND), not just lose the compile-cache feature.
+  "node-compile-cache.mjs",
   "node-version.mjs",
   "node-sqlite.mjs",
   "node-runtime-update.mjs",

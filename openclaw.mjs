@@ -7,6 +7,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  isUnderOpenClawCompileCacheNamespace,
+  maintainOpenClawCompileCache,
+  resolveOpenClawCompileCacheDirectory,
+} from "./node-compile-cache.mjs";
+import {
   consumeLauncherRootOptionToken,
   isForegroundGmailRunInvocation,
   isNativeHookRelayInvocation,
@@ -87,41 +92,13 @@ const ensureSupportedRuntimeVersion = async () => {
 const isNodeCompileCacheDisabled = () => process.env.NODE_DISABLE_COMPILE_CACHE !== undefined;
 const isNodeCompileCacheRequested = () =>
   Boolean(process.env.NODE_COMPILE_CACHE) && !isNodeCompileCacheDisabled();
-const sanitizeCompileCachePathSegment = (value) => {
-  const normalized = value.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
-  return normalized.length > 0 ? normalized : "unknown";
-};
-const readPackageVersion = () => {
-  try {
-    const parsed = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
-    if (typeof parsed?.version === "string" && parsed.version.trim().length > 0) {
-      return parsed.version;
-    }
-  } catch {
-    // Fall through to an install-metadata-only cache key.
-  }
-  return "unknown";
-};
-const resolvePackagedCompileCacheDirectory = () => {
-  const packageJsonUrl = new URL("./package.json", import.meta.url);
-  const version = sanitizeCompileCachePathSegment(readPackageVersion());
-  let installMarker = "no-package-json";
-  try {
-    const stat = statSync(packageJsonUrl);
-    installMarker = `${Math.trunc(stat.mtimeMs)}-${stat.size}`;
-  } catch {
-    // Package archives should always have package.json, but keep startup best-effort.
-  }
-  const baseDirectory = isNodeCompileCacheRequested()
-    ? process.env.NODE_COMPILE_CACHE
-    : path.join(os.tmpdir(), "node-compile-cache");
-  return path.join(
-    baseDirectory,
-    "openclaw",
-    version,
-    sanitizeCompileCachePathSegment(installMarker),
-  );
-};
+// Delegates to the shared node-compile-cache.mjs module so the launcher and the
+// built runtime (src/entry.compile-cache.ts) resolve, bound, and reuse the exact
+// same cache namespace instead of maintaining parallel copies of this logic.
+const resolvePackagedCompileCacheDirectory = () =>
+  resolveOpenClawCompileCacheDirectory({
+    installRoot: path.dirname(fileURLToPath(import.meta.url)),
+  });
 
 const respawnWithoutCompileCacheIfNeeded = () => {
   if (!isSourceCheckoutLauncher()) {
@@ -158,7 +135,9 @@ const respawnWithPackagedCompileCacheIfNeeded = () => {
     return false;
   }
   const desiredDirectory = resolvePackagedCompileCacheDirectory();
-  if (path.resolve(currentDirectory) === path.resolve(desiredDirectory)) {
+  // Windows refuses cache paths over 200 characters (nodejs/node#66438); treat
+  // "no safe directory" the same as "already matches" and just leave caching off.
+  if (!desiredDirectory || path.resolve(currentDirectory) === path.resolve(desiredDirectory)) {
     return false;
   }
   const env = {
@@ -669,7 +648,34 @@ if (
   !isSourceCheckoutLauncher()
 ) {
   try {
-    module.enableCompileCache(resolvePackagedCompileCacheDirectory());
+    const directory = resolvePackagedCompileCacheDirectory();
+    if (directory) {
+      const baseDirectory = path.resolve(directory);
+      const result = module.enableCompileCache(directory);
+      const statuses = module.constants?.compileCacheStatus;
+      // Yuiclaw's gateway launcher sets NODE_COMPILE_CACHE on this process's own
+      // env before spawning it, so Node auto-enables from that inherited value
+      // at bootstrap - before this line ever runs - and enableCompileCache()
+      // reports ALREADY_ENABLED for it, not ENABLED. That is the launcher's
+      // normal path, not an edge case: accept ALREADY_ENABLED too, but only
+      // once the directory actually active is confirmed to live inside the
+      // OpenClaw namespace just resolved (never adopt some unrelated cache, or
+      // Node's own reported version/arch leaf, as ours).
+      const accepted =
+        statuses !== undefined &&
+        (result?.status === statuses.ENABLED || result?.status === statuses.ALREADY_ENABLED);
+      if (
+        accepted &&
+        isUnderOpenClawCompileCacheNamespace(module.getCompileCacheDir?.(), baseDirectory)
+      ) {
+        // Bootstrap adapter for src/infra/node-compile-cache-env.ts: preserve the first
+        // successful input without importing runtime code before cache activation.
+        const key = Symbol.for("openclaw.nodeCompileCacheBase");
+        const owner = (globalThis[key] ??= {});
+        owner.baseDirectory ??= baseDirectory;
+        void maintainOpenClawCompileCache(baseDirectory);
+      }
+    }
   } catch {
     // Ignore errors
   }

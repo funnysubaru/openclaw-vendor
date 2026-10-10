@@ -22,6 +22,7 @@ const targets = [
   "test",
   "skills",
   "config",
+  "node-compile-cache.mjs",
   "node-runtime-update.mjs",
   "node-runtime-recovery.mjs",
   "node-sqlite.mjs",

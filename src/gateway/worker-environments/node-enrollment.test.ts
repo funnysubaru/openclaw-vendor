@@ -126,6 +126,12 @@ describe("worker node enrollment", () => {
         path.join(packageRoot, "node-runtime-recovery.mjs"),
         "export const recovery = true;",
       ),
+      // BOOTSTRAP_LAUNCHER_FILES also requires this one now - openclaw.mjs
+      // statically imports it, unconditionally.
+      fs.writeFile(
+        path.join(packageRoot, "node-compile-cache.mjs"),
+        "export const compileCache = true;",
+      ),
       fs.writeFile(path.join(packageRoot, "dist/entry.js"), "export const ready = true;"),
       fs.writeFile(
         path.join(packageRoot, "dist/build-info.json"),

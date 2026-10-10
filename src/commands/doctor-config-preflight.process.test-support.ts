@@ -104,6 +104,7 @@ export function createSourceRuntime(root: string): string {
     );
   }
   for (const filename of [
+    "node-compile-cache.mjs",
     "node-version.mjs",
     "node-sqlite.mjs",
     "node-runtime-update.mjs",

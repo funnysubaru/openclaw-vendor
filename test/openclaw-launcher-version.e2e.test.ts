@@ -41,6 +41,11 @@ async function makeLauncherVersionFixture(
     path.resolve(process.cwd(), "node-runtime-recovery.mjs"),
     path.join(fixtureRoot, "node-runtime-recovery.mjs"),
   );
+  // openclaw.mjs statically imports this at its top, unconditionally.
+  await fs.copyFile(
+    path.resolve(process.cwd(), "node-compile-cache.mjs"),
+    path.join(fixtureRoot, "node-compile-cache.mjs"),
+  );
   await fs.mkdir(path.join(fixtureRoot, "dist"), { recursive: true });
   await fs.writeFile(
     path.join(fixtureRoot, "package.json"),

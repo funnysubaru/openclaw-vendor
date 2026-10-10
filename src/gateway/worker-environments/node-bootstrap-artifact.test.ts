@@ -63,6 +63,9 @@ async function fixture(mode: "source" | "package" | "external-plugin" = "source"
   await write(packageRoot, "node-sqlite.mjs", "export const probe = true;");
   await write(packageRoot, "node-runtime-update.mjs", "export const update = true;");
   await write(packageRoot, "node-runtime-recovery.mjs", "export const recovery = true;");
+  // BOOTSTRAP_LAUNCHER_FILES in node-bootstrap-artifact.ts also requires this
+  // one now - openclaw.mjs statically imports it, unconditionally.
+  await write(packageRoot, "node-compile-cache.mjs", "export const compileCache = true;");
   await write(packageRoot, "scripts/preinstall.mjs", "export {};\n");
   await write(
     packageRoot,

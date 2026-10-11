@@ -2,6 +2,7 @@
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { prepareSyntheticAuthWithProvider } from "../plugins/provider-synthetic-auth.js";
+import type { PluginRegistry } from "../plugins/registry-types.js";
 import type { ProviderPlugin } from "../plugins/types.js";
 
 // Provider-scoped live builds must not fan ambient synthetic-auth discovery out to every
@@ -29,6 +30,12 @@ export function listPreparedSyntheticAuthProviderRefs(
       ),
     ),
   ].toSorted((left, right) => left.localeCompare(right));
+}
+
+export function listRegistrySyntheticAuthProviderRefs(registry: PluginRegistry | undefined) {
+  return listPreparedSyntheticAuthProviderRefs(
+    registry?.providers.map(({ provider }) => provider) ?? [],
+  );
 }
 
 export async function prepareSyntheticAuth(params: {

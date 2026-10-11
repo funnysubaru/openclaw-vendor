@@ -15,6 +15,7 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { logVerbose } from "../../globals.js";
 import type { PluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.types.js";
 import { loadBundledSkillEntryByName } from "../loading/workspace-skill-loader.js";
+import { getSkillsSnapshotVersion } from "../runtime/refresh-state.js";
 import { getRemoteSkillEligibility } from "../runtime/remote.js";
 import type { SkillCommandSpec } from "../types.js";
 import { resolveEffectiveAgentSkillFilter } from "./agent-filter.js";
@@ -176,7 +177,9 @@ function* resolveAgentSkillCommandWorkspaces(params: AgentSkillCommandParams) {
     });
     yield {
       workspaceDir,
-      options: {
+      // Built on demand: remote eligibility is a snapshot of the connected nodes, so async
+      // preparation must be able to rebuild it after a remote node change.
+      resolveOptions: () => ({
         config: params.cfg,
         agentId,
         skillFilter,
@@ -189,7 +192,7 @@ function* resolveAgentSkillCommandWorkspaces(params: AgentSkillCommandParams) {
             advertiseExecNode: nodeSkills.canExec,
           }),
         },
-      },
+      }),
     };
   }
 }
@@ -215,12 +218,12 @@ function finalizeSkillCommands(entries: SkillCommandSpec[]) {
 export function listSkillCommandsForAgents(params: AgentSkillCommandParams): SkillCommandSpec[] {
   const used = listReservedChatSlashCommandNames();
   const entries: SkillCommandSpec[] = [];
-  for (const { workspaceDir, options } of resolveAgentSkillCommandWorkspaces(params)) {
+  for (const { workspaceDir, resolveOptions } of resolveAgentSkillCommandWorkspaces(params)) {
     appendSkillCommands(
       entries,
       used,
       buildWorkspaceSkillCommandSpecs(workspaceDir, {
-        ...options,
+        ...resolveOptions(),
         reservedNames: used,
       }),
     );
@@ -233,15 +236,22 @@ export async function prepareSkillCommandsForAgents(
 ): Promise<SkillCommandSpec[]> {
   const used = listReservedChatSlashCommandNames();
   const entries: SkillCommandSpec[] = [];
-  for (const { workspaceDir, options } of resolveAgentSkillCommandWorkspaces(params)) {
-    appendSkillCommands(
-      entries,
-      used,
-      await prepareWorkspaceSkillCommandSpecs(workspaceDir, {
-        ...options,
+  for (const { workspaceDir, resolveOptions } of resolveAgentSkillCommandWorkspaces(params)) {
+    let commands: SkillCommandSpec[];
+    for (;;) {
+      // Remote node connects/disconnects bump the skills version. The loader retries on that
+      // bump but reuses our options, whose remote eligibility predates the await; read the
+      // version before building options and rebuild them if it moved while preparing.
+      const version = getSkillsSnapshotVersion(workspaceDir);
+      commands = await prepareWorkspaceSkillCommandSpecs(workspaceDir, {
+        ...resolveOptions(),
         reservedNames: used,
-      }),
-    );
+      });
+      if (getSkillsSnapshotVersion(workspaceDir) === version) {
+        break;
+      }
+    }
+    appendSkillCommands(entries, used, commands);
   }
   return finalizeSkillCommands(entries);
 }

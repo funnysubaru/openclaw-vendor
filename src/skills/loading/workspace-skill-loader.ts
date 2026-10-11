@@ -9,6 +9,7 @@ import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { shouldRejectHardlinkedPluginFiles } from "../../plugins/hardlink-policy.js";
 import type { PluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.types.js";
 import { normalizeAgentId } from "../../routing/session-key.js";
+import { prepareBinaryAvailability } from "../../shared/config-eval.js";
 import { CONFIG_DIR, resolveUserPath } from "../../utils.js";
 import {
   isSessionSkillEnabled,
@@ -115,11 +116,12 @@ function filterSkillEntries(
   skillFilter?: string[],
   skillOverrides?: Readonly<Record<string, boolean>>,
   eligibility?: SkillEligibilityContext,
+  hasBin?: (bin: string) => boolean,
 ): SkillEntry[] {
   const bundledAllowlist = resolveBundledAllowlist(config);
   assertUnambiguousManagedSkillNames(entries);
   let filtered = entries.filter((entry) =>
-    shouldIncludeSkill({ entry, config, bundledAllowlist, eligibility }),
+    shouldIncludeSkill({ entry, config, bundledAllowlist, eligibility, hasBin }),
   );
   if (skillFilter !== undefined || skillOverrides !== undefined) {
     const normalized = normalizeSkillFilter(skillFilter) ?? [];
@@ -384,22 +386,129 @@ export function resolveWorkspaceSkillPromptEntries(
   };
 }
 
-export function loadWorkspaceSkills(
-  workspaceDir: string,
-  opts?: WorkspaceSkillLoadOptions,
-): SkillEntry[] {
+// Yuiclaw：以下 prepareSkillBinaryProbe / resolveWorkspaceSkillLoad / prepareWorkspaceSkills
+// 是上游 #146373（4e668c36a35）的核心部分回搬。#146812「异步准备 Gateway 技能命令」依赖它。
+// 只搬了「异步探测二进制」这一块：Windows 上缺失的命令要扫 PATH 目录 × PATHEXT 后缀，
+// 同步 accessSync 会把 gateway 主线程卡住几十秒（实测 CPU profile hasBinary 38s/60s）；
+// 改成 fs.promises.access 后交给 libuv 线程池，主线程不再被阻塞。
+// #146373 的其余部分（resolveWorkspaceSkillPromptEntries 改 async 等 50 个文件）没搬，
+// 那些调用方仍走同步 loadWorkspaceSkills / hasBinary，行为与 pin 一致。
+// prepareSkillBinaryProbe 再叠上游 #147359（af40e11dda8）：只探「除了缺程序以外都满足条件」
+// 的技能所需程序（os 不符 / 被禁用 / 不在 allowlist 的技能不再白扫 PATH）；判定时若用到了
+// 没预先探过的程序（条件在探测期间变了）就整轮重来，不用半旧结果。
+async function prepareSkillBinaryProbe(
+  entries: SkillEntry[],
+  opts?: Pick<WorkspaceSkillLoadOptions, "config" | "eligibility">,
+  assertCurrent?: () => void,
+) {
+  const bins = new Set<string>();
+  const bundledAllowlist = resolveBundledAllowlist(opts?.config);
+  let needsBinaries: boolean;
+  const recordBinaryRequirement = () => {
+    needsBinaries = true;
+    return true;
+  };
+  for (const entry of entries) {
+    const requires = entry.metadata?.requires;
+    if (!requires?.bins?.length && !requires?.anyBins?.length) {
+      continue;
+    }
+    needsBinaries = false;
+    shouldIncludeSkill({
+      entry,
+      config: opts?.config,
+      bundledAllowlist,
+      eligibility: opts?.eligibility,
+      hasBin: recordBinaryRequirement,
+    });
+    if (needsBinaries) {
+      for (const bin of entry.metadata?.requires?.bins ?? []) {
+        bins.add(bin);
+      }
+      for (const bin of entry.metadata?.requires?.anyBins ?? []) {
+        bins.add(bin);
+      }
+    }
+  }
+  const facts = await prepareBinaryAvailability(bins, assertCurrent);
+  let unprepared = false;
+  return {
+    hasBin: (bin: string) => {
+      // Eligibility can change while probing; prepare newly requested facts before publishing.
+      if (!bins.has(bin)) {
+        unprepared = true;
+        return false;
+      }
+      return facts.hasBinary(bin);
+    },
+    needsRetry: () => unprepared || !facts.isCurrent(),
+  };
+}
+
+function resolveWorkspaceSkillLoad(workspaceDir: string, opts?: WorkspaceSkillLoadOptions) {
   const roots = normalizeWorkspaceSkillRoots({
     agentWorkspaceDir: workspaceDir,
     executionWorkspaceDir: opts?.executionWorkspaceDir,
   });
   const entries = loadSkillEntries(roots.agentWorkspaceDir, opts);
   const effectiveSkillFilter = resolveEffectiveWorkspaceSkillFilter(opts);
-  if (
-    !roots.executionWorkspaceDir &&
-    effectiveSkillFilter === undefined &&
-    opts?.skillOverrides === undefined &&
-    opts?.eligibility === undefined
-  ) {
+  return {
+    entries,
+    effectiveSkillFilter,
+    shouldFilter:
+      Boolean(roots.executionWorkspaceDir) ||
+      effectiveSkillFilter !== undefined ||
+      opts?.skillOverrides !== undefined ||
+      opts?.eligibility !== undefined,
+  };
+}
+
+/** Runtime preparation shares discovery and filtering with synchronous SDK inventory reads. */
+export async function prepareWorkspaceSkills(
+  workspaceDir: string,
+  opts?: WorkspaceSkillLoadOptions,
+  assertCurrent?: () => void,
+): Promise<SkillEntry[]> {
+  for (;;) {
+    assertCurrent?.();
+    const sourceVersion = getSkillsSnapshotVersion(workspaceDir);
+    const { entries, effectiveSkillFilter, shouldFilter } = resolveWorkspaceSkillLoad(
+      workspaceDir,
+      opts,
+    );
+    if (!shouldFilter) {
+      return entries;
+    }
+    const probe = await prepareSkillBinaryProbe(entries, opts, assertCurrent);
+    // 异步探测期间技能目录变了（安装/删除技能）或探测条件失效，就重来，避免用旧条目配新探测结果。
+    if (probe.needsRetry() || getSkillsSnapshotVersion(workspaceDir) !== sourceVersion) {
+      continue;
+    }
+    const eligible = filterSkillEntries(
+      entries,
+      opts?.config,
+      effectiveSkillFilter,
+      opts?.skillOverrides,
+      opts?.eligibility,
+      probe.hasBin,
+    );
+    assertCurrent?.();
+    if (probe.needsRetry()) {
+      continue;
+    }
+    return eligible;
+  }
+}
+
+export function loadWorkspaceSkills(
+  workspaceDir: string,
+  opts?: WorkspaceSkillLoadOptions,
+): SkillEntry[] {
+  const { entries, effectiveSkillFilter, shouldFilter } = resolveWorkspaceSkillLoad(
+    workspaceDir,
+    opts,
+  );
+  if (!shouldFilter) {
     return entries;
   }
   return filterSkillEntries(

@@ -16,6 +16,7 @@ import {
   type PluginMetadataSnapshot,
 } from "../plugins/plugin-metadata-snapshot.js";
 import { normalizePluginPolicyId } from "../plugins/plugin-policy-id.js";
+import { withSharedPersistedPluginFileChecks } from "../plugins/plugin-registry-snapshot.js";
 import type { OpenClawConfig } from "./types.openclaw.js";
 
 function mergeRegistries(registries: readonly PluginManifestRegistry[]): PluginManifestRegistry {
@@ -127,8 +128,16 @@ function resolveConfigWidePluginMetadataSnapshotImpl(
       allowCurrent: params.allowCurrent,
       allowWorkspaceScopedCurrent: true,
     });
-  const firstSnapshot = resolveSnapshot(workspaceDirs[0]);
-  const snapshots = [firstSnapshot, ...workspaceDirs.slice(1).map(resolveSnapshot)];
+  // 任务99：各工作区共用同一份持久化插件索引的文件检查结果，避免同样的检查按员工数重复做
+  // （Windows、20 个员工，启动期这两项合计约 33 秒 CPU）。
+  // 详见 withSharedPersistedPluginFileChecks 的注释。
+  const { firstSnapshot, snapshots } = withSharedPersistedPluginFileChecks(() => {
+    const first = resolveSnapshot(workspaceDirs[0]);
+    return {
+      firstSnapshot: first,
+      snapshots: [first, ...workspaceDirs.slice(1).map(resolveSnapshot)],
+    };
+  });
   if (snapshots.length === 1) {
     return firstSnapshot;
   }

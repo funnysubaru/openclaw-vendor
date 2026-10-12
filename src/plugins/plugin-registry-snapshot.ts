@@ -188,6 +188,86 @@ function hasStaleDoctorContractFile(
     : plugin.doctorContractHash !== undefined || plugin.doctorContractFile !== undefined;
 }
 
+// 任务99（Windows 启动慢，热点①）：一次「全员读配置」（resolveConfigWidePluginMetadataSnapshot）
+// 会按员工工作区逐个解析插件元数据，每个工作区都会对同一份持久化插件索引做一遍「插件文件是否过期」
+// 和「内置插件目录是否对得上」的检查。这两项只取决于索引本身（后者再加 env），与工作区无关；
+// Windows 上每次 lstat / realpath 都很贵，20 个员工就是同样的文件系统检查做 20 遍
+// （Windows 实测：启动前 90 秒内这两项合计约 33 秒 CPU）。
+// 这里在那一次全员读配置期间按索引对象记住结果，后面的工作区直接复用。
+//
+// 边界：
+// - 只在 withSharedPersistedPluginFileChecks 包住的同步调用期间生效，出了这次调用立即丢弃，
+//   不跨调用、不跨进程生命周期缓存，所以 gateway 长时间运行后插件文件被替换仍能照常检测到。
+// - 用 WeakMap 按索引对象记：同一插件缓存作用域里持久化索引是同一个对象（见
+//   getPersistedInstalledPluginIndexCacheEntry），换了作用域或换了索引就是新对象，不会串用。
+// - 代价：同一次全员读配置内部，若插件文件恰好在两个工作区之间被替换，后面的工作区沿用前面的结论。
+//   这次调用本来就是一个时间点的视图，第一个工作区做完的派生发现也已缓存了当时的文件内容。
+// - 上游的做法是 #151805 重构成多个工作区共用一个 reader（连同依赖 #144676 约 950 行），
+//   这里是同等效果的最小改动，日后整体同步上游时换成上游写法。
+type SharedPersistedPluginFileChecks = {
+  stale?: boolean;
+  mismatchedBundledRoot?: { env: NodeJS.ProcessEnv; value: boolean };
+};
+
+let sharedPersistedPluginFileChecks:
+  | WeakMap<InstalledPluginIndex, SharedPersistedPluginFileChecks>
+  | undefined;
+
+/**
+ * 在 run 执行期间共用持久化插件索引的文件检查结果。run 必须是同步函数：
+ * 共享表挂在模块变量上，异步续体会跑到 finally 清理之后，拿不到也不该拿到这份结果。
+ * 嵌套调用直接沿用外层的共享表。
+ */
+export function withSharedPersistedPluginFileChecks<T>(run: () => T): T {
+  if (sharedPersistedPluginFileChecks) {
+    return run();
+  }
+  sharedPersistedPluginFileChecks = new WeakMap();
+  try {
+    return run();
+  } finally {
+    sharedPersistedPluginFileChecks = undefined;
+  }
+}
+
+function getSharedPersistedPluginFileChecks(
+  index: InstalledPluginIndex,
+): SharedPersistedPluginFileChecks | undefined {
+  const shared = sharedPersistedPluginFileChecks;
+  if (!shared) {
+    return undefined;
+  }
+  let checks = shared.get(index);
+  if (!checks) {
+    checks = {};
+    shared.set(index, checks);
+  }
+  return checks;
+}
+
+function hasStalePersistedPluginFilesShared(index: InstalledPluginIndex): boolean {
+  const checks = getSharedPersistedPluginFileChecks(index);
+  if (!checks) {
+    return hasStalePersistedPluginFiles(index);
+  }
+  return (checks.stale ??= hasStalePersistedPluginFiles(index));
+}
+
+function hasMismatchedPersistedBundledRootShared(
+  index: InstalledPluginIndex,
+  env: NodeJS.ProcessEnv,
+): boolean {
+  const checks = getSharedPersistedPluginFileChecks(index);
+  if (!checks) {
+    return hasMismatchedPersistedBundledRoot(index, env);
+  }
+  // 结论还取决于 env（内置插件目录、overlay 都从 env 解析），env 换了对象就重算。
+  if (checks.mismatchedBundledRoot?.env !== env) {
+    checks.mismatchedBundledRoot = { env, value: hasMismatchedPersistedBundledRoot(index, env) };
+  }
+  return checks.mismatchedBundledRoot.value;
+}
+
 function hasStalePersistedPluginFiles(index: InstalledPluginIndex): boolean {
   const realpathCache = new Map<string, string>();
   return index.plugins.some((plugin) => {
@@ -357,7 +437,7 @@ function requiresDerivedRegistryValidation(
     index.diagnostics.some(({ pluginId, source }) =>
       Boolean(pluginId && source && path.isAbsolute(source) && !fs.existsSync(source)),
     ) ||
-    hasMismatchedPersistedBundledRoot(index, env) ||
+    hasMismatchedPersistedBundledRootShared(index, env) ||
     hasRecoveredInstallRecordsMissingFromPersistedIndex(index, params, env) ||
     hasConfiguredGlobalSourcePluginMissingFromPersistedIndex(params, index, env)
   );
@@ -436,7 +516,9 @@ export function loadPluginRegistrySnapshotWithMetadata(
   const persistedIndex = readPersistedInstalledPluginIndexSync(params);
   let stalePluginFiles: boolean | undefined;
   const hasStalePluginFiles = () =>
-    (stalePluginFiles ??= persistedIndex ? hasStalePersistedPluginFiles(persistedIndex) : false);
+    (stalePluginFiles ??= persistedIndex
+      ? hasStalePersistedPluginFilesShared(persistedIndex)
+      : false);
   if (!persistedIndex) {
     diagnostics.push({
       level: "info",
@@ -479,7 +561,7 @@ export function loadPluginRegistrySnapshotWithMetadata(
     params.discovery === undefined &&
     params.installRecords === undefined &&
     !hasStalePluginFiles() &&
-    !hasMismatchedPersistedBundledRoot(persistedIndex, env)
+    !hasMismatchedPersistedBundledRootShared(persistedIndex, env)
   ) {
     const derivedPluginIds = new Set(derived.index.plugins.map((plugin) => plugin.pluginId));
     for (const plugin of persistedIndex.plugins) {

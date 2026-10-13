@@ -17,6 +17,7 @@ import {
 } from "../plugins/plugin-metadata-snapshot.js";
 import { normalizePluginPolicyId } from "../plugins/plugin-policy-id.js";
 import { withSharedPersistedPluginFileChecks } from "../plugins/plugin-registry-snapshot.js";
+import { withSynchronousArtifactPreservingStateSnapshot } from "../state/openclaw-state-db-readonly.js";
 import type { OpenClawConfig } from "./types.openclaw.js";
 
 function mergeRegistries(registries: readonly PluginManifestRegistry[]): PluginManifestRegistry {
@@ -96,6 +97,16 @@ export function resolveConfigWidePluginMetadataSnapshot(
       return gatewaySnapshot;
     }
   }
+  // 任务99 热点③（同上游 #147861）：这一次全员读配置内对共享状态库只准备一份只读快照，
+  // 不再每读一次就起一个 SQLite 子进程。详见 withSynchronousArtifactPreservingStateSnapshot。
+  return withSynchronousArtifactPreservingStateSnapshot(() =>
+    resolveConfigWidePluginMetadataSnapshotInScope(params),
+  );
+}
+
+function resolveConfigWidePluginMetadataSnapshotInScope(
+  params: ResolveConfigWidePluginMetadataParams,
+): PluginMetadataSnapshot {
   const env = params.env ?? process.env;
   const dirs = listAgentWorkspaceDirs(params.config, env);
   const workspaceDirs: Array<string | undefined> = dirs.length ? dirs : [undefined];

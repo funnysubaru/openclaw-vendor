@@ -34,6 +34,8 @@ describe("resolveProviderModelPolicySurface 传参引用", () => {
     for (const [, params] of mocks.resolveProviderPolicySurface.mock.calls) {
       // toBe = 同一对象引用；若改回「每次新包一层」这里会变红。
       expect((params as { manifestRegistry: unknown }).manifestRegistry).toBe(metadata);
+      // 任务99 热点②（上游 #155241）：刚查过的直接策略结果（未命中=null）一并传下去，下游不再重查。
+      expect((params as { directSurface: unknown }).directSurface).toBeNull();
     }
   });
 

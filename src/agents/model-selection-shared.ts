@@ -35,7 +35,7 @@ import {
   normalizeProviderId,
 } from "./model-ref-shared.js";
 import { findNormalizedProviderValue, parseModelRef } from "./model-selection-normalize.js";
-import { resolveModelCatalogIdentityKey } from "./openai-model-routes.js";
+import { createModelCatalogIdentityKeyResolver } from "./openai-model-routes.js";
 
 export { resolvePrimaryStringValue as normalizeModelSelection } from "@openclaw/normalization-core/string-coerce";
 
@@ -1062,6 +1062,8 @@ function buildAllowedModelSetFromPrepared(
     return allowAll();
   }
 
+  // 任务99 热点②（对齐上游 #145257 及上游此函数的现行写法）：本函数内同步算完，同一 provider 的策略只查一次。
+  const resolveModelCatalogIdentityKey = createModelCatalogIdentityKeyResolver();
   const allowedKeys = new Set<string>();
   const catalogIdentities = new Set(catalog.map(resolveModelCatalogIdentityKey));
   const allowedCatalogIdentities = new Set<string>();
@@ -1322,6 +1324,8 @@ export function buildConfiguredModelCatalog(params: {
 
   const manifestPlugins = resolveConfiguredModelManifestPlugins(params);
   const normalizeModelId = createConfiguredProviderCatalogModelIdNormalizer({ manifestPlugins });
+  // 任务99 热点②（对齐上游 #145257 及上游此函数的现行写法）：本函数内同步算完，同一 provider 的策略只查一次。
+  const resolveModelCatalogIdentityKey = createModelCatalogIdentityKeyResolver();
   const capturedByIdentity = params.catalog?.length
     ? new Map(
         dedupeByKey(params.catalog, resolveModelCatalogIdentityKey).map((entry) => [
@@ -1628,6 +1632,8 @@ export function createModelVisibilityPolicyWithFallbacks(
   const { visibility, policyAliasIndex, selectionAliasIndex, configuredCatalog } = prepared;
   const wildcardModelKeys = visibility.wildcardModelKeys;
   const allowed = buildAllowedModelSetFromPrepared(params, prepared);
+  // 任务99 热点②（对齐上游 #145257 及上游此函数的现行写法）：本函数内同步算完，同一 provider 的策略只查一次。
+  const resolveModelCatalogIdentityKey = createModelCatalogIdentityKeyResolver();
   const configuredKeys = new Set(configuredCatalog.map(resolveModelCatalogIdentityKey));
   const retainedKeys = new Set<string>();
   const addConfiguredRef = (

@@ -11,6 +11,7 @@ import type {
 import {
   createProviderModelRoutesResolver,
   resolveProviderModelCatalogId,
+  resolveProviderModelPolicySurface,
 } from "../plugins/provider-model-routes.js";
 import type { ModelCatalogEntry } from "./model-catalog.types.js";
 import { splitTrailingAuthProfile } from "./model-ref-profile.js";
@@ -74,11 +75,40 @@ export const openAIModelCatalogRoutePolicy =
 export function resolveModelCatalogIdentityKey(
   entry: Pick<ModelCatalogEntry, "provider" | "id">,
 ): string {
+  return resolveModelCatalogIdentityKeyWithPolicies(entry);
+}
+
+/**
+ * Reuses each provider policy only for one synchronous catalog operation.
+ *
+ * 回搬上游 #145257（任务99 热点②）：模型目录的去重 / 可见性判断要对每个模型算一次身份键，
+ * 原写法每算一次都重新查一遍该 provider 的策略；Windows 上每查一次要读几次环境变量
+ * （本机实测一次 3.6～6.7 微秒），启动期合计十几秒。这里按 provider 记住查到的策略
+ * （未命中的 null 也记住），只在调用方这一次处理内有效：调用方每次处理新建一个，
+ * 不跨 await 复用（await 期间插件归属可能变化），所以插件重装 / 配置热重载后自然重新查。
+ */
+export function createModelCatalogIdentityKeyResolver() {
+  const policies = new Map<string, ReturnType<typeof resolveProviderModelPolicySurface>>();
+  return (entry: Pick<ModelCatalogEntry, "provider" | "id">) =>
+    resolveModelCatalogIdentityKeyWithPolicies(entry, policies);
+}
+
+function resolveModelCatalogIdentityKeyWithPolicies(
+  entry: Pick<ModelCatalogEntry, "provider" | "id">,
+  policies?: Map<string, ReturnType<typeof resolveProviderModelPolicySurface>>,
+): string {
   const provider = normalizeProviderId(entry.provider);
+  const modelId = splitTrailingAuthProfile(entry.id).model;
+  let surface = policies?.get(provider);
+  if (policies && surface === undefined) {
+    surface = resolveProviderModelPolicySurface(provider);
+    policies.set(provider, surface);
+  }
   const id =
     resolveProviderModelCatalogId({
       provider,
-      modelId: splitTrailingAuthProfile(entry.id).model,
+      modelId,
+      surface,
     }) ?? entry.id;
   return JSON.stringify([provider, id]);
 }

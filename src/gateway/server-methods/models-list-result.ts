@@ -30,6 +30,7 @@ import {
   RUNTIME_MODEL_VISIBILITY_NORMALIZATION,
 } from "../../agents/model-visibility-policy.js";
 import {
+  createModelCatalogIdentityKeyResolver,
   createOpenAIModelRoutesResolver,
   openAIModelCatalogRoutePolicy,
   resolveModelCatalogIdentityKey,
@@ -572,17 +573,21 @@ export async function prepareModelsListResult(
   });
   return {
     isCurrent: () => isCurrent() && projector.isCurrent(),
-    read: () => ({
-      models: readCatalog()
-        .filter(matchesProvider)
-        .map((entry) => {
-          const evaluation = evaluations.get(resolveModelCatalogIdentityKey(entry));
-          if (!evaluation) {
-            throw new Error("Model catalog publication omitted prepared auth evaluation");
-          }
-          return projectPublic(entry, evaluation);
-        }),
-      ...outcomeProjection,
-    }),
+    read: () => {
+      // 回搬上游 #145257 的用法（任务99 热点②）：每次发布新建一个解析器，同一 provider 的策略只查一次。
+      const keyOf = createModelCatalogIdentityKeyResolver();
+      return {
+        models: readCatalog()
+          .filter(matchesProvider)
+          .map((entry) => {
+            const evaluation = evaluations.get(keyOf(entry));
+            if (!evaluation) {
+              throw new Error("Model catalog publication omitted prepared auth evaluation");
+            }
+            return projectPublic(entry, evaluation);
+          }),
+        ...outcomeProjection,
+      };
+    },
   };
 }

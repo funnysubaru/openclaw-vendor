@@ -9,6 +9,7 @@ import {
 } from "./model-catalog-route.js";
 import type { ModelCatalogEntry } from "./model-catalog.types.js";
 import {
+  createModelCatalogIdentityKeyResolver,
   openAIModelCatalogRoutePolicy,
   resolveModelCatalogIdentityKey,
 } from "./openai-model-routes.js";
@@ -19,9 +20,13 @@ export function createModelCatalogView(params: {
   catalog: ModelCatalogEntry[];
   routeVariants?: readonly ModelCatalogEntry[];
 }) {
+  // 任务99 热点②（对齐上游 #145257 及上游此函数的现行写法）：建索引与去重在这里同步做完，
+  // 同一 provider 的策略只查一次。返回的 variantsOf 可能在 await / 插件重载之后才被调用，
+  // 所以它照旧每次现查，不复用这个解析器（与上游一致）。
+  const keyOf = createModelCatalogIdentityKeyResolver();
   const variantsByKey = new Map<string, ModelCatalogEntry[]>();
   for (const entry of params.routeVariants ?? params.catalog) {
-    const key = resolveModelCatalogIdentityKey(entry);
+    const key = keyOf(entry);
     const variants = variantsByKey.get(key) ?? [];
     variants.push(entry);
     variantsByKey.set(key, variants);
@@ -29,7 +34,7 @@ export function createModelCatalogView(params: {
   const variantsOf = (entry: Pick<ModelCatalogEntry, "provider" | "id">) =>
     variantsByKey.get(resolveModelCatalogIdentityKey(entry));
   return {
-    logicalEntries: dedupeByKey(params.catalog, resolveModelCatalogIdentityKey),
+    logicalEntries: dedupeByKey(params.catalog, keyOf),
     variantsOf,
     project(entry: ModelCatalogEntry, evaluation: ModelAuthAvailabilityEvaluation) {
       const projection: ModelCatalogRouteProjection =

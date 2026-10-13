@@ -9,7 +9,10 @@ import { loadBundledProviderStaticCatalogContextModels } from "./embedded-agent-
 import { modelCatalogRowToEntry } from "./model-catalog-entry.js";
 import { compareModelCatalogEntries } from "./model-catalog-order.js";
 import type { ModelCatalogSnapshot } from "./model-catalog.types.js";
-import { resolveModelCatalogIdentityKey } from "./openai-model-routes.js";
+import {
+  createModelCatalogIdentityKeyResolver,
+  resolveModelCatalogIdentityKey,
+} from "./openai-model-routes.js";
 import {
   getPreparedModelFullCatalogAuth,
   setPreparedModelFullCatalogAuth,
@@ -234,15 +237,17 @@ export function materializePreparedModelCatalog(
   // Preserve inventory reads before capability preparation when the snapshot has accessors.
   const materialized = { ...snapshot };
   const sourceEntries = snapshot.entries;
+  // 回搬上游 #145257（任务99 热点②）：本函数同步跑完，同一 provider 的策略只查一次。
+  const identityKey = createModelCatalogIdentityKeyResolver();
   const runtimeByKey = new Map(
     runtimeCapabilityModels.map(({ provider, modelId, model }) => [
-      resolveModelCatalogIdentityKey({ provider, id: modelId }),
+      identityKey({ provider, id: modelId }),
       modelCatalogRowToEntry(model),
     ]),
   );
   const project = (entries: ModelCatalogSnapshot["entries"]) =>
     entries.map((entry) => {
-      const runtime = runtimeByKey.get(resolveModelCatalogIdentityKey(entry));
+      const runtime = runtimeByKey.get(identityKey(entry));
       if (!runtime) {
         return entry;
       }
@@ -271,7 +276,7 @@ export function materializePreparedModelCatalog(
           ...configuredRuntimeModels.map(({ model }) => modelCatalogRowToEntry(model)),
           ...(snapshot.staticEntries ?? []),
         ],
-        resolveModelCatalogIdentityKey,
+        identityKey,
       ),
     );
   }

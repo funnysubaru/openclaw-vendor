@@ -23,7 +23,10 @@ import {
   createModelVisibilityPolicy,
   type ModelVisibilityPolicy,
 } from "./model-visibility-policy.js";
-import { resolveModelCatalogIdentityKey } from "./openai-model-routes.js";
+import {
+  createModelCatalogIdentityKeyResolver,
+  resolveModelCatalogIdentityKey,
+} from "./openai-model-routes.js";
 
 type ModelCatalogVisibilityView = "default" | "configured" | "all";
 export type ModelCatalogAuthChecker = (
@@ -66,12 +69,13 @@ function sortModelCatalogEntries(entries: ModelCatalogEntry[]): ModelCatalogEntr
 function isPickerVisibleCatalogEntry(
   entry: ModelCatalogEntry,
   configuredKeys: ReadonlySet<string>,
+  keyOf: (entry: ModelCatalogEntry) => string = resolveModelCatalogIdentityKey,
 ): boolean {
   // Deprecated and disabled rows stay selectable but are picker-hidden.
   // Exact configured refs always remain visible so pinned models never disappear.
   return (
     (entry.status !== "deprecated" && entry.status !== "disabled") ||
-    configuredKeys.has(resolveModelCatalogIdentityKey(entry))
+    configuredKeys.has(keyOf(entry))
   );
 }
 
@@ -126,7 +130,11 @@ export async function prepareLogicalVisibleModelCatalog(
       agentId: params.agentId,
       ...RUNTIME_MODEL_VISIBILITY_NORMALIZATION,
     });
-  const keyOf = resolveModelCatalogIdentityKey;
+  // 任务99 热点②（对齐上游 #145257 及上游此函数的现行写法）：一次同步处理内每个 provider 的
+  // 策略只查一次，不再按模型逐个查（Windows 上每查一次要读几次环境变量，模型多时累计秒级）。
+  // 跨 await 不复用：await 期间插件归属可能变化，所以下面「逐条准备」的循环照旧逐个现查，
+  // await 之后与每次发布（返回的闭包被调用）各自新建一个解析器。
+  const keyOf = createModelCatalogIdentityKeyResolver();
   const projectionCatalog = params.routeVariants?.length ? params.routeVariants : params.catalog;
   const routeVariantsByKey = new Map<string, ModelCatalogEntry[]>();
   for (const entry of projectionCatalog) {
@@ -135,7 +143,8 @@ export async function prepareLogicalVisibleModelCatalog(
     variants.push(entry);
     routeVariantsByKey.set(key, variants);
   }
-  const variantsOf = (entry: ModelCatalogEntry) => routeVariantsByKey.get(keyOf(entry)) ?? [entry];
+  const variantsOf = (entry: ModelCatalogEntry, key = keyOf(entry)) =>
+    routeVariantsByKey.get(key) ?? [entry];
   const { configuredKeys, retainedKeys } = policy;
   const retained = params.catalog.filter((entry) => retainedKeys.has(keyOf(entry)));
   const wildcard = policy.allowAny || policy.hasProviderWildcards;
@@ -151,13 +160,13 @@ export async function prepareLogicalVisibleModelCatalog(
         ];
   const readers = new Map<string, () => LogicalModelCatalogEntryState>();
   for (const entry of candidates) {
-    const key = keyOf(entry);
+    const key = resolveModelCatalogIdentityKey(entry);
     if (!readers.has(key)) {
-      const variants = variantsOf(entry);
+      const variants = variantsOf(entry, key);
       readers.set(key, await params.prepareEntry(variants[0] ?? entry, variants));
     }
   }
-  const catalogKeys = new Set(params.catalog.map(keyOf));
+  const catalogKeys = new Set(params.catalog.map(createModelCatalogIdentityKeyResolver()));
   const projections = new Map<
     ModelCatalogEntry,
     {
@@ -170,10 +179,12 @@ export async function prepareLogicalVisibleModelCatalog(
     }
   >();
   return () => {
+    // 每次发布各用一个新的解析器（见上方任务99 注释）。
+    const publicationKeyOf = createModelCatalogIdentityKeyResolver();
     // Membership and row availability consume this one observation after every await.
     const states = new Map([...readers].map(([key, read]) => [key, read()]));
     const getEntryState = (entry: ModelCatalogEntry) => {
-      const state = states.get(keyOf(entry));
+      const state = states.get(publicationKeyOf(entry));
       if (!state) {
         throw new Error("Model catalog publication omitted prepared entry state");
       }
@@ -200,14 +211,14 @@ export async function prepareLogicalVisibleModelCatalog(
           row = projectModelCatalogEntryForRoute({
             entry,
             projection,
-            catalog: variantsOf(entry),
+            catalog: variantsOf(entry, publicationKeyOf(entry)),
             ...(cached.overrides ? { overrides: cached.overrides } : {}),
           }).entry;
           cached.rows.set(route, row);
         }
         return row;
       });
-      return sortModelCatalogEntries(dedupeByKey(projected, resolveModelCatalogIdentityKey));
+      return sortModelCatalogEntries(dedupeByKey(projected, publicationKeyOf));
     };
     if (params.view === "all") {
       return projectEntries(params.catalog);
@@ -228,12 +239,15 @@ export async function prepareLogicalVisibleModelCatalog(
           view: params.view,
         }),
       ),
-    ).filter((entry) => catalogKeys.has(keyOf(entry)) || configuredKeys.has(keyOf(entry)));
-    const preferredKeys = new Set([...visible, ...retained].map(keyOf));
+    ).filter(
+      (entry) =>
+        catalogKeys.has(publicationKeyOf(entry)) || configuredKeys.has(publicationKeyOf(entry)),
+    );
+    const preferredKeys = new Set([...visible, ...retained].map(publicationKeyOf));
     const preferred: ModelCatalogEntry[] = [];
     const routeBacked = new Set<ModelCatalogEntry>();
     for (const entry of params.catalog) {
-      const key = keyOf(entry);
+      const key = publicationKeyOf(entry);
       const preferredKey = preferredKeys.has(key);
       const wildcardRoute =
         policy.allowAny ||
@@ -259,7 +273,7 @@ export async function prepareLogicalVisibleModelCatalog(
     }
     const kept = visible.filter((entry) => {
       const state = getEntryState(entry);
-      const configured = configuredKeys.has(keyOf(entry));
+      const configured = configuredKeys.has(publicationKeyOf(entry));
       return (
         (state.compatible || configured) &&
         (!state.routeManaged || configured || routeBacked.has(entry))
@@ -267,7 +281,7 @@ export async function prepareLogicalVisibleModelCatalog(
     });
     // Selected physical routes must lead dedupe so sibling metadata cannot win.
     return projectEntries([...preferred, ...kept, ...retained, ...routeBacked]).filter((entry) =>
-      isPickerVisibleCatalogEntry(entry, configuredKeys),
+      isPickerVisibleCatalogEntry(entry, configuredKeys, publicationKeyOf),
     );
   };
 }

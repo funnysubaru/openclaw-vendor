@@ -15,6 +15,7 @@ import {
   toAgentStoreSessionKey,
 } from "../../routing/session-key.js";
 import { runQueuedStoreWrite, type StoreWriterTiming } from "../../shared/store-writer-queue.js";
+import { waitForAgentDatabaseStartupAdmission } from "../../state/agent-startup-admission.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import {
@@ -225,6 +226,18 @@ export async function runExclusiveSqliteSessionWrite<T>(
       : {}),
   });
   try {
+    // ADR-0033 任务84(c) 启动死锁修复：进写队列之前先等完该库的后台启动准入，不在占着写队列时
+    // 再等。否则：启动期的中断会话恢复扫描先占住某员工库的写队列 → 队列里异步开库
+    // （withOpenClawAgentDatabaseAsync）等该员工准入；而准入 migrate 阶段的转录对账也要进
+    // 同一条写队列，排在恢复扫描后面 → 两边互等，gateway 永远停在 starting（2026-10-23 live
+    // 实证：cron 跑着时强杀、留下 running 会话，之后每次启动都卡）。对齐上游做法：上游
+    // session-accessor.sqlite-artifact-cleanup 也是先 await waitForAgentDatabasePreparation
+    // 再取写入资格。准入自己的写入经异步上下文豁免（返回 undefined，不等自己）；不在准入期
+    // 时也返回 undefined，正常写入不多付一个 await。关停 / 热重启时等待随调度器信号中止。
+    const admission = waitForAgentDatabaseStartupAdmission(databaseOptions.agentId);
+    if (admission) {
+      await admission;
+    }
     const result = await runQueuedStoreWrite({
       queues: SQLITE_SESSION_WRITER_QUEUES,
       storePath,

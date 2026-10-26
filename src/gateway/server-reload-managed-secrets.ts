@@ -120,6 +120,9 @@ type HotReloadHandler = NonNullable<ManagedReloadOptions["onHotReload"]>;
  * 避免任何原值进日志。
  */
 function describeConfigValueShape(value: unknown): string {
+  if (value === UNRESOLVED_PATH) {
+    return "unresolved";
+  }
   if (value === undefined) {
     return "absent";
   }
@@ -138,16 +141,39 @@ function describeConfigValueShape(value: unknown): string {
   return typeof value;
 }
 
-/** 按 diffConfigPaths 产出的点分路径取值；中途断掉返回 undefined（显示为 absent）。 */
+/** 路径有多种拆法都能取到值时的占位：宁可说「解析不了」，也不冒充成 absent。 */
+const UNRESOLVED_PATH = Symbol("unresolved-config-path");
+
+/**
+ * 按 diffConfigPaths 产出的点分路径取值。diffConfigPaths 不转义键里的点，合法配置键本身
+ * 可能含点（如 Matrix 房间 `channels.matrix.rooms["!room:example.org"]`），所以每一层都尝试
+ * 把后续若干段拼回一个键：唯一一种拆法命中 → 返回该值；一种都不命中 → undefined（显示为
+ * absent）；多种拆法都命中 → UNRESOLVED_PATH（显示为 unresolved）。
+ */
 function readConfigPath(config: unknown, path: string): unknown {
-  let current: unknown = config;
-  for (const segment of path.split(".")) {
-    if (current === null || typeof current !== "object") {
-      return undefined;
+  const segments = path.split(".");
+  const matches: unknown[] = [];
+  const walk = (current: unknown, index: number): void => {
+    if (index === segments.length) {
+      matches.push(current);
+      return;
     }
-    current = (current as Record<string, unknown>)[segment];
+    if (current === null || typeof current !== "object") {
+      return;
+    }
+    const record = current as Record<string, unknown>;
+    for (let end = index + 1; end <= segments.length; end += 1) {
+      const key = segments.slice(index, end).join(".");
+      if (Object.hasOwn(record, key)) {
+        walk(record[key], end);
+      }
+    }
+  };
+  walk(config, 0);
+  if (matches.length === 0) {
+    return undefined;
   }
-  return current;
+  return matches.length === 1 ? matches[0] : UNRESOLVED_PATH;
 }
 
 /**

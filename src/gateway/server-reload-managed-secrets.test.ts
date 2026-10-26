@@ -202,4 +202,19 @@ describe("describeChannelDiffShapes", () => {
     expect(text).not.toContain("LINE_TOKEN");
     expect(text).not.toContain("8443");
   });
+
+  // 键名本身含点（Matrix 房间 id）时不能误报成 absent；拆法有歧义时标 unresolved。
+  it("resolves dotted keys and marks ambiguous paths as unresolved", () => {
+    const room = "!room:example.org";
+    const previous = { channels: { matrix: { rooms: { [room]: { requireMention: true } } } } };
+    const next = { channels: { matrix: { rooms: { [room]: { requireMention: false } } } } };
+    expect(
+      describeChannelDiffShapes(previous, next, [`channels.matrix.rooms.${room}.requireMention`]),
+    ).toBe(`channels.matrix.rooms.${room}.requireMention: boolean -> boolean`);
+
+    const ambiguous = { channels: { x: { "a.b": 1, a: { b: "v" } } } };
+    expect(describeChannelDiffShapes(ambiguous, {}, ["channels.x.a.b"])).toBe(
+      "channels.x.a.b: unresolved -> absent",
+    );
+  });
 });

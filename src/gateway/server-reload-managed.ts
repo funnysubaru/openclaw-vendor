@@ -316,6 +316,7 @@ export function startManagedGatewayConfigReloader(
     prepareRuntimeCandidate,
     tryPrepareRuntimeSecrets,
     applyHotReload,
+    logReload: params.logReload,
   });
 
   let lastCommittedRuntimeConfig: OpenClawConfig | undefined;

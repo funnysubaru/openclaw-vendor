@@ -113,6 +113,64 @@ type EffectiveConfigUnchangedHandler = NonNullable<
 >;
 type HotReloadHandler = NonNullable<ManagedReloadOptions["onHotReload"]>;
 
+/**
+ * 诊断用（Yuiclaw ADR-0033 任务 119）：描述某个配置值的「形状」，绝不包含值本身。
+ * channels.* 下面挂着渠道 token / secret，所以只输出类型、字符串长度、数组长度、
+ * 对象的 key 列表（key 是字段名或账号 id，不是机密）；数字、布尔同样只给类型，
+ * 避免任何原值进日志。
+ */
+function describeConfigValueShape(value: unknown): string {
+  if (value === undefined) {
+    return "absent";
+  }
+  if (value === null) {
+    return "null";
+  }
+  if (typeof value === "string") {
+    return `string(len=${value.length})`;
+  }
+  if (Array.isArray(value)) {
+    return `array(len=${value.length})`;
+  }
+  if (typeof value === "object") {
+    return `object{${Object.keys(value).toSorted().join(",")}}`;
+  }
+  return typeof value;
+}
+
+/** 按 diffConfigPaths 产出的点分路径取值；中途断掉返回 undefined（显示为 absent）。 */
+function readConfigPath(config: unknown, path: string): unknown {
+  let current: unknown = config;
+  for (const segment of path.split(".")) {
+    if (current === null || typeof current !== "object") {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
+/**
+ * 诊断用（Yuiclaw ADR-0033 任务 119）：热重载时「活动密钥快照」与「新准备的运行时配置」
+ * 之间的 channels.* 差异会让渠道（如 LINE）重启，而渠道重启要等在途请求结束——
+ * 1.16.0 上添加订阅卡 5 分钟就是这么来的，但写入的文件里并没有改 channels.*，
+ * 隔离副本也复现不出，只能在真实环境抓这份差异。
+ * 输出每条路径 + 新旧值形状，例如 `channels.line.accessToken: string(len=172) -> string(len=0)`。
+ * 安全边界：只拼路径与形状，绝不输出值（含渠道 token）。
+ */
+export function describeChannelDiffShapes(
+  previousConfig: unknown,
+  nextConfig: unknown,
+  paths: readonly string[],
+): string {
+  return paths
+    .map(
+      (path) =>
+        `${path}: ${describeConfigValueShape(readConfigPath(previousConfig, path))} -> ${describeConfigValueShape(readConfigPath(nextConfig, path))}`,
+    )
+    .join("; ");
+}
+
 export function createManagedReloadSecretHandlers(options: {
   params: Pick<
     ManagedGatewayConfigReloaderParams,
@@ -127,8 +185,11 @@ export function createManagedReloadSecretHandlers(options: {
   prepareRuntimeCandidate: PrepareRuntimeCandidate;
   tryPrepareRuntimeSecrets: TryPrepareRuntimeSecrets;
   applyHotReload: ReturnType<typeof createGatewayReloadHandlers>["applyHotReload"];
+  /** 可选：只用于下方 channels.* 差异诊断 warn；测试等不传时静默。 */
+  logReload?: { warn: (msg: string) => void };
 }) {
-  const { params, prepareRuntimeCandidate, tryPrepareRuntimeSecrets, applyHotReload } = options;
+  const { params, prepareRuntimeCandidate, tryPrepareRuntimeSecrets, applyHotReload, logReload } =
+    options;
   const onEffectiveConfigUnchanged: EffectiveConfigUnchangedHandler = async (
     nextConfig,
     transactionOwnership,
@@ -330,14 +391,34 @@ export function createManagedReloadSecretHandlers(options: {
       params.assertRuntimeSecurityConfig?.(prepared.config, transactionOwnership.runtimeEnv?.env);
       // Resolution can change channel lifetimes even when only a provider
       // definition changed. Rebuild each attempt so a lost CAS leaves no targets.
-      const resolvedChannelPlan = buildGatewayReloadPlan(
-        previousSnapshot
-          ? diffConfigPaths(previousSnapshot.config, prepared.config).filter(
-              (path) => path === "channels" || path.startsWith("channels."),
-            )
-          : [],
-        { candidateConfig: prepared.config },
-      );
+      const resolvedChannelPaths = previousSnapshot
+        ? diffConfigPaths(previousSnapshot.config, prepared.config).filter(
+            (path) => path === "channels" || path.startsWith("channels."),
+          )
+        : [];
+      const resolvedChannelPlan = buildGatewayReloadPlan(resolvedChannelPaths, {
+        candidateConfig: prepared.config,
+      });
+      // 诊断（Yuiclaw ADR-0033 任务 119）：解析出来的 channels.* 差异要重启渠道时，
+      // 把触发重启的路径和新旧值形状记下来，用于在真实环境定位「文件没改渠道却重启了 LINE」。
+      // 只打路径与形状，不打值（describeChannelDiffShapes 保证）。
+      if (
+        previousSnapshot &&
+        (resolvedChannelPlan.restartChannels.size > 0 ||
+          (resolvedChannelPlan.restartChannelAccounts?.size ?? 0) > 0)
+      ) {
+        logReload?.warn(
+          `config hot reload: resolved channel diff restarts channels [${[
+            ...resolvedChannelPlan.restartChannels,
+          ].join(",")}] accounts [${[...(resolvedChannelPlan.restartChannelAccounts ?? [])]
+            .map(([channel, ids]) => `${channel}:${[...ids].join("|")}`)
+            .join(",")}]; paths: ${describeChannelDiffShapes(
+            previousSnapshot.config,
+            prepared.config,
+            resolvedChannelPaths,
+          )}`,
+        );
+      }
       plan.restartChannels = new Set([...authoredChannels, ...resolvedChannelPlan.restartChannels]);
       plan.restartChannelAccounts = new Map(
         [...authoredAccountTargets].map(([channel, ids]) => [channel, new Set(ids)]),

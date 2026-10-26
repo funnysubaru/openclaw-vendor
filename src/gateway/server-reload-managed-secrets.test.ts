@@ -16,7 +16,10 @@ import {
 import { buildGatewayReloadPlan } from "./config-reload-plan.js";
 import type { GatewayConfigReloadTransactionOwnership } from "./config-reload.js";
 import type { ManagedGatewayConfigReloaderParams } from "./server-reload-contracts.js";
-import { createManagedReloadSecretHandlers } from "./server-reload-managed-secrets.js";
+import {
+  createManagedReloadSecretHandlers,
+  describeChannelDiffShapes,
+} from "./server-reload-managed-secrets.js";
 import { createRuntimeSecretsActivator } from "./server-startup-config.js";
 
 vi.mock("../agents/context.js", () => ({ refreshContextWindowCache: vi.fn() }));
@@ -163,3 +166,40 @@ describe.each([true, false])(
     });
   },
 );
+
+// Yuiclaw ADR-0033 任务 119：渠道差异诊断日志只能带路径与形状，渠道 token 等值绝不能进日志。
+describe("describeChannelDiffShapes", () => {
+  it("reports paths and value shapes without leaking values", () => {
+    const secret = "line-channel-access-token-SECRET";
+    const previous = {
+      channels: { line: { channelAccessToken: secret, enabled: true, port: 8443 } },
+    };
+    const next = {
+      channels: {
+        line: {
+          channelAccessToken: { source: "env", id: "LINE_TOKEN" },
+          enabled: false,
+          accounts: { default: { channelSecret: "another-SECRET-value" } },
+        },
+      },
+    };
+    const text = describeChannelDiffShapes(previous, next, [
+      "channels.line.channelAccessToken",
+      "channels.line.enabled",
+      "channels.line.port",
+      "channels.line.accounts",
+    ]);
+
+    expect(text).toBe(
+      [
+        `channels.line.channelAccessToken: string(len=${secret.length}) -> object{id,source}`,
+        "channels.line.enabled: boolean -> boolean",
+        "channels.line.port: number -> absent",
+        "channels.line.accounts: absent -> object{default}",
+      ].join("; "),
+    );
+    expect(text).not.toContain("SECRET");
+    expect(text).not.toContain("LINE_TOKEN");
+    expect(text).not.toContain("8443");
+  });
+});

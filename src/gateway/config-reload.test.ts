@@ -2632,6 +2632,235 @@ describe("startGatewayConfigReloader", () => {
     await harness.reloader.stop();
   });
 
+  // Yuiclaw ADR-0033 任务 119.2：订阅激活写配置后，热重载已把运行时切到新配置
+  // （markRuntimeCommitted），收尾前自己的文件回声把进度号加一 → assertCurrent 判
+  // superseded、回执转交 watcher。watcher 重放同 hash 时走「配置未变」分支，真实环境里
+  // 源快照快路径的严格比较（已解析快照 vs 未解析 nextConfig）必然不等再判 superseded，
+  // 回执从此无人结算，激活永远 await。这里用 onEffectiveConfigUnchanged 抛 superseded
+  // 模拟那次严格比较，锁住「已提交运行时的同一份写入，回声重放必须直接结算 applied」。
+  it("settles a runtime-committed write as applied when its own watcher echo supersedes it", async () => {
+    const application = createRuntimeConfigWriteApplication();
+    const readSnapshot = vi.fn(async () => makeZeroDebounceHookSnapshot("committed-echo"));
+    const onHotReload = async (
+      plan: GatewayReloadPlan,
+      nextConfig: OpenClawConfig,
+      ownership: GatewayConfigReloadTransactionOwnership,
+    ) => {
+      ownership.markRuntimeCommitted(nextConfig, plan);
+      // 回声在运行时提交之后、热重载收尾之前到达。
+      harness.watcher.emit("change");
+      return "applied" as const;
+    };
+    const harness = createReloaderHarness(readSnapshot, {
+      onHotReload,
+      onEffectiveConfigUnchanged: async () => {
+        throw new GatewayConfigReloadSupersededError();
+      },
+    });
+    let settled: string | undefined;
+    void application.result.then((status) => {
+      settled = status;
+    });
+
+    harness.emitWrite(
+      attachRuntimeConfigWriteApplication(makeZeroDebounceHookWrite("committed-echo"), application),
+    );
+    await vi.runAllTimersAsync();
+
+    expect(settled).toBe("applied");
+    expect(harness.onHotReload).toHaveBeenCalledOnce();
+    expect(harness.onEffectiveConfigUnchanged).not.toHaveBeenCalled();
+    expect(harness.onConfigRevisionApplied).toHaveBeenCalledWith(expect.any(String));
+    // 第一轮收尾被跳过的「配置已变」广播要补发，客户端才会重新拉 config.get。
+    expect(harness.onConfigCandidateCommitted).toHaveBeenCalledWith(
+      expect.objectContaining({ persistedHash: "committed-echo" }),
+    );
+    await harness.reloader.stop();
+  });
+
+  // 任务 119.2 review #1：插件刷新（plugins.refresh → notifyPluginMetadataChanged）若在
+  // 运行时提交之后、收尾之前到达，同样会把回执转交 watcher，且文件 hash / 源配置都不变。
+  // 短路不能吞掉这次刷新：必须照原路径请求 Gateway 重启，回执结算 restart-pending。
+  it("keeps the plugin metadata restart when a refresh supersedes a runtime-committed write", async () => {
+    const application = createRuntimeConfigWriteApplication();
+    const readSnapshot = vi.fn(async () =>
+      makeZeroDebounceHookSnapshot("committed-plugin-refresh"),
+    );
+    const onHotReload = async (
+      plan: GatewayReloadPlan,
+      nextConfig: OpenClawConfig,
+      ownership: GatewayConfigReloadTransactionOwnership,
+    ) => {
+      ownership.markRuntimeCommitted(nextConfig, plan);
+      harness.reloader.notifyPluginMetadataChanged();
+      return "applied" as const;
+    };
+    const harness = createReloaderHarness(readSnapshot, {
+      onHotReload,
+      onEffectiveConfigUnchanged: async () => {
+        throw new GatewayConfigReloadSupersededError();
+      },
+    });
+    let settled: string | undefined;
+    void application.result.then((status) => {
+      settled = status;
+    });
+
+    harness.emitWrite(
+      attachRuntimeConfigWriteApplication(
+        makeZeroDebounceHookWrite("committed-plugin-refresh"),
+        application,
+      ),
+    );
+    await vi.runAllTimersAsync();
+
+    expect(settled).toBe("restart-pending");
+    expect(harness.onRestart).toHaveBeenCalledOnce();
+    await harness.reloader.stop();
+  });
+
+  // 任务 119.2 review #3：短路里 acceptCurrentRuntimeEcho 最后的 epoch 检查之后还会
+  // await acceptWatchedPaths（本次配置去掉了旧 include 时要等旧 watcher close）。插件刷新若
+  // 恰好在这段等待里到达，短路返回后不能把旧 hash 写回、清掉 watcher 意图——否则下一轮
+  // 同 hash 走「已接受配置回声」分支，刷新要求的 Gateway 重启又被吞掉。
+  it("keeps the plugin metadata restart when a refresh arrives while the echo retires an include", async () => {
+    const application = createRuntimeConfigWriteApplication();
+    const readSnapshot = vi.fn(async () => makeZeroDebounceHookSnapshot("committed-late-refresh"));
+    const onHotReload = async (
+      plan: GatewayReloadPlan,
+      nextConfig: OpenClawConfig,
+      ownership: GatewayConfigReloadTransactionOwnership,
+    ) => {
+      ownership.markRuntimeCommitted(nextConfig, plan);
+      harness.watcher.emit("change");
+      return "applied" as const;
+    };
+    const harness = createReloaderHarness(readSnapshot, {
+      initialIncludedPaths: ["/tmp/retired-include.json5"],
+      onHotReload,
+      onEffectiveConfigUnchanged: async () => {
+        throw new GatewayConfigReloadSupersededError();
+      },
+    });
+    let refreshed = false;
+    harness.watcher.close.mockImplementation(async () => {
+      // 第一次 close 就是短路里退休旧 include：此刻插件刷新到达。
+      if (!refreshed) {
+        refreshed = true;
+        harness.reloader.notifyPluginMetadataChanged();
+      }
+    });
+    let settled: string | undefined;
+    void application.result.then((status) => {
+      settled = status;
+    });
+
+    harness.emitWrite(
+      attachRuntimeConfigWriteApplication(
+        makeZeroDebounceHookWrite("committed-late-refresh"),
+        application,
+      ),
+    );
+    await vi.runAllTimersAsync();
+    harness.watcher.emit("ready");
+    await vi.runAllTimersAsync();
+
+    expect(refreshed).toBe(true);
+    expect(settled).toBe("restart-pending");
+    expect(harness.onRestart).toHaveBeenCalledOnce();
+    await harness.reloader.stop();
+  });
+
+  // 任务 119.2 review #2：短路结算必须沿用原写入回执的事务执行器（originating RPC 的
+  // continuation），不能改用全局 runTransaction 去申请独立 Gateway root。否则回声到达后
+  // Gateway 进入重启排空，独立准入被拒，已生效的写入反而被结算成 failed。
+  it("settles a runtime-committed echo through the write's own transaction while the gateway drains", async () => {
+    let draining = false;
+    const globalTransactions: string[] = [];
+    const application = createRuntimeConfigWriteApplication(async (run) => await run());
+    const readSnapshot = vi.fn(async () => makeZeroDebounceHookSnapshot("committed-draining"));
+    const onHotReload = async (
+      plan: GatewayReloadPlan,
+      nextConfig: OpenClawConfig,
+      ownership: GatewayConfigReloadTransactionOwnership,
+    ) => {
+      ownership.markRuntimeCommitted(nextConfig, plan);
+      harness.watcher.emit("change");
+      // 回声之后 Gateway 开始重启排空：新的独立 root 准入一律拒绝。
+      draining = true;
+      return "applied" as const;
+    };
+    const harness = createReloaderHarness(readSnapshot, {
+      onHotReload,
+      onEffectiveConfigUnchanged: async () => {
+        throw new GatewayConfigReloadSupersededError();
+      },
+      runTransaction: async (run) => {
+        globalTransactions.push(draining ? "refused" : "admitted");
+        if (draining) {
+          throw new Error("gateway is draining for restart");
+        }
+        return await run();
+      },
+    });
+    let settled: string | undefined;
+    void application.result.then((status) => {
+      settled = status;
+    });
+
+    harness.emitWrite(
+      attachRuntimeConfigWriteApplication(
+        makeZeroDebounceHookWrite("committed-draining"),
+        application,
+      ),
+    );
+    await vi.runAllTimersAsync();
+
+    expect(settled).toBe("applied");
+    expect(globalTransactions).not.toContain("refused");
+    await harness.reloader.stop();
+  });
+
+  // 反例：回声读到的是外部改过的另一份配置（hash 不同），短路不能把它当成本次写入，
+  // 回执仍应按原逻辑结算 superseded。
+  it("still settles a runtime-committed write as superseded when the echo carries different bytes", async () => {
+    const application = createRuntimeConfigWriteApplication();
+    const readSnapshot = vi.fn(async () =>
+      makeSnapshot({
+        sourceConfig: { gateway: { reload: {} }, hooks: { enabled: false } },
+        runtimeConfig: { gateway: { reload: {} }, hooks: { enabled: false } },
+        config: { gateway: { reload: {} }, hooks: { enabled: false } },
+        hash: "external-edit",
+      }),
+    );
+    const onHotReload = vi.fn(
+      async (
+        plan: GatewayReloadPlan,
+        nextConfig: OpenClawConfig,
+        ownership: GatewayConfigReloadTransactionOwnership,
+      ) => {
+        if (onHotReload.mock.calls.length === 1) {
+          ownership.markRuntimeCommitted(nextConfig, plan);
+          harness.watcher.emit("change");
+        }
+        return "applied" as const;
+      },
+    );
+    const harness = createReloaderHarness(readSnapshot, { onHotReload });
+    let settled: string | undefined;
+    void application.result.then((status) => {
+      settled = status;
+    });
+
+    harness.emitWrite(
+      attachRuntimeConfigWriteApplication(makeZeroDebounceHookWrite("committed-own"), application),
+    );
+    await vi.runAllTimersAsync();
+
+    expect(settled).toBe("superseded");
+    await harness.reloader.stop();
+  });
+
   it("settles a coalesced in-process write as superseded", async () => {
     const supersededApplication = createRuntimeConfigWriteApplication();
     const appliedApplication = createRuntimeConfigWriteApplication();

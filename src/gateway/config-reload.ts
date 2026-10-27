@@ -265,6 +265,14 @@ export function startGatewayConfigReloader(opts: {
   };
   let startupInternalWriteHash = opts.initialInternalWriteHash ?? null;
   let lastAppliedWriteHash: string | null = null;
+  // Yuiclaw ADR-0033 任务 119.2：最近一次真正把运行时切到新配置（markRuntimeCommitted）
+  // 的那次写入回执，以及它的变更路径。热重载提交运行时之后、收尾 assertCurrent 之前，
+  // 自己写的文件回声会把这次事务判 superseded 并把回执转交给 watcher；watcher 重放时
+  // 靠它认出「运行时其实已经是这份写入」，直接结算回执（见 runReload 的短路）。
+  let runtimeCommittedWrite: {
+    application: RuntimeConfigWriteApplicationClaim;
+    changedPaths: readonly string[];
+  } | null = null;
   let lastSourceOnlyWriteHash: string | null = null;
   let lastSourceOnlyReapplyRuntimeOverlays: ((config: OpenClawConfig) => OpenClawConfig) | null =
     null;
@@ -497,6 +505,9 @@ export function startGatewayConfigReloader(opts: {
         // the newer disk config plans the reverse work instead of diffing stale state.
         commitPublishedRuntimeEnv();
         opts.onRuntimeConfigCommitted?.(plan, runtimeConfig);
+        // 任务 119.2：记下「运行时已切到这次写入」。后续任何一次提交都会覆盖它，
+        // 所以 watcher 短路只会认最新那次真正生效的写入。
+        runtimeCommittedWrite = application ? { application, changedPaths } : null;
         committedRuntimeConfig = runtimeConfig;
         currentConfig = runtimeConfig;
         currentCompareConfig = nextCompareConfig;
@@ -897,6 +908,58 @@ export function startGatewayConfigReloader(opts: {
         snapshot.hash === intentCandidate.persistedHash &&
         diffConfigPaths(intentCandidate.compareConfig, snapshot.sourceConfig).length === 0
       ) {
+        // Yuiclaw ADR-0033 任务 119.2：回执孤立短路。
+        // 业务意图：订阅激活等进程内写入带回执，激活 RPC 会一直 await 它。若上一轮热重载
+        // 已经把运行时切到这份写入（markRuntimeCommitted），只是收尾前被自己的文件回声判
+        // superseded，那么这里读到的同 hash、零源差异的文件就是它本身——运行时已生效，
+        // 只差确认和结算。不能再走 applySnapshot：基线已挪到新配置，会落进「配置未变」
+        // 分支，源快照快路径用严格比较（server-reload-managed-secrets.ts 的
+        // isDeepStrictEqual：已解析密钥的快照 vs 未解析的 nextConfig）必然不等，再判
+        // superseded，回执被原样交回 watcher 却再无人调度，激活卡到重启 gateway。
+        // 边界：
+        // - 只认 markRuntimeCommitted 记下的同一个回执对象（同一次写入），且文件 hash 与
+        //   源配置都没变；外部改过内容（hash 变）照旧走下面的分支、结算 superseded。
+        // - 只处理写入意图为 auto 的热重载路径；需要重启的写入在 applySnapshot 里早已
+        //   结算 restart-pending，到不了这里。
+        // - acceptCurrentRuntimeEcho 内部先 appliedRevision.flush，补上被跳过的
+        //   appliedRevision.apply（markRuntimeCommitted 已 defer 了计划）；它若再被更新的
+        //   写入 supersede，按原逻辑抛出、由外层交回 watcher。
+        // 上游对应：openclaw/openclaw 719715a47b83（#171922）用 acceptCurrentRuntimeEcho
+        // 结算 watcher 已应用的写入；根因修复是 c35b657cf455（#157372，自己的写入不再被
+        // 回声转交）。两者都建在 9-10 之后重写的重载模型上，无法单独回搬，故 fork 内只做
+        // 这个等价短路。下次升 pin 时本文件整体被上游新模型替换，此短路随之作废。
+        if (
+          intentCandidate.application !== undefined &&
+          runtimeCommittedWrite?.application === intentCandidate.application &&
+          resolveConfigWriteFollowUp(intentCandidate.afterWrite).mode === "auto" &&
+          diffConfigPaths(currentSourceConfig, snapshot.sourceConfig).length === 0
+        ) {
+          const committedChangedPaths = runtimeCommittedWrite.changedPaths;
+          await acceptCurrentRuntimeEcho(transactionEpoch, snapshot);
+          runtimeCommittedWrite = null;
+          lastAppliedWriteHash = intentCandidate.persistedHash;
+          if (watcherIntentCandidate === intentCandidate) {
+            watcherIntentCandidate = null;
+            watcherIntentCameFromPendingWrite = false;
+          }
+          // 第一轮收尾被跳过的「配置已变」广播在这里补发，客户端才会重新拉 config.get。
+          if (committedChangedPaths.length > 0) {
+            opts.onConfigCandidateCommitted?.({
+              path: opts.watchPath,
+              persistedHash: intentCandidate.persistedHash,
+              changedPaths: committedChangedPaths,
+            });
+          }
+          opts.log.info(
+            "config reload: settled a runtime-committed write from its own watcher echo",
+          );
+          settleApplication(
+            intentCandidate,
+            opts.hasOutstandingGatewayRestart?.() ? "applied-restart-required" : "applied",
+          );
+          await promoteAcceptedSnapshot(snapshot, "in-process-write");
+          return;
+        }
         lastAppliedWriteHash = intentCandidate.persistedHash;
         try {
           await runAcceptedTransaction(async () => {

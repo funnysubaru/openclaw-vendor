@@ -2632,6 +2632,92 @@ describe("startGatewayConfigReloader", () => {
     await harness.reloader.stop();
   });
 
+  // Yuiclaw ADR-0033 任务 119.2：订阅激活写配置后，热重载已把运行时切到新配置
+  // （markRuntimeCommitted），收尾前自己的文件回声把进度号加一 → assertCurrent 判
+  // superseded、回执转交 watcher。watcher 重放同 hash 时走「配置未变」分支，真实环境里
+  // 源快照快路径的严格比较（已解析快照 vs 未解析 nextConfig）必然不等再判 superseded，
+  // 回执从此无人结算，激活永远 await。这里用 onEffectiveConfigUnchanged 抛 superseded
+  // 模拟那次严格比较，锁住「已提交运行时的同一份写入，回声重放必须直接结算 applied」。
+  it("settles a runtime-committed write as applied when its own watcher echo supersedes it", async () => {
+    const application = createRuntimeConfigWriteApplication();
+    const readSnapshot = vi.fn(async () => makeZeroDebounceHookSnapshot("committed-echo"));
+    const onHotReload = async (
+      plan: GatewayReloadPlan,
+      nextConfig: OpenClawConfig,
+      ownership: GatewayConfigReloadTransactionOwnership,
+    ) => {
+      ownership.markRuntimeCommitted(nextConfig, plan);
+      // 回声在运行时提交之后、热重载收尾之前到达。
+      harness.watcher.emit("change");
+      return "applied" as const;
+    };
+    const harness = createReloaderHarness(readSnapshot, {
+      onHotReload,
+      onEffectiveConfigUnchanged: async () => {
+        throw new GatewayConfigReloadSupersededError();
+      },
+    });
+    let settled: string | undefined;
+    void application.result.then((status) => {
+      settled = status;
+    });
+
+    harness.emitWrite(
+      attachRuntimeConfigWriteApplication(makeZeroDebounceHookWrite("committed-echo"), application),
+    );
+    await vi.runAllTimersAsync();
+
+    expect(settled).toBe("applied");
+    expect(harness.onHotReload).toHaveBeenCalledOnce();
+    expect(harness.onEffectiveConfigUnchanged).not.toHaveBeenCalled();
+    expect(harness.onConfigRevisionApplied).toHaveBeenCalledWith(expect.any(String));
+    // 第一轮收尾被跳过的「配置已变」广播要补发，客户端才会重新拉 config.get。
+    expect(harness.onConfigCandidateCommitted).toHaveBeenCalledWith(
+      expect.objectContaining({ persistedHash: "committed-echo" }),
+    );
+    await harness.reloader.stop();
+  });
+
+  // 反例：回声读到的是外部改过的另一份配置（hash 不同），短路不能把它当成本次写入，
+  // 回执仍应按原逻辑结算 superseded。
+  it("still settles a runtime-committed write as superseded when the echo carries different bytes", async () => {
+    const application = createRuntimeConfigWriteApplication();
+    const readSnapshot = vi.fn(async () =>
+      makeSnapshot({
+        sourceConfig: { gateway: { reload: {} }, hooks: { enabled: false } },
+        runtimeConfig: { gateway: { reload: {} }, hooks: { enabled: false } },
+        config: { gateway: { reload: {} }, hooks: { enabled: false } },
+        hash: "external-edit",
+      }),
+    );
+    const onHotReload = vi.fn(
+      async (
+        plan: GatewayReloadPlan,
+        nextConfig: OpenClawConfig,
+        ownership: GatewayConfigReloadTransactionOwnership,
+      ) => {
+        if (onHotReload.mock.calls.length === 1) {
+          ownership.markRuntimeCommitted(nextConfig, plan);
+          harness.watcher.emit("change");
+        }
+        return "applied" as const;
+      },
+    );
+    const harness = createReloaderHarness(readSnapshot, { onHotReload });
+    let settled: string | undefined;
+    void application.result.then((status) => {
+      settled = status;
+    });
+
+    harness.emitWrite(
+      attachRuntimeConfigWriteApplication(makeZeroDebounceHookWrite("committed-own"), application),
+    );
+    await vi.runAllTimersAsync();
+
+    expect(settled).toBe("superseded");
+    await harness.reloader.stop();
+  });
+
   it("settles a coalesced in-process write as superseded", async () => {
     const supersededApplication = createRuntimeConfigWriteApplication();
     const appliedApplication = createRuntimeConfigWriteApplication();

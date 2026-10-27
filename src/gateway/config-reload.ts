@@ -946,6 +946,13 @@ export function startGatewayConfigReloader(opts: {
         ) {
           const committedChangedPaths = runtimeCommittedWrite.changedPaths;
           await acceptCurrentRuntimeEcho(transactionEpoch, snapshot, intentCandidate.application);
+          // acceptCurrentRuntimeEcho 最后一次 epoch 检查之后还会 await acceptWatchedPaths
+          // （退休旧 include 时要等旧 watcher close）。这段等待里若有插件刷新或新写入到达，
+          // 本事务已过期：抛 superseded，回执留给 watcher 下一轮按新状态处理（插件刷新会
+          // 走上面被排除的路径、请求 Gateway 重启），不能再写回旧 hash、清掉意图。
+          if (configWriteEpoch !== transactionEpoch) {
+            throw new GatewayConfigReloadSupersededError();
+          }
           runtimeCommittedWrite = null;
           lastAppliedWriteHash = intentCandidate.persistedHash;
           if (watcherIntentCandidate === intentCandidate) {

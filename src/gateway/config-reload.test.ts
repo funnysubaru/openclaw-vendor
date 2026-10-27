@@ -2719,6 +2719,58 @@ describe("startGatewayConfigReloader", () => {
     await harness.reloader.stop();
   });
 
+  // 任务 119.2 review #3：短路里 acceptCurrentRuntimeEcho 最后的 epoch 检查之后还会
+  // await acceptWatchedPaths（本次配置去掉了旧 include 时要等旧 watcher close）。插件刷新若
+  // 恰好在这段等待里到达，短路返回后不能把旧 hash 写回、清掉 watcher 意图——否则下一轮
+  // 同 hash 走「已接受配置回声」分支，刷新要求的 Gateway 重启又被吞掉。
+  it("keeps the plugin metadata restart when a refresh arrives while the echo retires an include", async () => {
+    const application = createRuntimeConfigWriteApplication();
+    const readSnapshot = vi.fn(async () => makeZeroDebounceHookSnapshot("committed-late-refresh"));
+    const onHotReload = async (
+      plan: GatewayReloadPlan,
+      nextConfig: OpenClawConfig,
+      ownership: GatewayConfigReloadTransactionOwnership,
+    ) => {
+      ownership.markRuntimeCommitted(nextConfig, plan);
+      harness.watcher.emit("change");
+      return "applied" as const;
+    };
+    const harness = createReloaderHarness(readSnapshot, {
+      initialIncludedPaths: ["/tmp/retired-include.json5"],
+      onHotReload,
+      onEffectiveConfigUnchanged: async () => {
+        throw new GatewayConfigReloadSupersededError();
+      },
+    });
+    let refreshed = false;
+    harness.watcher.close.mockImplementation(async () => {
+      // 第一次 close 就是短路里退休旧 include：此刻插件刷新到达。
+      if (!refreshed) {
+        refreshed = true;
+        harness.reloader.notifyPluginMetadataChanged();
+      }
+    });
+    let settled: string | undefined;
+    void application.result.then((status) => {
+      settled = status;
+    });
+
+    harness.emitWrite(
+      attachRuntimeConfigWriteApplication(
+        makeZeroDebounceHookWrite("committed-late-refresh"),
+        application,
+      ),
+    );
+    await vi.runAllTimersAsync();
+    harness.watcher.emit("ready");
+    await vi.runAllTimersAsync();
+
+    expect(refreshed).toBe(true);
+    expect(settled).toBe("restart-pending");
+    expect(harness.onRestart).toHaveBeenCalledOnce();
+    await harness.reloader.stop();
+  });
+
   // 任务 119.2 review #2：短路结算必须沿用原写入回执的事务执行器（originating RPC 的
   // continuation），不能改用全局 runTransaction 去申请独立 Gateway root。否则回声到达后
   // Gateway 进入重启排空，独立准入被拒，已生效的写入反而被结算成 failed。

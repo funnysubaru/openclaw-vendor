@@ -2678,6 +2678,97 @@ describe("startGatewayConfigReloader", () => {
     await harness.reloader.stop();
   });
 
+  // 任务 119.2 review #1：插件刷新（plugins.refresh → notifyPluginMetadataChanged）若在
+  // 运行时提交之后、收尾之前到达，同样会把回执转交 watcher，且文件 hash / 源配置都不变。
+  // 短路不能吞掉这次刷新：必须照原路径请求 Gateway 重启，回执结算 restart-pending。
+  it("keeps the plugin metadata restart when a refresh supersedes a runtime-committed write", async () => {
+    const application = createRuntimeConfigWriteApplication();
+    const readSnapshot = vi.fn(async () =>
+      makeZeroDebounceHookSnapshot("committed-plugin-refresh"),
+    );
+    const onHotReload = async (
+      plan: GatewayReloadPlan,
+      nextConfig: OpenClawConfig,
+      ownership: GatewayConfigReloadTransactionOwnership,
+    ) => {
+      ownership.markRuntimeCommitted(nextConfig, plan);
+      harness.reloader.notifyPluginMetadataChanged();
+      return "applied" as const;
+    };
+    const harness = createReloaderHarness(readSnapshot, {
+      onHotReload,
+      onEffectiveConfigUnchanged: async () => {
+        throw new GatewayConfigReloadSupersededError();
+      },
+    });
+    let settled: string | undefined;
+    void application.result.then((status) => {
+      settled = status;
+    });
+
+    harness.emitWrite(
+      attachRuntimeConfigWriteApplication(
+        makeZeroDebounceHookWrite("committed-plugin-refresh"),
+        application,
+      ),
+    );
+    await vi.runAllTimersAsync();
+
+    expect(settled).toBe("restart-pending");
+    expect(harness.onRestart).toHaveBeenCalledOnce();
+    await harness.reloader.stop();
+  });
+
+  // 任务 119.2 review #2：短路结算必须沿用原写入回执的事务执行器（originating RPC 的
+  // continuation），不能改用全局 runTransaction 去申请独立 Gateway root。否则回声到达后
+  // Gateway 进入重启排空，独立准入被拒，已生效的写入反而被结算成 failed。
+  it("settles a runtime-committed echo through the write's own transaction while the gateway drains", async () => {
+    let draining = false;
+    const globalTransactions: string[] = [];
+    const application = createRuntimeConfigWriteApplication(async (run) => await run());
+    const readSnapshot = vi.fn(async () => makeZeroDebounceHookSnapshot("committed-draining"));
+    const onHotReload = async (
+      plan: GatewayReloadPlan,
+      nextConfig: OpenClawConfig,
+      ownership: GatewayConfigReloadTransactionOwnership,
+    ) => {
+      ownership.markRuntimeCommitted(nextConfig, plan);
+      harness.watcher.emit("change");
+      // 回声之后 Gateway 开始重启排空：新的独立 root 准入一律拒绝。
+      draining = true;
+      return "applied" as const;
+    };
+    const harness = createReloaderHarness(readSnapshot, {
+      onHotReload,
+      onEffectiveConfigUnchanged: async () => {
+        throw new GatewayConfigReloadSupersededError();
+      },
+      runTransaction: async (run) => {
+        globalTransactions.push(draining ? "refused" : "admitted");
+        if (draining) {
+          throw new Error("gateway is draining for restart");
+        }
+        return await run();
+      },
+    });
+    let settled: string | undefined;
+    void application.result.then((status) => {
+      settled = status;
+    });
+
+    harness.emitWrite(
+      attachRuntimeConfigWriteApplication(
+        makeZeroDebounceHookWrite("committed-draining"),
+        application,
+      ),
+    );
+    await vi.runAllTimersAsync();
+
+    expect(settled).toBe("applied");
+    expect(globalTransactions).not.toContain("refused");
+    await harness.reloader.stop();
+  });
+
   // 反例：回声读到的是外部改过的另一份配置（hash 不同），短路不能把它当成本次写入，
   // 回执仍应按原逻辑结算 superseded。
   it("still settles a runtime-committed write as superseded when the echo carries different bytes", async () => {

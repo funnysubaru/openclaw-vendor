@@ -764,6 +764,9 @@ export function startGatewayConfigReloader(opts: {
   const acceptCurrentRuntimeEcho = async (
     transactionEpoch: number,
     snapshot?: ConfigFileSnapshot,
+    // Yuiclaw ADR-0033 任务 119.2：结算某次写入回执时传入它，沿用该写入 RPC 的事务执行器
+    // （originating root 的 continuation）；不传时与原逻辑一致，走全局 runTransaction。
+    application?: RuntimeConfigWriteApplicationClaim,
   ) => {
     const ownership: GatewayConfigReloadTransactionOwnership = {
       isCurrent: () => configWriteEpoch === transactionEpoch,
@@ -788,7 +791,7 @@ export function startGatewayConfigReloader(opts: {
       if (snapshot?.valid && typeof snapshot.hash === "string") {
         updateAcceptedSnapshot(snapshot.hash, snapshot.parsed);
       }
-    });
+    }, application);
     if (snapshot?.valid) {
       await acceptWatchedPaths(snapshot.includedPaths ?? []);
     }
@@ -921,9 +924,15 @@ export function startGatewayConfigReloader(opts: {
         //   源配置都没变；外部改过内容（hash 变）照旧走下面的分支、结算 superseded。
         // - 只处理写入意图为 auto 的热重载路径；需要重启的写入在 applySnapshot 里早已
         //   结算 restart-pending，到不了这里。
+        // - 插件刷新（notifyPluginMetadataChanged）同样会把回执转交过来且 hash / 源配置不变；
+        //   有未处理的刷新请求时不能短路，必须走下面的 applySnapshot，由它按
+        //   「plugin metadata changed」请求 Gateway 重启并结算 restart-pending。
         // - acceptCurrentRuntimeEcho 内部先 appliedRevision.flush，补上被跳过的
         //   appliedRevision.apply（markRuntimeCommitted 已 defer 了计划）；它若再被更新的
         //   写入 supersede，按原逻辑抛出、由外层交回 watcher。
+        // - 传入 intentCandidate.application，沿用原写入 RPC 的事务执行器，与下面原有重放
+        //   一致；否则会改用全局 runTransaction 申请独立 Gateway root，回声后 Gateway 若已
+        //   进入重启排空，准入被拒，已生效的写入会被错结算成 failed。
         // 上游对应：openclaw/openclaw 719715a47b83（#171922）用 acceptCurrentRuntimeEcho
         // 结算 watcher 已应用的写入；根因修复是 c35b657cf455（#157372，自己的写入不再被
         // 回声转交）。两者都建在 9-10 之后重写的重载模型上，无法单独回搬，故 fork 内只做
@@ -932,10 +941,11 @@ export function startGatewayConfigReloader(opts: {
           intentCandidate.application !== undefined &&
           runtimeCommittedWrite?.application === intentCandidate.application &&
           resolveConfigWriteFollowUp(intentCandidate.afterWrite).mode === "auto" &&
+          pluginMetadataRefreshRequests === pluginMetadataRefreshApplied &&
           diffConfigPaths(currentSourceConfig, snapshot.sourceConfig).length === 0
         ) {
           const committedChangedPaths = runtimeCommittedWrite.changedPaths;
-          await acceptCurrentRuntimeEcho(transactionEpoch, snapshot);
+          await acceptCurrentRuntimeEcho(transactionEpoch, snapshot, intentCandidate.application);
           runtimeCommittedWrite = null;
           lastAppliedWriteHash = intentCandidate.persistedHash;
           if (watcherIntentCandidate === intentCandidate) {

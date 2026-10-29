@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  isCurrentOpenClawCompileCache,
   isUnderOpenClawCompileCacheNamespace,
   maintainOpenClawCompileCache,
   resolveOpenClawCompileCacheDirectory,
@@ -137,7 +138,9 @@ const respawnWithPackagedCompileCacheIfNeeded = () => {
   const desiredDirectory = resolvePackagedCompileCacheDirectory();
   // Windows refuses cache paths over 200 characters (nodejs/node#66438); treat
   // "no safe directory" the same as "already matches" and just leave caching off.
-  if (!desiredDirectory || path.resolve(currentDirectory) === path.resolve(desiredDirectory)) {
+  // Node's reported directory carries its own version leaf, so compare via the
+  // shared predicate instead of exact path equality (it never matched).
+  if (!desiredDirectory || isCurrentOpenClawCompileCache(currentDirectory, desiredDirectory)) {
     return false;
   }
   const env = {

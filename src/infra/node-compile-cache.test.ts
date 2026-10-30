@@ -3,6 +3,7 @@ import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, expect, it } from "vitest";
 import {
+  isCurrentOpenClawCompileCache,
   maintainOpenClawCompileCache,
   resolveOpenClawCompileCacheDirectory,
 } from "../../node-compile-cache.mjs";
@@ -10,6 +11,21 @@ import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const MiB = 1024 * 1024;
+
+it("treats Node's own version leaf below NODE_COMPILE_CACHE as the current cache", () => {
+  const desired = path.resolve("cache", "openclaw", "2026.9.6", "1000-100");
+  const leaf = path.join(desired, "v24.22.1-arm64-964aae3f-501");
+  const env = { NODE_COMPILE_CACHE: desired };
+  expect(isCurrentOpenClawCompileCache(desired, desired, {})).toBe(true);
+  expect(isCurrentOpenClawCompileCache(leaf, desired, env)).toBe(true);
+  // Only Node's single leaf counts, and only when NODE_COMPILE_CACHE proves it.
+  expect(isCurrentOpenClawCompileCache(leaf, desired, {})).toBe(false);
+  expect(isCurrentOpenClawCompileCache(path.join(leaf, "deeper"), desired, env)).toBe(false);
+  expect(
+    isCurrentOpenClawCompileCache(leaf, desired, { NODE_COMPILE_CACHE: path.resolve("cache") }),
+  ).toBe(false);
+  expect(isCurrentOpenClawCompileCache(undefined, desired, env)).toBe(false);
+});
 
 it.each([
   ["another-app", "1000-100"],

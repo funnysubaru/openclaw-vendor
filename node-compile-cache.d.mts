@@ -3,6 +3,11 @@ export function resolveOpenClawCompileCacheDirectory(params: {
   env?: NodeJS.ProcessEnv;
 }): string | undefined;
 export function resolveSafeNodeCompileCacheDirectory(directory: string): string | undefined;
+export function isCurrentOpenClawCompileCache(
+  currentDirectory: string | undefined,
+  directory: string,
+  env?: NodeJS.ProcessEnv,
+): boolean;
 export function isUnderOpenClawCompileCacheNamespace(
   activeDirectory: string | undefined,
   namespaceDirectory: string,

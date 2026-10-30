@@ -48,6 +48,29 @@ export function resolveOpenClawCompileCacheDirectory({ installRoot, env = proces
   return resolveSafeNodeCompileCacheDirectory(path.join(base, "openclaw", version, marker));
 }
 
+// Backport of upstream isCurrentCompileCache (openclaw/openclaw 1b77dd5c65,
+// #169365; still the same predicate on upstream main 2026-10-28), taken alone
+// without the rest of that perf change. Node reports getCompileCacheDir() as a
+// `v<node>-<arch>-<hash>` leaf below the configured directory, never the
+// directory itself, so the launcher's exact comparison never matched and every
+// packaged start respawned once even when the caller had already passed the
+// final directory. Accept that leaf only when NODE_COMPILE_CACHE itself names
+// the desired directory: then the leaf is provably Node's own, not some deeper
+// directory a different owner configured.
+export function isCurrentOpenClawCompileCache(currentDirectory, directory, env = process.env) {
+  if (!currentDirectory) {
+    return false;
+  }
+  const current = path.resolve(currentDirectory);
+  const desired = path.resolve(directory);
+  return (
+    current === desired ||
+    (Boolean(env.NODE_COMPILE_CACHE) &&
+      path.resolve(env.NODE_COMPILE_CACHE) === desired &&
+      path.dirname(current) === desired)
+  );
+}
+
 // Fork-local fix (not present upstream as of this writing - checked `git log
 // <our-pin>..upstream/main -- <these files>`, zero hits): Node reports
 // ALREADY_ENABLED, not ENABLED, whenever a compile cache was already active

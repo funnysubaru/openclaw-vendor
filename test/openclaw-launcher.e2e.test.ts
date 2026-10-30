@@ -1562,6 +1562,44 @@ describe("openclaw launcher", () => {
     },
   );
 
+  it("does not respawn when NODE_COMPILE_CACHE already names the packaged cache directory", async () => {
+    // Node always reports getCompileCacheDir() one level deeper than the
+    // configured directory (a `v<node>-<arch>-<hash>` leaf it owns), so an exact
+    // comparison never matched and every packaged start respawned once even
+    // when the caller (Yuiclaw's gateway launcher) already handed over the
+    // final directory. Mirrors upstream isCurrentCompileCache (#169365).
+    const fixtureRoot = await makeLauncherFixture(fixtureRoots);
+    await fs.writeFile(path.join(fixtureRoot, "package.json"), '{"version":"2026.4.29"}\n');
+    const { resolveOpenClawCompileCacheDirectory } = await import(
+      pathToFileURL(path.join(fixtureRoot, "node-compile-cache.mjs")).href
+    );
+    const desiredDirectory = resolveOpenClawCompileCacheDirectory({
+      installRoot: fixtureRoot,
+      env: { NODE_COMPILE_CACHE: path.join(fixtureRoot, ".node-compile-cache") },
+    });
+    await fs.writeFile(
+      path.join(fixtureRoot, "dist", "entry.js"),
+      [
+        'import module from "node:module";',
+        "process.stdout.write(",
+        '  `${module.getCompileCacheDir?.() ?? "cache:disabled"};respawned:${process.env.OPENCLAW_PACKAGED_COMPILE_CACHE_RESPAWNED ?? "0"}`,',
+        ");",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const result = spawnSync(process.execPath, [path.join(fixtureRoot, "openclaw.mjs")], {
+      cwd: fixtureRoot,
+      env: launcherEnv({ NODE_COMPILE_CACHE: desiredDirectory }),
+      encoding: "utf8",
+    });
+
+    expect(result.status).toBe(0);
+    const [activeDirectory, respawned] = result.stdout.split(";");
+    expect(respawned).toBe("respawned:0");
+    expect(path.dirname(activeDirectory)).toBe(path.resolve(desiredDirectory));
+  });
+
   it.runIf(process.platform !== "win32")(
     "does not respawn native hook relays for packaged compile-cache scoping",
     async () => {

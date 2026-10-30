@@ -12,6 +12,7 @@ import {
   validateWizardStatusParams,
 } from "../../../packages/gateway-protocol/src/index.js";
 import type { OnboardOptions } from "../../commands/onboard-types.js";
+import { runAsGatewayPassiveWait } from "../../process/gateway-work-admission.js";
 import { createNonExitingRuntime, ExitError, type RuntimeEnv } from "../../runtime.js";
 import type { WizardPrompter } from "../../wizard/prompts.js";
 import {
@@ -99,6 +100,15 @@ function findWizardSessionOrRespond(params: {
 }
 
 /** Gateway handlers for the interactive setup wizard session lifecycle. */
+/**
+ * 取向导下一步。没有现成步骤时会一直挂着，等后台向导（可能正在落凭据、等热重载生效）出下一步。
+ * 这段挂起只是被动等待，用 runAsGatewayPassiveWait 包住，免得热重载 / 重启排空把它算成在途请求、
+ * 与向导互等到超时（Yuiclaw ADR-0033 任务 123.3）。
+ */
+async function nextWizardResult(session: WizardSession) {
+  return await runAsGatewayPassiveWait(() => session.next());
+}
+
 export const wizardHandlers: GatewayRequestHandlers = {
   "wizard.start": async ({ params, respond, context }) => {
     if (!assertValidParams(params, validateWizardStartParams, "wizard.start", respond)) {
@@ -142,7 +152,7 @@ export const wizardHandlers: GatewayRequestHandlers = {
       return;
     }
     context.wizardSessions.set(sessionId, session);
-    const result = await session.next();
+    const result = await nextWizardResult(session);
     if (result.done) {
       // Let the runner release setup admission before the terminal response,
       // so an immediate replacement wizard is not rejected as still busy.
@@ -172,7 +182,7 @@ export const wizardHandlers: GatewayRequestHandlers = {
           respond(
             true,
             {
-              ...sanitizeWizardResultForClient(await session.next()),
+              ...sanitizeWizardResultForClient(await nextWizardResult(session)),
               error: validationError,
             },
             undefined,
@@ -184,7 +194,7 @@ export const wizardHandlers: GatewayRequestHandlers = {
         return;
       }
     }
-    const result = await session.next();
+    const result = await nextWizardResult(session);
     if (result.done) {
       // Keep terminal response ordering identical to wizard.start.
       await whenAdmittedWizardSessionSettled(session);

@@ -327,6 +327,53 @@ describe("wizard setup ownership", () => {
     }
   });
 
+  // Yuiclaw ADR-0033 任务 123.3：向导落凭据后要等热重载生效才出下一步，挂着的 wizard.next
+  // 若被热重载 / 重启排空算成在途请求就会互等到超时。它挂着时只对阻塞计数隐身，总量照算。
+  it("does not count a wizard.next parked on the runner as blocking work", async () => {
+    resetGatewayWorkAdmission();
+    const runnerSettled = createDeferred();
+    const tracker = createWizardSessionTracker();
+    const context = {
+      ...tracker,
+      wizardRunner: async (_opts: unknown, _runtime: RuntimeEnv, prompter: WizardPrompter) => {
+        prompter.progress("working");
+        await runnerSettled.promise;
+      },
+    };
+
+    try {
+      let sessionId = "";
+      await runWithGatewayIndependentRootWorkAdmission(async () => {
+        const respond = vi.fn();
+        await expectDefined(
+          wizardHandlers["wizard.start"],
+          "wizard.start test invariant",
+        )({ params: { mode: "local" }, respond, context } as never);
+        sessionId = String(respond.mock.calls[0]?.[1]?.sessionId);
+      });
+      const nextRespond = vi.fn();
+      const parkedNext = runWithGatewayIndependentRootWorkAdmission(async () => {
+        await expectDefined(
+          wizardHandlers["wizard.next"],
+          "wizard.next test invariant",
+        )({ params: { sessionId }, respond: nextRespond, context } as never);
+      });
+
+      // 运行器保留的 wizard.start 根 + 挂着的 wizard.next 根
+      await vi.waitFor(() => expect(getActiveGatewayRootWorkCount()).toBe(2));
+      expect(getActiveGatewayRootWorkCount({ excludeCurrent: true })).toBe(1);
+      expect(nextRespond).not.toHaveBeenCalled();
+
+      runnerSettled.resolve();
+      await parkedNext;
+      expect(nextRespond.mock.calls[0]?.[1]).toMatchObject({ done: true, status: "done" });
+      await vi.waitFor(() => expect(getActiveGatewayRootWorkCount()).toBe(0));
+    } finally {
+      runnerSettled.resolve();
+      resetGatewayWorkAdmission();
+    }
+  });
+
   it("cleans up detached wizard owners when setup lock release fails", async () => {
     resetGatewayWorkAdmission();
     const runnerSettled = createDeferred();

@@ -29,6 +29,7 @@ import {
   runWithGatewayIndependentRootWorkAdmission,
   runWithGatewayIndependentRootWorkContinuation,
   runWithRetainedGatewayRootWork,
+  runAsGatewayPassiveWait,
   runOutsideGatewayRootWorkAdmission,
   tryBeginGatewayPreparedRestartRootWorkAdmission,
   tryBeginGatewayRestartStartupRootWorkAdmission,
@@ -109,6 +110,45 @@ it("classifies draining errors only while an authoritative restart signal or dra
   expect(nextDrainSignal.aborted).toBe(false);
   markGatewayRestartDraining();
   expect(nextDrainSignal.aborted).toBe(true);
+});
+
+// Yuiclaw ADR-0033 任务 123.3：wizard.next 这类请求只是挂着等后台向导出下一步，向导又在等热重载，
+// 若热重载把它算成在途请求就互等到 300 秒超时。被动等待期间对「阻塞计数」不可见，等完恢复计入；
+// 不带 excludeCurrent 的总量（泄漏检测）始终计入。
+it("hides a root from blocking counts only while it passively waits", async () => {
+  const step = createDeferredCore();
+  const afterWait = createDeferredCore();
+  const waitEntered = createDeferredCore();
+  const waitLeft = createDeferredCore();
+  const root = tryBeginGatewayRootWorkAdmission("wizard.next");
+  expect(root).not.toBeNull();
+  const request = root!.run(async () => {
+    await runAsGatewayPassiveWait(async () => {
+      waitEntered.resolve();
+      await step.promise;
+    });
+    waitLeft.resolve();
+    await afterWait.promise;
+  });
+  await waitEntered.promise;
+  expect(getActiveGatewayRootWorkCount({ excludeCurrent: true })).toBe(0);
+  expect(getActiveGatewayRootWorkHolders({ excludeCurrent: true })).toEqual([]);
+  expect(getActiveGatewayRootWorkCount()).toBe(1);
+
+  step.resolve();
+  await waitLeft.promise;
+  expect(getActiveGatewayRootWorkCount({ excludeCurrent: true })).toBe(1);
+  expect(getActiveGatewayRootWorkHolders({ excludeCurrent: true })).toEqual(["wizard.next"]);
+
+  afterWait.resolve();
+  await request;
+  root!.release();
+  expect(getActiveGatewayRootWorkCount()).toBe(0);
+});
+
+it("counts a passive wait outside any root as a no-op", async () => {
+  await expect(runAsGatewayPassiveWait(async () => 42)).resolves.toBe(42);
+  expect(getActiveGatewayRootWorkCount()).toBe(0);
 });
 
 it("counts one nested root chain once and excludes the preparing caller", async () => {

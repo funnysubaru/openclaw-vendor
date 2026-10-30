@@ -2,6 +2,7 @@
 // auto-enable behavior, model defaults, and recovery diagnostics.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConfigFileSnapshot, ModelDefinitionConfig, OpenClawConfig } from "../config/types.js";
+import type { ModelProviderConfigInput } from "../config/types.models.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
 import { buildTestConfigSnapshot } from "./test-helpers.config-snapshots.js";
 
@@ -365,6 +366,87 @@ describe("gateway startup config validation", () => {
     expectPluginAutoEnableFor(sourceConfig);
     expect(configMutate.replaceConfigFile).not.toHaveBeenCalled();
     expect(log.info).not.toHaveBeenCalled();
+  });
+
+  it.each<{ name: string; overlay: ModelProviderConfigInput }>([
+    { name: "API key", overlay: { apiKey: "test-api-key" } },
+    { name: "timeout", overlay: { timeoutSeconds: 600 } },
+    { name: "headers", overlay: { headers: { "X-Test": "test-header" } } },
+    { name: "empty models", overlay: { models: [] } },
+  ])("preserves materialized $name provider overlays after auto-enable", async ({ overlay }) => {
+    // Snapshot source retains authored omissions; its runtime pair has already passed validation.
+    const sourceConfig = {
+      gateway: { mode: "local" },
+      agents: { defaults: { model: "anthropic/claude-sonnet-4-6" } },
+      models: { providers: { anthropic: overlay } },
+      channels: { telegram: { botToken: "test-token" } },
+    } as OpenClawConfig;
+    const runtimeConfig: OpenClawConfig = {
+      ...sourceConfig,
+      agents: {
+        defaults: { ...sourceConfig.agents?.defaults, compaction: { mode: "safeguard" } },
+      },
+      models: { providers: { anthropic: { baseUrl: "", models: [], ...overlay } } },
+      channels: { telegram: { ...sourceConfig.channels?.telegram, dmPolicy: "pairing" } },
+      messages: { ackReactionScope: "group-mentions" },
+    };
+    const snapshot = buildRuntimeSnapshot(sourceConfig, runtimeConfig);
+    mockStartupSnapshot(snapshot);
+    mockRuntimeAutoEnable({
+      ...sourceConfig,
+      channels: { telegram: { ...sourceConfig.channels?.telegram, enabled: true } },
+      plugins: { entries: { anthropic: { enabled: true } } },
+    });
+
+    const result = await loadTestStartup({ minimalTestGateway: false });
+
+    expect(result.snapshot.runtimeConfig).toEqual({
+      ...runtimeConfig,
+      channels: { telegram: { ...runtimeConfig.channels?.telegram, enabled: true } },
+      plugins: { entries: { anthropic: { enabled: true } } },
+    });
+    expect(result.snapshot.config).toBe(result.snapshot.runtimeConfig);
+    expect(result.snapshot.sourceConfig).toBe(sourceConfig);
+    expect(result.snapshot.sourceConfig.models?.providers?.anthropic).toEqual(overlay);
+    expectPluginAutoEnableFor(sourceConfig);
+    expect(runtimeConfig.channels?.telegram?.enabled).toBeUndefined();
+    expect(result.wroteConfig).toBe(false);
+    expect(configIo.writeConfigFile).not.toHaveBeenCalled();
+    expect(configMutate.replaceConfigFile).not.toHaveBeenCalled();
+  });
+
+  // Yuiclaw ADR-0033 任务 123.1：启动时有插件被自动启用，旧实现用未补默认值的 sourceConfig
+  // 重算运行时配置，LINE 渠道级与账号级的 groupPolicy / dmPolicy 默认值全丢；之后任何一次热重载
+  // （如添加订阅）拿补过默认值的新配置去比，判出 channels.line.* absent -> string，误重启 LINE。
+  it("keeps LINE channel and account schema defaults after auto-enable", async () => {
+    const lineAccount = { channelAccessToken: "test-token", channelSecret: "test-secret" };
+    const sourceConfig = {
+      gateway: { mode: "local" },
+      agents: { defaults: { model: "anthropic/claude-sonnet-4-6" } },
+      channels: { line: { enabled: true, accounts: { a1: lineAccount } } },
+    } as OpenClawConfig;
+    const lineDefaults = { dmPolicy: "pairing", groupPolicy: "allowlist" };
+    const runtimeConfig = {
+      ...sourceConfig,
+      channels: {
+        line: {
+          enabled: true,
+          ...lineDefaults,
+          accounts: { a1: { ...lineAccount, ...lineDefaults } },
+        },
+      },
+    } as OpenClawConfig;
+    mockStartupSnapshot(buildRuntimeSnapshot(sourceConfig, runtimeConfig));
+    mockRuntimeAutoEnable({
+      ...sourceConfig,
+      plugins: { entries: { anthropic: { enabled: true } } },
+    });
+
+    const result = await loadTestStartup({ minimalTestGateway: false });
+
+    expect(result.snapshot.config.channels).toEqual(runtimeConfig.channels);
+    expect(result.snapshot.config.plugins?.entries?.anthropic?.enabled).toBe(true);
+    expect(result.snapshot.sourceConfig).toBe(sourceConfig);
   });
 
   it("reuses a CLI preflight snapshot without rereading config", async () => {

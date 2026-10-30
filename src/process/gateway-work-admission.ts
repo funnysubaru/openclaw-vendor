@@ -24,6 +24,8 @@ type GatewayRootWorkAdmission = {
   references: number;
   released: boolean;
   retiredByReset?: true;
+  /** Yuiclaw ADR-0033 任务 123.3：正在被动等待（见 runAsGatewayPassiveWait）的层数。 */
+  passiveWaits?: number;
 };
 
 type GatewayWorkAdmissionState = {
@@ -578,19 +580,50 @@ export function runOutsideGatewayRootWorkAdmission<T>(run: () => T): T {
   return GATEWAY_WORK_ADMISSION_STATE.currentRootWork.exit(run);
 }
 
+/**
+ * Yuiclaw ADR-0033 任务 123.3：当前请求接下来只是挂着等别的任务（典型是 wizard.next 等后台
+ * 设置向导出下一步）时用它包住那段等待。等待期间，这个请求对「要不要先等在途请求结束」的阻塞计数
+ * （excludeCurrent: true，热重载渠道重启前、重启排空前都用它）不可见。
+ *
+ * 为什么：向导落凭据后要等热重载生效才出下一步；热重载若要重启某个渠道，会先等在途请求结束，
+ * 而挂着的 wizard.next 正是在途请求之一 —— 两边互等，直到 300 秒的重载超时才解开。被动等待本身
+ * 不占用任何会被重载影响的资源，排除它是安全的；等待一结束（拿到步骤、开始真正处理）立即恢复计入。
+ * 不带 excludeCurrent 的总量照常计入，泄漏检测不受影响。不在任何请求里调用时等同直接执行。
+ */
+export async function runAsGatewayPassiveWait<T>(wait: () => Promise<T>): Promise<T> {
+  const current = GATEWAY_WORK_ADMISSION_STATE.currentRootWork.getStore();
+  if (!current) {
+    return await wait();
+  }
+  current.passiveWaits = (current.passiveWaits ?? 0) + 1;
+  try {
+    return await wait();
+  } finally {
+    current.passiveWaits -= 1;
+  }
+}
+
+function isBlockingRootWork(
+  admission: GatewayRootWorkAdmission,
+  current: GatewayRootWorkAdmission | undefined,
+  opts: { excludeCurrent?: boolean } | undefined,
+): boolean {
+  if (opts?.excludeCurrent !== true) {
+    return true;
+  }
+  return admission !== current && !(admission.passiveWaits && admission.passiveWaits > 0);
+}
+
 /** Active root requests/ticks, optionally excluding the caller running prepare. */
 export function getActiveGatewayRootWorkCount(opts?: { excludeCurrent?: boolean }): number {
-  let count = GATEWAY_WORK_ADMISSION_STATE.activeRootWork.size;
   const current = GATEWAY_WORK_ADMISSION_STATE.currentRootWork.getStore();
-  if (
-    opts?.excludeCurrent === true &&
-    current &&
-    !current.released &&
-    GATEWAY_WORK_ADMISSION_STATE.activeRootWork.has(current)
-  ) {
-    count -= 1;
+  let count = 0;
+  for (const admission of GATEWAY_WORK_ADMISSION_STATE.activeRootWork) {
+    if (isBlockingRootWork(admission, current, opts)) {
+      count += 1;
+    }
   }
-  return Math.max(0, count);
+  return count;
 }
 
 /** Bounded, deterministic root-owner inventory for shutdown diagnostics. */
@@ -598,7 +631,7 @@ export function getActiveGatewayRootWorkHolders(opts?: { excludeCurrent?: boolea
   const current = GATEWAY_WORK_ADMISSION_STATE.currentRootWork.getStore();
   const counts = new Map<string, number>();
   for (const admission of GATEWAY_WORK_ADMISSION_STATE.activeRootWork) {
-    if (opts?.excludeCurrent === true && admission === current) {
+    if (!isBlockingRootWork(admission, current, opts)) {
       continue;
     }
     counts.set(admission.origin, (counts.get(admission.origin) ?? 0) + 1);

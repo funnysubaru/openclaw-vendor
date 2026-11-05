@@ -35,7 +35,11 @@ export {
   supportsClaudeNativeXhighEffort,
 } from "@openclaw/llm-core";
 
-export const ANTHROPIC_CLAUDE_CODE_VERSION = "2.1.75";
+// Yuiclaw（ADR-0033 任务 73）：对齐上游 #156062 的下限 2.1.280。Anthropic 按 Claude Code 版本放行
+// 订阅（OAuth）请求：claude-fable-5-1 要求 ≥ 2.1.251、claude-opus-5-5 要求 ≥ 2.1.280，旧值 2.1.75 会被拒。
+// 不搬上游 #154098 的本机 `claude --version` 探测：Yuiclaw 订阅走已存储凭据，那条路径上探测不生效。
+// 以后 Anthropic 对新型号再提版本要求时，照 #156062 的做法再提这个常量。
+export const ANTHROPIC_CLAUDE_CODE_VERSION = "2.1.280";
 export const ANTHROPIC_CLAUDE_CODE_BILLING_SYSTEM_BLOCK = `x-anthropic-billing-header: cc_version=${ANTHROPIC_CLAUDE_CODE_VERSION}; cc_entrypoint=sdk-cli;`;
 
 type ReplayModelRef = {

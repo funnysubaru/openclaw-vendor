@@ -384,6 +384,15 @@ describe("buildChannelInboundEventContext", () => {
     });
   });
 
+  it("carries the prompt identifier opt-out without changing routing or identity facts", () => {
+    const ctx = buildTestInboundEventContext({ extra: { OmitPromptIdentifiers: true } });
+
+    expect(ctx.OmitPromptIdentifiers).toBe(true);
+    expect(ctx.SenderId).toBe("u1");
+    expect(ctx.MessageSid).toBe("msg-1");
+    expect(ctx.OriginatingTo).toBe("test:room:room-1");
+  });
+
   it("merges untrusted supplemental group prompt context with extra context", async () => {
     const ctx = buildTestInboundEventContext({
       supplemental: {

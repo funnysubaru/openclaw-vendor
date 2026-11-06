@@ -338,6 +338,24 @@ describe("pruneProcessedHistoryImages", () => {
     expect(firstUser?.content).toBe(PRUNED_HISTORY_MEDIA_REFERENCE_MARKER);
   });
 
+  it("redacts a workspace-relative marker for an absolute fact with a recorded workspace", () => {
+    // Collab patch #1: OmitPromptIdentifiers renders workspace media relative in the prompt.
+    const message = buildPersistedUserTurnMessage({
+      text: "[media attached: inbound/photo.png (image/png)]",
+      media: [
+        {
+          path: "/workspace/inbound/photo.png",
+          workspaceDir: "/workspace",
+          contentType: "image/png",
+        },
+      ],
+    }) as AgentMessage;
+
+    const pruned = expectPrunedMessages([message, ...oldEnoughTail()]);
+    const firstUser = pruned[0] as Extract<AgentMessage, { role: "user" }> | undefined;
+    expect(firstUser?.content).toBe(PRUNED_HISTORY_MEDIA_REFERENCE_MARKER);
+  });
+
   it("does not claim a basename-only marker for an absolute owned fact", () => {
     const message = buildPersistedUserTurnMessage({
       text: "caption mentions [media attached: ./photo.png (image/png)]",

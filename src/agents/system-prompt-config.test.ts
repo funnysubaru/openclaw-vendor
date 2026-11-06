@@ -212,3 +212,21 @@ describe("buildConfiguredAgentSystemPrompt", () => {
     expect(prompt).toContain("## Delegation");
   });
 });
+
+describe("buildConfiguredAgentSystemPrompt omitPromptIdentifiers", () => {
+  it("reads agents.defaults.omitPromptIdentifiers; unset keeps the prompt unchanged", () => {
+    const sessionKey = "agent:main:collab:group:ci:abc";
+    const off = buildPrompt({}, "main", sessionKey);
+    expect(
+      buildPrompt({ agents: { defaults: { omitPromptIdentifiers: false } } }, "main", sessionKey),
+    ).toBe(off);
+    expect(off).toContain(sessionKey);
+    const on = buildPrompt(
+      { agents: { defaults: { omitPromptIdentifiers: true } } },
+      "main",
+      sessionKey,
+    );
+    expect(on).not.toContain(sessionKey);
+    expect(on).not.toContain("/tmp/openclaw");
+  });
+});

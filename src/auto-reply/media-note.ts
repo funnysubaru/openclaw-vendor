@@ -42,19 +42,47 @@ function sanitizeInlineMediaNoteValue(value: string | undefined): string {
     .trim();
 }
 
+/**
+ * Prompt-visible form of a media path or URL. With OmitPromptIdentifiers, an absolute path inside
+ * the fact's recorded workspace renders relative to it, so host paths that embed instance ids stay
+ * out of the prompt. Hydration reads the fact's absolute path, not this text, and history pruning
+ * already matches workspace-relative markers through `fact.workspaceDir`.
+ */
+function displayMediaRef(
+  value: string | undefined,
+  fact: MediaFact,
+  omitIdentifiers: boolean,
+): string | undefined {
+  const workspaceDir = fact.workspaceDir;
+  if (!omitIdentifiers || !value || !workspaceDir || !path.isAbsolute(value)) {
+    return value;
+  }
+  if (!path.isAbsolute(workspaceDir)) {
+    return value;
+  }
+  const relative = path.relative(workspaceDir, value);
+  return relative && !relative.startsWith("..") && !path.isAbsolute(relative) ? relative : value;
+}
+
 function formatMediaAttachedLine(params: {
   fact: MediaFact;
   index?: number;
   total?: number;
+  omitIdentifiers?: boolean;
 }): string {
   const prefix =
     typeof params.index === "number" && typeof params.total === "number"
       ? `[media attached ${params.index}/${params.total}: `
       : "[media attached: ";
-  const pathValue = sanitizeInlineMediaNoteValue(params.fact.path);
+  const omitIdentifiers = params.omitIdentifiers === true;
+  const pathValue = sanitizeInlineMediaNoteValue(
+    displayMediaRef(params.fact.path, params.fact, omitIdentifiers),
+  );
   const typeRaw = sanitizeInlineMediaNoteValue(params.fact.contentType ?? params.fact.kind);
   const typePart = typeRaw ? ` (${typeRaw})` : "";
-  const urlRaw = sanitizeInlineMediaNoteValue(params.fact.url);
+  const urlRaw = sanitizeInlineMediaNoteValue(
+    displayMediaRef(params.fact.url, params.fact, omitIdentifiers),
+  );
   // When the channel mirrors the local path into the fact URL (Telegram album
   // media is the canonical case), rendering ` | ${url}` adds no information
   // and clutters the prompt with `path | path` duplication (issue #47587).
@@ -185,6 +213,7 @@ export function buildInboundMediaNoteProjection(ctx: MsgContext): InboundMediaNo
     return { media: [], mediaIndexes: [] };
   }
   const describedImageIndices = collectDescribedImageAttachmentIndices(ctx);
+  const omitIdentifiers = ctx.OmitPromptIdentifiers === true;
   const media = visibleEntries.map((entry) => ({
     ...entry.fact,
     ...(describedImageIndices.has(entry.index) ? { hydrationSuppressed: true } : {}),
@@ -193,7 +222,7 @@ export function buildInboundMediaNoteProjection(ctx: MsgContext): InboundMediaNo
   const firstVisibleEntry = visibleEntries[0];
   if (visibleEntries.length === 1 && firstVisibleEntry) {
     return {
-      text: formatMediaAttachedLine({ fact: firstVisibleEntry.fact }),
+      text: formatMediaAttachedLine({ fact: firstVisibleEntry.fact, omitIdentifiers }),
       media,
       mediaIndexes,
     };
@@ -207,6 +236,7 @@ export function buildInboundMediaNoteProjection(ctx: MsgContext): InboundMediaNo
         fact: entry.fact,
         index: idx + 1,
         total: count,
+        omitIdentifiers,
       }),
     );
   }

@@ -65,6 +65,32 @@ describe("normalizeMessagesForLlmBoundary", () => {
     expect(output[0]?.content).toBe("Plain historical ask");
   });
 
+  it("omits the persisted sender id when the channel hid identifiers from the prompt", () => {
+    const input = [
+      {
+        role: "user",
+        content: "The launch is Friday",
+        timestamp: 1,
+        __openclaw: { senderId: "alice-id", senderName: "Alice", senderIdHiddenFromPrompt: true },
+      },
+    ];
+
+    const output = normalizeMessagesForLlmBoundary(
+      input as Parameters<typeof normalizeMessagesForLlmBoundary>[0],
+    ) as unknown as Array<{ content?: string }>;
+
+    expect(output[0]?.content).toBe(
+      [
+        markInboundContextLabel("Conversation info:"),
+        "```json",
+        '{"sender":{"name":"Alice"}}',
+        "```",
+        "",
+        "The launch is Friday",
+      ].join("\n"),
+    );
+  });
+
   it("projects persisted sender metadata onto historical group turns", () => {
     const input = [
       {

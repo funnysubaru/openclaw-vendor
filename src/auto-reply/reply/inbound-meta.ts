@@ -261,14 +261,19 @@ function formatChannelStructuredContextLabel(label: unknown): string {
 function buildConversationMentionMetadataPayload(
   ctx: TemplateContext,
   isDirect: boolean,
+  omitIdentifiers: boolean,
 ): Record<string, unknown> {
   return {
     is_group_chat: !isDirect ? true : undefined,
     was_mentioned: ctx.WasMentioned === true ? true : undefined,
     explicitly_mentioned_bot:
       typeof ctx.ExplicitlyMentionedBot === "boolean" ? ctx.ExplicitlyMentionedBot : undefined,
-    mentioned_user_ids: normalizePromptMetadataStringArray(ctx.MentionedUserIds),
-    mentioned_subteam_ids: normalizePromptMetadataStringArray(ctx.MentionedSubteamIds),
+    mentioned_user_ids: omitIdentifiers
+      ? undefined
+      : normalizePromptMetadataStringArray(ctx.MentionedUserIds),
+    mentioned_subteam_ids: omitIdentifiers
+      ? undefined
+      : normalizePromptMetadataStringArray(ctx.MentionedSubteamIds),
     implicit_mention_kinds: normalizePromptMetadataStringArray(ctx.ImplicitMentionKinds),
     mention_source: normalizePromptMetadataString(ctx.MentionSource),
   };
@@ -295,6 +300,7 @@ function formatChatWindowTimestamp(
 function formatChatWindowMessage(
   value: unknown,
   envelope?: EnvelopeFormatOptions,
+  omitIdentifiers = false,
 ): string | undefined {
   if (!isRecord(value)) {
     return undefined;
@@ -308,10 +314,10 @@ function formatChatWindowMessage(
     normalizePromptMediaPath(value["media_path"]) ?? sanitizeTranscriptField(value["media_ref"]);
   const body = sanitizeTranscriptBody(value["body"]);
   const details = [
-    messageId ? `#${messageId}` : undefined,
+    messageId && !omitIdentifiers ? `#${messageId}` : undefined,
     timestamp,
     value["is_reply_target"] === true ? "[reply target]" : undefined,
-    replyToId ? `->#${replyToId}` : undefined,
+    replyToId && !omitIdentifiers ? `->#${replyToId}` : undefined,
   ].filter(Boolean);
   const media = mediaType ? `[${mediaType}${mediaLocator ? ` ${mediaLocator}` : ""}]` : undefined;
   const content = [body, media].filter(Boolean).join(" ");
@@ -324,13 +330,14 @@ function formatChatWindowMessage(
 function formatChatWindowStructuredContext(
   entry: NonNullable<TemplateContext["ChannelStructuredContext"]>[number],
   envelope?: EnvelopeFormatOptions,
+  omitIdentifiers = false,
 ): string | undefined {
   if (!isChatWindowStructuredContext(entry)) {
     return undefined;
   }
   const messages = Array.isArray(entry.payload["messages"]) ? entry.payload["messages"] : [];
   const lines = messages.flatMap((message) => {
-    const line = formatChatWindowMessage(message, envelope);
+    const line = formatChatWindowMessage(message, envelope, omitIdentifiers);
     return line ? [line] : [];
   });
   if (lines.length === 0) {
@@ -461,6 +468,22 @@ function buildReplyChainPayload(
   });
 }
 
+const PROMPT_IDENTIFIER_KEYS = [
+  "message_id",
+  "thread_id",
+  "sender_id",
+  "reply_to_id",
+  "forwarded_from_id",
+] as const;
+
+function omitPromptIdentifiers(entry: Record<string, unknown>): Record<string, unknown> {
+  const copy = { ...entry };
+  for (const key of PROMPT_IDENTIFIER_KEYS) {
+    delete copy[key];
+  }
+  return copy;
+}
+
 function isTelegramInboundContext(ctx: TemplateContext): boolean {
   return [ctx.OriginatingChannel, ctx.Surface, ctx.Provider].some(
     (value) => normalizePromptMetadataString(value) === "telegram",
@@ -480,8 +503,10 @@ function formatTelegramCurrentMessageContext(ctx: TemplateContext): string | und
     return undefined;
   }
   const messageId =
-    normalizePromptMetadataString(ctx.MessageSid) ??
-    normalizePromptMetadataString(ctx.MessageSidFull);
+    ctx.OmitPromptIdentifiers === true
+      ? undefined
+      : (normalizePromptMetadataString(ctx.MessageSid) ??
+        normalizePromptMetadataString(ctx.MessageSidFull));
   const header = messageId ? `#${messageId}:` : undefined;
   return ["Current message:", `[Replying to: ${JSON.stringify(quote)}]`, header]
     .filter((line) => line !== undefined)
@@ -620,6 +645,10 @@ export function buildInboundUserContextPrefix(
     directChannelValue && directChannelValue !== "webchat",
   );
   const shouldIncludeConversationInfo = !isDirect || includeDirectConversationInfo;
+  // Channel-declared: platform ids stay in ctx for routing and authorization but are not
+  // shown to the model.
+  const omitIdentifiers = ctx.OmitPromptIdentifiers === true;
+  const includeIdentifiers = shouldIncludeConversationInfo && !omitIdentifiers;
 
   const messageId = normalizePromptMetadataString(ctx.MessageSid);
   const messageIdFull = normalizePromptMetadataString(ctx.MessageSidFull);
@@ -647,7 +676,7 @@ export function buildInboundUserContextPrefix(
   const senderIdDigits = senderId?.replace(/\D/gu, "");
   const senderE164Digits = senderE164?.replace(/\D/gu, "");
   const senderIdentity = {
-    id: senderId,
+    id: omitIdentifiers ? undefined : senderId,
     name: normalizePromptMetadataString(ctx.SenderName),
     username: normalizePromptMetadataString(ctx.SenderUsername),
     e164: senderE164Digits && senderE164Digits === senderIdDigits ? undefined : senderE164,
@@ -657,11 +686,9 @@ export function buildInboundUserContextPrefix(
   // Keep volatile conversation/message identifiers in the user-role block so the system
   // prompt stays byte-stable across task-scoped sessions and reply turns.
   const conversationInfo = {
-    chat_id: shouldIncludeConversationInfo ? normalizeOptionalString(ctx.OriginatingTo) : undefined,
-    message_id: shouldIncludeConversationInfo ? resolvedMessageId : undefined,
-    reply_to_id: shouldIncludeConversationInfo
-      ? normalizePromptMetadataString(ctx.ReplyToId)
-      : undefined,
+    chat_id: includeIdentifiers ? normalizeOptionalString(ctx.OriginatingTo) : undefined,
+    message_id: includeIdentifiers ? resolvedMessageId : undefined,
+    reply_to_id: includeIdentifiers ? normalizePromptMetadataString(ctx.ReplyToId) : undefined,
     conversation_label: isDirect ? undefined : normalizePromptMetadataString(ctx.ConversationLabel),
     sender: shouldIncludeConversationInfo
       ? Object.values(senderIdentity).some((value) => value !== undefined)
@@ -677,12 +704,12 @@ export function buildInboundUserContextPrefix(
     thread_label: normalizePromptMetadataString(ctx.ThreadLabel),
     inbound_event_kind: ctx.InboundEventKind,
     topic_id:
-      ctx.MessageThreadId != null
+      !omitIdentifiers && ctx.MessageThreadId != null
         ? (normalizePromptMetadataString(String(ctx.MessageThreadId)) ?? undefined)
         : undefined,
     topic_name: normalizePromptMetadataString(ctx.TopicName) ?? undefined,
     is_forum: ctx.IsForum === true ? true : undefined,
-    ...buildConversationMentionMetadataPayload(ctx, isDirect),
+    ...buildConversationMentionMetadataPayload(ctx, isDirect, omitIdentifiers),
     history_count: boundedHistory.length > 0 ? boundedHistory.length : undefined,
     history_truncated: inboundHistory.length > MAX_UNTRUSTED_HISTORY_ENTRIES ? true : undefined,
   };
@@ -709,13 +736,13 @@ export function buildInboundUserContextPrefix(
     blocks.push(
       formatContextJsonBlock(
         markInboundContextLabel("Reply chain of current user message (nearest first):"),
-        replyChainPayload,
+        omitIdentifiers ? replyChainPayload.map(omitPromptIdentifiers) : replyChainPayload,
       ),
     );
   } else if (hasReplyTargetMetadata && !chatWindowCoversReplyContext && !currentMessageContext) {
     blocks.push(
       formatContextJsonBlock(markInboundContextLabel("Reply target of current user message:"), {
-        message_id: replyToId,
+        message_id: omitIdentifiers ? undefined : replyToId,
         sender_label: replyToSender,
         is_quote: ctx.ReplyToIsQuote === true ? true : undefined,
         body: replyToBody || undefined,
@@ -751,7 +778,7 @@ export function buildInboundUserContextPrefix(
     if (!entry || typeof entry !== "object") {
       continue;
     }
-    const chatWindow = formatChatWindowStructuredContext(entry, envelope);
+    const chatWindow = formatChatWindowStructuredContext(entry, envelope, omitIdentifiers);
     if (chatWindow) {
       blocks.push(chatWindow);
       continue;
@@ -779,7 +806,7 @@ export function buildInboundUserContextPrefix(
       ];
       const line = formatChatWindowMessage(
         {
-          message_id: entry.messageId,
+          message_id: omitIdentifiers ? undefined : entry.messageId,
           sender: entry.sender,
           timestamp_ms: entry.timestamp,
           body: entry.body,

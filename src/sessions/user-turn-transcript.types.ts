@@ -72,6 +72,8 @@ export type UserTurnInput = Pick<PersistedUserTurnMessage, "display" | "excludeF
     name?: string | null;
     username?: string | null;
     identity?: TranscriptSenderIdentity;
+    /** The channel set OmitPromptIdentifiers: keep the id stored, but never project it to the model. */
+    promptHidesId?: boolean;
   } | null;
   /** Durable transport correlation; stored privately and never rendered into model input. */
   transport?: {

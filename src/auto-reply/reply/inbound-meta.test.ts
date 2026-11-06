@@ -1570,4 +1570,145 @@ describe("buildInboundUserContextPrefix", () => {
     expect(text).not.toContain("Chat history since last reply: ⟦openclaw:ctx⟧\n```json");
   });
 });
+
+describe("buildInboundUserContextPrefix with OmitPromptIdentifiers", () => {
+  const base = {
+    ChatType: "group",
+    OriginatingTo: "ci:11111111-2222-3333-4444-555555555555",
+    MessageSid: "run-aaaa",
+    ReplyToId: "msg-41",
+    ReplyToSender: "Quoter",
+    ReplyToBody: "quoted body",
+    SenderId: "user-bbbb",
+    SenderName: "Alice",
+    ConversationLabel: "Team chat",
+    GroupSubject: "Team chat",
+    InboundHistory: [{ messageId: "hist-1", sender: "Bob", body: "earlier", timestamp: 1 }],
+  } as TemplateContext;
+
+  it("keeps platform identifiers out of every model-visible block", () => {
+    const text = buildInboundUserContextPrefix({ ...base, OmitPromptIdentifiers: true });
+
+    const info = parseConversationInfoPayload(text);
+    expect(info["chat_id"]).toBeUndefined();
+    expect(info["message_id"]).toBeUndefined();
+    expect(info["reply_to_id"]).toBeUndefined();
+    expect(info["sender"]).toEqual({ name: "Alice" });
+    expect(info["conversation_label"]).toBe("Team chat");
+    expect(parseReplyPayload(text)).toEqual({ sender_label: "Quoter", body: "quoted body" });
+    for (const id of ["ci:1111", "run-aaaa", "msg-41", "user-bbbb", "hist-1"]) {
+      expect(text).not.toContain(id);
+    }
+  });
+
+  it("drops identifiers from hydrated reply chains", () => {
+    const text = buildInboundUserContextPrefix({
+      OmitPromptIdentifiers: true,
+      ReplyChain: [
+        { messageId: "3001", sender: "Blair", senderId: "700002", body: "hi", replyToId: "3000" },
+      ],
+    } as TemplateContext);
+
+    expect(parseReplyChainPayload(text)).toEqual([{ sender: "Blair", body: "hi" }]);
+  });
+
+  const telegramReply = {
+    Provider: "telegram",
+    Surface: "telegram",
+    OriginatingChannel: "telegram",
+    ChatType: "group",
+    MessageSid: "34974",
+    ReplyToId: "34971",
+    ReplyToQuoteText: "selected quote",
+    SenderName: "obviyus",
+  } as TemplateContext;
+
+  it.each([
+    [true, false],
+    [false, true],
+  ])("Telegram current-message quote with flag=%s keeps the message id: %s", (flag, keepsId) => {
+    const text = buildInboundUserContextPrefix({ ...telegramReply, OmitPromptIdentifiers: flag });
+    expect(text).toContain('Current message:\n[Replying to: "selected quote"]');
+    expect(text.includes("#34974:")).toBe(keepsId);
+    expect(text.includes("34971")).toBe(keepsId);
+  });
+
+  const chatWindow = {
+    ChatType: "group",
+    ChannelStructuredContext: [
+      {
+        label: "Current local chat window",
+        source: "test",
+        type: "chat_window",
+        payload: {
+          order: "chronological",
+          relation: "before_current_message",
+          messages: [
+            {
+              message_id: "win-1",
+              sender: "Sam",
+              timestamp_ms: 1_736_380_700_000,
+              body: "see #4242",
+            },
+            {
+              message_id: "win-2",
+              sender: "Riley",
+              timestamp_ms: 1_736_380_760_000,
+              body: "order 31337 shipped",
+              reply_to_id: "win-1",
+            },
+          ],
+        },
+      },
+    ],
+    InboundHistory: [{ messageId: "hist-9", sender: "Bob", body: "earlier", timestamp: 1 }],
+  } as TemplateContext;
+
+  it.each([
+    [true, false],
+    [false, true],
+  ])("chat window with flag=%s keeps message and reply ids: %s", (flag, keepsIds) => {
+    const text = buildInboundUserContextPrefix(
+      { ...chatWindow, OmitPromptIdentifiers: flag },
+      { timezone: "UTC" },
+    );
+    expect(text).toContain("Sam: see #4242");
+    expect(text).toContain("Riley: order 31337 shipped");
+    expect(text).toContain("2025-01-08T23:58:20Z");
+    for (const id of ["#win-1", "#win-2", "->#win-1"]) {
+      expect(text.includes(id)).toBe(keepsIds);
+    }
+    // The window covers history, so the InboundHistory branch is skipped either way.
+    expect(text).not.toContain("hist-9");
+  });
+
+  it.each([
+    [true, false],
+    [false, true],
+  ])("conversation info with flag=%s keeps topic and mention ids: %s", (flag, keepsIds) => {
+    const info = parseConversationInfoPayload(
+      buildInboundUserContextPrefix({
+        ChatType: "group",
+        MessageThreadId: "thread-7",
+        TopicName: "Deployments",
+        WasMentioned: true,
+        MentionedUserIds: ["U_OTHER"],
+        MentionedSubteamIds: ["S_ONCALL"],
+        OmitPromptIdentifiers: flag,
+      } as TemplateContext),
+    );
+    expect(info["topic_name"]).toBe("Deployments");
+    expect(info["was_mentioned"]).toBe(true);
+    expect(info["topic_id"]).toEqual(keepsIds ? "thread-7" : undefined);
+    expect(info["mentioned_user_ids"]).toEqual(keepsIds ? ["U_OTHER"] : undefined);
+    expect(info["mentioned_subteam_ids"]).toEqual(keepsIds ? ["S_ONCALL"] : undefined);
+  });
+
+  it("leaves output unchanged when the flag is absent or false", () => {
+    const off = buildInboundUserContextPrefix(base);
+    expect(buildInboundUserContextPrefix({ ...base, OmitPromptIdentifiers: false })).toBe(off);
+    expect(parseConversationInfoPayload(off)["sender"]).toEqual({ id: "user-bbbb", name: "Alice" });
+    expect(off).toContain("run-aaaa");
+  });
+});
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

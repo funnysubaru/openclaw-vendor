@@ -547,3 +547,45 @@ describe("buildInboundMediaNote", () => {
     ]);
   });
 });
+
+// Collab patch #1 (COLLAB-PATCHES.md): channels that declare OmitPromptIdentifiers keep host paths
+// that embed instance ids out of the prompt; hydration still reads the fact's absolute path.
+describe("buildInboundMediaNoteProjection with OmitPromptIdentifiers", () => {
+  const ws = "/data/ai/tax/11111111-2222-3333-4444-555555555555";
+  const media = [
+    { path: `${ws}/inbound/photo.png`, contentType: "image/png", workspaceDir: ws },
+    { path: "/srv/shared/outside.png", contentType: "image/png", workspaceDir: ws },
+  ];
+
+  it("off: renders absolute paths exactly as before", () => {
+    const off = buildInboundMediaNoteProjection({ media } as MsgContext);
+    expect(
+      buildInboundMediaNoteProjection({ media, OmitPromptIdentifiers: false } as MsgContext),
+    ).toEqual(off);
+    expect(off.text).toContain(`[media attached 1/2: ${ws}/inbound/photo.png (image/png)]`);
+  });
+
+  it("on: workspace paths render relative, outside paths stay, facts keep absolute paths", () => {
+    const on = buildInboundMediaNoteProjection({
+      media,
+      OmitPromptIdentifiers: true,
+    } as MsgContext);
+    expect(on.text).toBe(
+      [
+        "[media attached: 2 files]",
+        "[media attached 1/2: inbound/photo.png (image/png)]",
+        "[media attached 2/2: /srv/shared/outside.png (image/png)]",
+      ].join("\n"),
+    );
+    expect(on.text).not.toContain("11111111-2222-3333-4444-555555555555");
+    expect(on.media.map((fact) => fact.path)).toEqual(media.map((fact) => fact.path));
+  });
+
+  it("on: a fact without workspaceDir keeps its path", () => {
+    const on = buildInboundMediaNoteProjection({
+      media: [{ path: "/tmp/a.png", contentType: "image/png" }],
+      OmitPromptIdentifiers: true,
+    } as MsgContext);
+    expect(on.text).toBe("[media attached: /tmp/a.png (image/png)]");
+  });
+});

@@ -208,7 +208,22 @@ function prepareContextFilesForPrompt(contextFiles: EmbeddedContextFile[]) {
   );
 }
 
-function buildProjectContextSection(files: ReturnType<typeof prepareContextFilesForPrompt>) {
+/** Shows a path under the workspace relative to it; other paths are unchanged. */
+function toWorkspaceRelativePromptPath(filePath: string, workspaceDir: string): string {
+  const root = workspaceDir.replace(/\/+$/u, "");
+  if (!root) {
+    return filePath;
+  }
+  if (filePath === root) {
+    return ".";
+  }
+  return filePath.startsWith(`${root}/`) ? filePath.slice(root.length + 1) : filePath;
+}
+
+function buildProjectContextSection(
+  files: ReturnType<typeof prepareContextFilesForPrompt>,
+  displayPath: (filePath: string) => string = (filePath) => filePath,
+) {
   if (files.length === 0) {
     return [];
   }
@@ -232,7 +247,12 @@ function buildProjectContextSection(files: ReturnType<typeof prepareContextFiles
   }
   lines.push("");
   for (const { file } of files) {
-    lines.push(`## ${file.path}`, "", sanitizeContextFileContentForPrompt(file.content), "");
+    lines.push(
+      `## ${displayPath(file.path)}`,
+      "",
+      sanitizeContextFileContentForPrompt(file.content),
+      "",
+    );
   }
   return lines;
 }
@@ -816,6 +836,8 @@ export function buildAgentSystemPrompt(params: {
   sandboxInfo?: EmbeddedSandboxInfo;
   /** Whether read/write/edit/apply_patch are restricted to the workspace root. */
   fsWorkspaceOnly?: boolean;
+  /** Render workspace paths relative to the workspace and drop agent/session ids from Runtime. */
+  omitPromptIdentifiers?: boolean;
   /** Reaction guidance for the agent (for Telegram minimal/extensive modes). */
   reactionGuidance?: {
     level: "minimal" | "extensive";
@@ -1053,7 +1075,10 @@ export function buildAgentSystemPrompt(params: {
     ? "none"
     : (params.silentReplyPromptMode ?? "generic");
   const sandboxContainerWorkspace = params.sandboxInfo?.containerWorkspaceDir?.trim();
-  const sanitizedWorkspaceDir = sanitizeForPromptLiteral(params.workspaceDir);
+  const omitIdentifiers = params.omitPromptIdentifiers === true;
+  const displayPromptPath = (filePath: string) =>
+    omitIdentifiers ? toWorkspaceRelativePromptPath(filePath, params.workspaceDir) : filePath;
+  const sanitizedWorkspaceDir = sanitizeForPromptLiteral(displayPromptPath(params.workspaceDir));
   const runtimeCwd = params.runtimeCwd ?? params.workspaceDir;
   const hasSeparateRuntimeCwd = !sandboxedRuntime && runtimeCwd !== params.workspaceDir;
   const sanitizedSandboxContainerWorkspace = sandboxContainerWorkspace
@@ -1079,8 +1104,8 @@ export function buildAgentSystemPrompt(params: {
   const directorySection = hasSeparateRuntimeCwd
     ? [
         "## Directory Roles",
-        `Working directory: ${sanitizeForPromptLiteral(runtimeCwd)} (tools and deliverables).`,
-        `Agent workspace: ${sanitizedWorkspaceDir} (AGENTS.md/SOUL.md, other agent instructions, MEMORY.md/memory only; use absolute paths).`,
+        `Working directory: ${sanitizeForPromptLiteral(displayPromptPath(runtimeCwd))} (tools and deliverables).`,
+        `Agent workspace: ${sanitizedWorkspaceDir} (AGENTS.md/SOUL.md, other agent instructions, MEMORY.md/memory only; ${omitIdentifiers ? "paths relative to the agent workspace" : "use absolute paths"}).`,
       ]
     : ["## Workspace", `Working directory: ${displayWorkspaceDir}`, workspaceGuidance];
   const safetySection = [
@@ -1353,7 +1378,7 @@ export function buildAgentSystemPrompt(params: {
             params.sandboxInfo.containerWorkspaceDir
               ? `Sandbox container workdir: ${sanitizeForPromptLiteral(params.sandboxInfo.containerWorkspaceDir)}`
               : "",
-            params.sandboxInfo.workspaceDir
+            params.sandboxInfo.workspaceDir && !omitIdentifiers
               ? `Sandbox host mount source (file tools bridge only; not valid inside sandbox exec): ${sanitizeForPromptLiteral(params.sandboxInfo.workspaceDir)}`
               : "",
             params.sandboxInfo.workspaceAccess
@@ -1407,7 +1432,7 @@ export function buildAgentSystemPrompt(params: {
       lines.push("## Reasoning Format", reasoningHint, "");
     }
 
-    lines.push(...buildProjectContextSection(preparedContextFiles));
+    lines.push(...buildProjectContextSection(preparedContextFiles, displayPromptPath));
 
     lines.push(SYSTEM_PROMPT_CACHE_BOUNDARY);
     return lines.filter(Boolean).join("\n");
@@ -1556,10 +1581,18 @@ export function buildAgentSystemPrompt(params: {
     // Only Runtime facts may move behind tools. Close the region before callers
     // append hook instructions or permission notices that must retain their role.
     SYSTEM_PROMPT_RELOCATABLE_BOUNDARY,
-    `${buildRuntimeLine(runtimeInfo, runtimeChannel, runtimeCapabilities)}${SYSTEM_PROMPT_RELOCATABLE_BOUNDARY_END}`,
+    `${buildRuntimeLine(omitIdentifiers ? omitRuntimeIdentifiers(runtimeInfo) : runtimeInfo, runtimeChannel, runtimeCapabilities)}${SYSTEM_PROMPT_RELOCATABLE_BOUNDARY_END}`,
   );
 
   return lines.filter(Boolean).join("\n");
+}
+
+function omitRuntimeIdentifiers(
+  runtimeInfo?: SystemPromptRuntimeInfo,
+): SystemPromptRuntimeInfo | undefined {
+  return runtimeInfo
+    ? { ...runtimeInfo, agentId: undefined, sessionKey: undefined, sessionId: undefined }
+    : undefined;
 }
 
 function buildRuntimeLine(

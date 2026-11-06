@@ -87,6 +87,7 @@ export const AgentDefaultsSchema = z
     silentReply: SilentReplyPolicyConfigSchema.optional(),
     repoRoot: z.string().optional(),
     skipBootstrap: z.boolean().optional(),
+    omitPromptIdentifiers: z.boolean().optional(),
     skipOptionalBootstrapFiles: z.array(OptionalBootstrapFileNameSchema).optional(),
     contextInjection: z
       .union([z.literal("always"), z.literal("continuation-skip"), z.literal("never")])

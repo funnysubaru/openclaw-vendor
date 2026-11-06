@@ -2680,3 +2680,46 @@ describe("system prompt runtime cache boundary", () => {
     expect(next.suffix).toContain("Current elevated level: full");
   });
 });
+
+// 协作版补丁 #1（COLLAB-PATCHES.md）：多人通道声明后，系统提示不给模型看实例路径和会话 id。
+describe("buildAgentSystemPrompt omitPromptIdentifiers", () => {
+  const base = {
+    workspaceDir: "/data/ai/tax/11111111-2222-3333-4444-555555555555",
+    contextFiles: [
+      {
+        path: "/data/ai/tax/11111111-2222-3333-4444-555555555555/AGENTS.md",
+        content: "Be helpful.",
+      },
+      { path: "/etc/shared/SOUL.md", content: "Outside workspace." },
+    ],
+    runtimeInfo: {
+      agentId: "ci-1111111122223333",
+      sessionKey: "agent:ci-1111111122223333:collab:group:ci:11111111-2222-3333-4444-555555555555",
+      sessionId: "99999999-8888-7777-6666-555555555555",
+      host: "engine-host",
+      model: "fixture/model",
+    },
+  };
+
+  it("off: output unchanged and keeps absolute paths and ids", () => {
+    const prompt = buildAgentSystemPrompt(base);
+    expect(buildAgentSystemPrompt({ ...base, omitPromptIdentifiers: false })).toBe(prompt);
+    expect(prompt).toContain("## /data/ai/tax/11111111-2222-3333-4444-555555555555/AGENTS.md");
+    expect(prompt).toContain("agent=ci-1111111122223333");
+    expect(prompt).toContain("sessionId=99999999-8888-7777-6666-555555555555");
+  });
+
+  it("on: no instance path, agent id, session key or session id reaches the prompt", () => {
+    const prompt = buildAgentSystemPrompt({ ...base, omitPromptIdentifiers: true });
+    expect(prompt).not.toContain("11111111-2222-3333-4444-555555555555");
+    expect(prompt).not.toContain("ci-1111111122223333");
+    expect(prompt).not.toContain("99999999-8888-7777-6666-555555555555");
+    expect(prompt).not.toMatch(/\bsession(Id)?=/);
+    expect(prompt).toContain("## AGENTS.md");
+    // 工作区外的文件不是实例路径，原样保留
+    expect(prompt).toContain("## /etc/shared/SOUL.md");
+    expect(prompt).toContain("Be helpful.");
+    expect(prompt).toContain("host=engine-host");
+    expect(prompt).toContain("model=fixture/model");
+  });
+});

@@ -88,6 +88,16 @@ Disables automatic creation of workspace bootstrap files (`AGENTS.md`, `SOUL.md`
 }
 ```
 
+## `agents.defaults.omitPromptIdentifiers`
+
+Keeps internal identifiers out of the system prompt. When `true`, the Runtime line omits `agent=`, `session=`, and `sessionId=`, and the workspace directory and context file headings render relative to the workspace root (`AGENTS.md` instead of `/path/to/workspace/AGENTS.md`). File tools already resolve relative paths against the workspace. Default: `false` (prompt unchanged).
+
+```json5
+{
+  agents: { defaults: { omitPromptIdentifiers: true } },
+}
+```
+
 ## `agents.defaults.skipOptionalBootstrapFiles`
 
 Skips creation of selected optional workspace files while still writing required bootstrap files (`AGENTS.md`, `BOOTSTRAP.md`). Valid values: `SOUL.md`, `USER.md`, and `IDENTITY.md` (`HEARTBEAT.md` is accepted but a no-op since heartbeat context moved to cron monitor scratch).

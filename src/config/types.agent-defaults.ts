@@ -172,6 +172,11 @@ export type AgentDefaultsConfig = {
   /** Skip bootstrap (BOOTSTRAP.md creation, etc.) for pre-configured deployments. */
   skipBootstrap?: boolean;
   /**
+   * Keep internal identifiers out of the system prompt: the Runtime line omits agent, session,
+   * and sessionId, and workspace paths render relative to the workspace root. Default false.
+   */
+  omitPromptIdentifiers?: boolean;
+  /**
    * List of optional bootstrap filenames to skip writing to the workspace root.
    * Applies to: SOUL.md, USER.md, IDENTITY.md ("HEARTBEAT.md" is accepted but a no-op).
    * Required workspace setup such as AGENTS.md still runs.

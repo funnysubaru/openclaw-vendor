@@ -1612,6 +1612,98 @@ describe("buildInboundUserContextPrefix with OmitPromptIdentifiers", () => {
     expect(parseReplyChainPayload(text)).toEqual([{ sender: "Blair", body: "hi" }]);
   });
 
+  const telegramReply = {
+    Provider: "telegram",
+    Surface: "telegram",
+    OriginatingChannel: "telegram",
+    ChatType: "group",
+    MessageSid: "34974",
+    ReplyToId: "34971",
+    ReplyToQuoteText: "selected quote",
+    SenderName: "obviyus",
+  } as TemplateContext;
+
+  it.each([
+    [true, false],
+    [false, true],
+  ])("Telegram current-message quote with flag=%s keeps the message id: %s", (flag, keepsId) => {
+    const text = buildInboundUserContextPrefix({ ...telegramReply, OmitPromptIdentifiers: flag });
+    expect(text).toContain('Current message:\n[Replying to: "selected quote"]');
+    expect(text.includes("#34974:")).toBe(keepsId);
+    expect(text.includes("34971")).toBe(keepsId);
+  });
+
+  const chatWindow = {
+    ChatType: "group",
+    ChannelStructuredContext: [
+      {
+        label: "Current local chat window",
+        source: "test",
+        type: "chat_window",
+        payload: {
+          order: "chronological",
+          relation: "before_current_message",
+          messages: [
+            {
+              message_id: "win-1",
+              sender: "Sam",
+              timestamp_ms: 1_736_380_700_000,
+              body: "see #4242",
+            },
+            {
+              message_id: "win-2",
+              sender: "Riley",
+              timestamp_ms: 1_736_380_760_000,
+              body: "order 31337 shipped",
+              reply_to_id: "win-1",
+            },
+          ],
+        },
+      },
+    ],
+    InboundHistory: [{ messageId: "hist-9", sender: "Bob", body: "earlier", timestamp: 1 }],
+  } as TemplateContext;
+
+  it.each([
+    [true, false],
+    [false, true],
+  ])("chat window with flag=%s keeps message and reply ids: %s", (flag, keepsIds) => {
+    const text = buildInboundUserContextPrefix(
+      { ...chatWindow, OmitPromptIdentifiers: flag },
+      { timezone: "UTC" },
+    );
+    expect(text).toContain("Sam: see #4242");
+    expect(text).toContain("Riley: order 31337 shipped");
+    expect(text).toContain("2025-01-08T23:58:20Z");
+    for (const id of ["#win-1", "#win-2", "->#win-1"]) {
+      expect(text.includes(id)).toBe(keepsIds);
+    }
+    // The window covers history, so the InboundHistory branch is skipped either way.
+    expect(text).not.toContain("hist-9");
+  });
+
+  it.each([
+    [true, false],
+    [false, true],
+  ])("conversation info with flag=%s keeps topic and mention ids: %s", (flag, keepsIds) => {
+    const info = parseConversationInfoPayload(
+      buildInboundUserContextPrefix({
+        ChatType: "group",
+        MessageThreadId: "thread-7",
+        TopicName: "Deployments",
+        WasMentioned: true,
+        MentionedUserIds: ["U_OTHER"],
+        MentionedSubteamIds: ["S_ONCALL"],
+        OmitPromptIdentifiers: flag,
+      } as TemplateContext),
+    );
+    expect(info["topic_name"]).toBe("Deployments");
+    expect(info["was_mentioned"]).toBe(true);
+    expect(info["topic_id"]).toEqual(keepsIds ? "thread-7" : undefined);
+    expect(info["mentioned_user_ids"]).toEqual(keepsIds ? ["U_OTHER"] : undefined);
+    expect(info["mentioned_subteam_ids"]).toEqual(keepsIds ? ["S_ONCALL"] : undefined);
+  });
+
   it("leaves output unchanged when the flag is absent or false", () => {
     const off = buildInboundUserContextPrefix(base);
     expect(buildInboundUserContextPrefix({ ...base, OmitPromptIdentifiers: false })).toBe(off);

@@ -261,14 +261,19 @@ function formatChannelStructuredContextLabel(label: unknown): string {
 function buildConversationMentionMetadataPayload(
   ctx: TemplateContext,
   isDirect: boolean,
+  omitIdentifiers: boolean,
 ): Record<string, unknown> {
   return {
     is_group_chat: !isDirect ? true : undefined,
     was_mentioned: ctx.WasMentioned === true ? true : undefined,
     explicitly_mentioned_bot:
       typeof ctx.ExplicitlyMentionedBot === "boolean" ? ctx.ExplicitlyMentionedBot : undefined,
-    mentioned_user_ids: normalizePromptMetadataStringArray(ctx.MentionedUserIds),
-    mentioned_subteam_ids: normalizePromptMetadataStringArray(ctx.MentionedSubteamIds),
+    mentioned_user_ids: omitIdentifiers
+      ? undefined
+      : normalizePromptMetadataStringArray(ctx.MentionedUserIds),
+    mentioned_subteam_ids: omitIdentifiers
+      ? undefined
+      : normalizePromptMetadataStringArray(ctx.MentionedSubteamIds),
     implicit_mention_kinds: normalizePromptMetadataStringArray(ctx.ImplicitMentionKinds),
     mention_source: normalizePromptMetadataString(ctx.MentionSource),
   };
@@ -295,6 +300,7 @@ function formatChatWindowTimestamp(
 function formatChatWindowMessage(
   value: unknown,
   envelope?: EnvelopeFormatOptions,
+  omitIdentifiers = false,
 ): string | undefined {
   if (!isRecord(value)) {
     return undefined;
@@ -308,10 +314,10 @@ function formatChatWindowMessage(
     normalizePromptMediaPath(value["media_path"]) ?? sanitizeTranscriptField(value["media_ref"]);
   const body = sanitizeTranscriptBody(value["body"]);
   const details = [
-    messageId ? `#${messageId}` : undefined,
+    messageId && !omitIdentifiers ? `#${messageId}` : undefined,
     timestamp,
     value["is_reply_target"] === true ? "[reply target]" : undefined,
-    replyToId ? `->#${replyToId}` : undefined,
+    replyToId && !omitIdentifiers ? `->#${replyToId}` : undefined,
   ].filter(Boolean);
   const media = mediaType ? `[${mediaType}${mediaLocator ? ` ${mediaLocator}` : ""}]` : undefined;
   const content = [body, media].filter(Boolean).join(" ");
@@ -324,13 +330,14 @@ function formatChatWindowMessage(
 function formatChatWindowStructuredContext(
   entry: NonNullable<TemplateContext["ChannelStructuredContext"]>[number],
   envelope?: EnvelopeFormatOptions,
+  omitIdentifiers = false,
 ): string | undefined {
   if (!isChatWindowStructuredContext(entry)) {
     return undefined;
   }
   const messages = Array.isArray(entry.payload["messages"]) ? entry.payload["messages"] : [];
   const lines = messages.flatMap((message) => {
-    const line = formatChatWindowMessage(message, envelope);
+    const line = formatChatWindowMessage(message, envelope, omitIdentifiers);
     return line ? [line] : [];
   });
   if (lines.length === 0) {
@@ -496,8 +503,10 @@ function formatTelegramCurrentMessageContext(ctx: TemplateContext): string | und
     return undefined;
   }
   const messageId =
-    normalizePromptMetadataString(ctx.MessageSid) ??
-    normalizePromptMetadataString(ctx.MessageSidFull);
+    ctx.OmitPromptIdentifiers === true
+      ? undefined
+      : (normalizePromptMetadataString(ctx.MessageSid) ??
+        normalizePromptMetadataString(ctx.MessageSidFull));
   const header = messageId ? `#${messageId}:` : undefined;
   return ["Current message:", `[Replying to: ${JSON.stringify(quote)}]`, header]
     .filter((line) => line !== undefined)
@@ -695,12 +704,12 @@ export function buildInboundUserContextPrefix(
     thread_label: normalizePromptMetadataString(ctx.ThreadLabel),
     inbound_event_kind: ctx.InboundEventKind,
     topic_id:
-      ctx.MessageThreadId != null
+      !omitIdentifiers && ctx.MessageThreadId != null
         ? (normalizePromptMetadataString(String(ctx.MessageThreadId)) ?? undefined)
         : undefined,
     topic_name: normalizePromptMetadataString(ctx.TopicName) ?? undefined,
     is_forum: ctx.IsForum === true ? true : undefined,
-    ...buildConversationMentionMetadataPayload(ctx, isDirect),
+    ...buildConversationMentionMetadataPayload(ctx, isDirect, omitIdentifiers),
     history_count: boundedHistory.length > 0 ? boundedHistory.length : undefined,
     history_truncated: inboundHistory.length > MAX_UNTRUSTED_HISTORY_ENTRIES ? true : undefined,
   };
@@ -769,7 +778,7 @@ export function buildInboundUserContextPrefix(
     if (!entry || typeof entry !== "object") {
       continue;
     }
-    const chatWindow = formatChatWindowStructuredContext(entry, envelope);
+    const chatWindow = formatChatWindowStructuredContext(entry, envelope, omitIdentifiers);
     if (chatWindow) {
       blocks.push(chatWindow);
       continue;

@@ -91,6 +91,35 @@ describe("normalizeMessagesForLlmBoundary", () => {
     );
   });
 
+  // Turns stored before the operator enabled agents.defaults.omitPromptIdentifiers
+  // carry no senderIdHiddenFromPrompt flag; the live config must still hide the id.
+  const unflaggedTurn = () => [
+    {
+      role: "user",
+      content: "The launch is Friday",
+      timestamp: 1,
+      __openclaw: { senderId: "alice-id", senderName: "Alice" },
+    },
+  ];
+
+  it("omits ids of unflagged persisted senders when omitPersistedSenderIds is set", () => {
+    const output = normalizeMessagesForLlmBoundary(
+      unflaggedTurn() as Parameters<typeof normalizeMessagesForLlmBoundary>[0],
+      { omitPersistedSenderIds: true },
+    ) as unknown as Array<{ content?: string }>;
+
+    expect(output[0]?.content).toContain('{"sender":{"name":"Alice"}}');
+    expect(output[0]?.content).not.toContain("alice-id");
+  });
+
+  it("keeps ids of unflagged persisted senders when omitPersistedSenderIds is off", () => {
+    const output = normalizeMessagesForLlmBoundary(
+      unflaggedTurn() as Parameters<typeof normalizeMessagesForLlmBoundary>[0],
+    ) as unknown as Array<{ content?: string }>;
+
+    expect(output[0]?.content).toContain('{"sender":{"id":"alice-id","name":"Alice"}}');
+  });
+
   it("projects persisted sender metadata onto historical group turns", () => {
     const input = [
       {

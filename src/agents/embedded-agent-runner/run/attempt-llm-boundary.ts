@@ -52,6 +52,8 @@ type LlmBoundaryOptions = {
   timezone?: string;
   includeTimestamp?: boolean;
   projectPersistedSenderContext?: boolean;
+  /** agents.defaults.omitPromptIdentifiers: never project persisted sender ids. */
+  omitPersistedSenderIds?: boolean;
   userTranscriptContexts?: readonly UserTranscriptContext[];
   currentUserTimestampOverride?: CurrentUserTimestampMatch;
 };
@@ -141,7 +143,9 @@ export function normalizeMessagesForLlmBoundary(
   const withPersistedSenderContext =
     options?.projectPersistedSenderContext === false
       ? normalizedUserMessages
-      : projectPersistedSenderContext(normalizedUserMessages, userTranscriptMessages);
+      : projectPersistedSenderContext(normalizedUserMessages, userTranscriptMessages, {
+          omitSenderIds: options?.omitPersistedSenderIds === true,
+        });
   // Prefix-bound thinking must replay every earlier carrier in its original position.
   const retained = options?.appendOnlyRuntimeContext
     ? withPersistedSenderContext
@@ -157,6 +161,7 @@ type CurrentPromptBoundaryInput = {
   prompt: string;
   timezone?: string;
   includeTimestamp?: boolean;
+  omitPersistedSenderIds?: boolean;
   currentUserTimestamp?: number;
   currentUserTranscriptMessage?: AgentMessage;
 };
@@ -192,6 +197,7 @@ function buildCurrentPromptBoundaryInput(params: CurrentPromptBoundaryInput): {
     appendOnlyRuntimeContext: params.appendOnlyRuntimeContext,
     ...(params.timezone ? { timezone: params.timezone } : {}),
     ...(params.includeTimestamp === false ? { includeTimestamp: false } : {}),
+    ...(params.omitPersistedSenderIds ? { omitPersistedSenderIds: true } : {}),
     ...(params.currentUserTranscriptMessage
       ? {
           userTranscriptContexts: [

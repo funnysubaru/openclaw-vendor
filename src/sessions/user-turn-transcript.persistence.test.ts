@@ -224,6 +224,23 @@ describe("persistUserTurnTranscript", () => {
     },
   );
 
+  it("keeps the channel sender id but marks it hidden from the prompt when the channel opts out", async () => {
+    const target = createSqliteTranscriptTarget({ dir: tempDirs.make("sender-hidden-") });
+    const sender = buildChannelUserTurnSender({
+      SenderId: "member-id",
+      SenderName: "Alice",
+      Provider: "test-channel",
+      OmitPromptIdentifiers: true,
+    });
+    await persistUserTurnTranscript({ ...target, input: { text: "hello", sender } });
+    const [message] = await readTranscriptMessages(target);
+    expect(message?.["__openclaw"]).toMatchObject({
+      senderId: "member-id",
+      senderName: "Alice",
+      senderIdHiddenFromPrompt: true,
+    });
+  });
+
   it.each(["retain", "omit", "replace", "in-place", "raw-redact", "forge"] as const)(
     "sender provenance hook %s respects original producer evidence",
     async (mode) => {

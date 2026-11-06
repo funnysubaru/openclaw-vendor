@@ -28,6 +28,7 @@ export function buildChannelUserTurnSender(ctx: MsgContext): UserTurnInput["send
     id,
     name: normalizeOptionalString(ctx.SenderName),
     username: normalizeOptionalString(ctx.SenderUsername),
+    ...(ctx.OmitPromptIdentifiers === true ? { promptHidesId: true } : {}),
     ...(id
       ? {
           identity: {
@@ -66,6 +67,7 @@ export function buildPersistedUserTurnMetadata(
             input.senderIsOwner && (!input.provenance || input.provenance.kind === "external_user"),
         }),
     ...(senderId ? { senderId } : {}),
+    ...(senderId && input.sender?.promptHidesId === true ? { senderIdHiddenFromPrompt: true } : {}),
     ...(senderName ? { senderName } : {}),
     ...(senderUsername ? { senderUsername } : {}),
     ...(senderIdentity && senderIdentity.id === senderId ? { senderIdentity } : {}),

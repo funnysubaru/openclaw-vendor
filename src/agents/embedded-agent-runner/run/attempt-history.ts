@@ -214,7 +214,10 @@ function readPersistedSender(message: AgentMessage): PersistedSender | undefined
   }
   const meta = openclaw as Record<string, unknown>;
   const sender = {
-    id: normalizePersistedSenderValue(meta["senderId"]),
+    id:
+      meta["senderIdHiddenFromPrompt"] === true
+        ? undefined
+        : normalizePersistedSenderValue(meta["senderId"]),
     name: normalizePersistedSenderValue(meta["senderName"]),
     username: normalizePersistedSenderValue(meta["senderUsername"]),
   };

@@ -468,6 +468,9 @@ export async function prepareEmbeddedAttemptSessionBoundary(input: {
       appendOnlyRuntimeContext: input.appendOnlyRuntimeContext,
       ...(boundaryTimezone ? { timezone: boundaryTimezone } : {}),
       ...(includeBoundaryTimestamp ? {} : { includeTimestamp: false }),
+      ...(attempt.config?.agents?.defaults?.omitPromptIdentifiers === true
+        ? { omitPersistedSenderIds: true }
+        : {}),
       ...(userTranscriptContexts?.length ? { userTranscriptContexts } : {}),
       ...(currentUserTimestampOverride ? { currentUserTimestampOverride } : {}),
     };

@@ -561,6 +561,9 @@ export function prepareEmbeddedAttemptPromptContext(input: {
     prompt: promptForModel,
     ...(input.boundaryTimezone ? { timezone: input.boundaryTimezone } : {}),
     ...(input.includeBoundaryTimestamp ? {} : { includeTimestamp: false }),
+    ...(attempt.config?.agents?.defaults?.omitPromptIdentifiers === true
+      ? { omitPersistedSenderIds: true }
+      : {}),
     ...(typeof preparedUserTurnTimestamp === "number"
       ? { currentUserTimestamp: preparedUserTurnTimestamp }
       : {}),

@@ -188,6 +188,9 @@ export async function prepareEmbeddedAttemptPromptPreflight(input: {
     appendOnlyRuntimeContext: input.appendOnlyRuntimeContext,
     ...(input.timezone ? { timezone: input.timezone } : {}),
     ...(input.includeBoundaryTimestamp ? {} : { includeTimestamp: false }),
+    ...(attempt.config?.agents?.defaults?.omitPromptIdentifiers === true
+      ? { omitPersistedSenderIds: true }
+      : {}),
   };
   const unwindowedLlmBoundaryMessagesForPrecheck =
     input.contextEnginePromptAuthority === "preassembly_may_overflow" &&

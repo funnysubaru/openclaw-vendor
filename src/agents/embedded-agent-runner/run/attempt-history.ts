@@ -207,7 +207,10 @@ type PersistedSender = {
   username?: string;
 };
 
-function readPersistedSender(message: AgentMessage): PersistedSender | undefined {
+function readPersistedSender(
+  message: AgentMessage,
+  omitSenderId: boolean,
+): PersistedSender | undefined {
   const openclaw = Reflect.get(message, "__openclaw");
   if (!openclaw || typeof openclaw !== "object" || Array.isArray(openclaw)) {
     return undefined;
@@ -215,7 +218,7 @@ function readPersistedSender(message: AgentMessage): PersistedSender | undefined
   const meta = openclaw as Record<string, unknown>;
   const sender = {
     id:
-      meta["senderIdHiddenFromPrompt"] === true
+      omitSenderId || meta["senderIdHiddenFromPrompt"] === true
         ? undefined
         : normalizePersistedSenderValue(meta["senderId"]),
     name: normalizePersistedSenderValue(meta["senderName"]),
@@ -319,6 +322,7 @@ function hasInterSessionPromptPrefix(message: AgentMessage): boolean {
 export function projectPersistedSenderContext(
   messages: AgentMessage[],
   transcriptMessages?: readonly (AgentMessage | undefined)[],
+  options?: { omitSenderIds?: boolean },
 ): AgentMessage[] {
   let changed = false;
   const nextMessages = messages.map((message, index) => {
@@ -339,7 +343,11 @@ export function projectPersistedSenderContext(
     // Group/channel persistence is the product boundary that opts into these
     // existing sender fields. Project every turn, including the active one, so
     // provider bytes stay stable when that same turn becomes historical.
-    const sender = readPersistedSender(transcriptMessage);
+    // The per-message flag only exists on turns written with
+    // OmitPromptIdentifiers; turns written before the operator enabled
+    // agents.defaults.omitPromptIdentifiers lack it, so the live config also
+    // hides ids on every projected turn.
+    const sender = readPersistedSender(transcriptMessage, options?.omitSenderIds === true);
     if (!sender) {
       return message;
     }

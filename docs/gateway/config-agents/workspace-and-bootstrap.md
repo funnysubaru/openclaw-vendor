@@ -90,7 +90,7 @@ Disables automatic creation of workspace bootstrap files (`AGENTS.md`, `SOUL.md`
 
 ## `agents.defaults.omitPromptIdentifiers`
 
-Keeps internal identifiers out of the system prompt. When `true`, the Runtime line omits `agent=`, `session=`, and `sessionId=`, and the sandbox host mount path is left out. Directory and context file paths render relative to the root that file tools resolve relative paths against: the runtime working directory when it differs from the agent workspace, otherwise the workspace (`AGENTS.md` instead of `/path/to/workspace/AGENTS.md`). Paths outside that root stay absolute, so they still resolve; in particular, an agent workspace outside a separate working directory keeps its absolute path. Default: `false` (prompt unchanged).
+Keeps internal identifiers out of the system prompt. When `true`, the Runtime line omits `agent=`, `session=`, and `sessionId=`, and the sandbox host mount path is left out. Directory and context file paths render relative to the root that file tools resolve relative paths against: the runtime working directory when it differs from the agent workspace, otherwise the workspace (`AGENTS.md` instead of `/path/to/workspace/AGENTS.md`). Paths outside that root stay absolute, so they still resolve; in particular, an agent workspace outside a separate working directory keeps its absolute path. Sender context replayed from the session transcript also omits sender ids, including turns stored before the option was enabled. Default: `false` (prompt unchanged).
 
 ```json5
 {

@@ -4,6 +4,7 @@
  * Assembles runtime, workspace, tooling, memory, delegation, channel, and cache-boundary prompt sections.
  */
 import { createHmac, createHash } from "node:crypto";
+import path from "node:path";
 import {
   normalizePromptCapabilityIds,
   normalizeStructuredPromptSection,
@@ -208,16 +209,26 @@ function prepareContextFilesForPrompt(contextFiles: EmbeddedContextFile[]) {
   );
 }
 
-/** Shows a path under the workspace relative to it; other paths are unchanged. */
-function toWorkspaceRelativePromptPath(filePath: string, workspaceDir: string): string {
-  const root = workspaceDir.replace(/\/+$/u, "");
+/**
+ * Shows an absolute path under `root` relative to it; any other path is returned unchanged.
+ * `root` must be the directory file tools resolve relative paths against, so every relative
+ * reference in the prompt stays resolvable. Path flavor follows the root (drive letter or UNC
+ * means win32), so Windows bootstrap paths built with backslashes relativize on any host.
+ */
+function toPromptRelativePath(filePath: string, root: string): string {
   if (!root) {
     return filePath;
   }
-  if (filePath === root) {
+  const flavor = /^(?:[A-Za-z]:[\\/]|\\\\)/u.test(root) ? path.win32 : path.posix;
+  if (!flavor.isAbsolute(filePath) || !flavor.isAbsolute(root)) {
+    return filePath;
+  }
+  const relative = flavor.relative(root, filePath);
+  if (relative === "") {
     return ".";
   }
-  return filePath.startsWith(`${root}/`) ? filePath.slice(root.length + 1) : filePath;
+  const escapes = relative === ".." || relative.startsWith(`..${flavor.sep}`);
+  return escapes || flavor.isAbsolute(relative) ? filePath : relative;
 }
 
 function buildProjectContextSection(
@@ -1075,12 +1086,17 @@ export function buildAgentSystemPrompt(params: {
     ? "none"
     : (params.silentReplyPromptMode ?? "generic");
   const sandboxContainerWorkspace = params.sandboxInfo?.containerWorkspaceDir?.trim();
-  const omitIdentifiers = params.omitPromptIdentifiers === true;
-  const displayPromptPath = (filePath: string) =>
-    omitIdentifiers ? toWorkspaceRelativePromptPath(filePath, params.workspaceDir) : filePath;
-  const sanitizedWorkspaceDir = sanitizeForPromptLiteral(displayPromptPath(params.workspaceDir));
   const runtimeCwd = params.runtimeCwd ?? params.workspaceDir;
   const hasSeparateRuntimeCwd = !sandboxedRuntime && runtimeCwd !== params.workspaceDir;
+  const omitIdentifiers = params.omitPromptIdentifiers === true;
+  // Relative prompt paths must resolve where file tools resolve them: the runtime cwd when it is
+  // separate from the agent workspace, otherwise the (host) workspace. Paths outside that root stay
+  // absolute, so a separate workspace remains addressable instead of collapsing to ".".
+  const promptPathRoot = hasSeparateRuntimeCwd ? runtimeCwd : params.workspaceDir;
+  const displayPromptPath = (filePath: string) =>
+    omitIdentifiers ? toPromptRelativePath(filePath, promptPathRoot) : filePath;
+  const displayedWorkspaceDir = displayPromptPath(params.workspaceDir);
+  const sanitizedWorkspaceDir = sanitizeForPromptLiteral(displayedWorkspaceDir);
   const sanitizedSandboxContainerWorkspace = sandboxContainerWorkspace
     ? sanitizeForPromptLiteral(sandboxContainerWorkspace)
     : "";
@@ -1105,7 +1121,7 @@ export function buildAgentSystemPrompt(params: {
     ? [
         "## Directory Roles",
         `Working directory: ${sanitizeForPromptLiteral(displayPromptPath(runtimeCwd))} (tools and deliverables).`,
-        `Agent workspace: ${sanitizedWorkspaceDir} (AGENTS.md/SOUL.md, other agent instructions, MEMORY.md/memory only; ${omitIdentifiers ? "paths relative to the agent workspace" : "use absolute paths"}).`,
+        `Agent workspace: ${sanitizedWorkspaceDir} (AGENTS.md/SOUL.md, other agent instructions, MEMORY.md/memory only; ${displayedWorkspaceDir === params.workspaceDir ? "use absolute paths" : "paths relative to the working directory"}).`,
       ]
     : ["## Workspace", `Working directory: ${displayWorkspaceDir}`, workspaceGuidance];
   const safetySection = [

@@ -1,3 +1,4 @@
+import path from "node:path";
 import { SYSTEM_PROMPT_CACHE_BOUNDARY } from "@openclaw/ai/internal/shared";
 // System prompt tests cover the main prompt facade, prompt-surface routing, and
 // user-visible sections for owners, tools, safety, skills, and subagents.
@@ -2722,4 +2723,75 @@ describe("buildAgentSystemPrompt omitPromptIdentifiers", () => {
     expect(prompt).toContain("host=engine-host");
     expect(prompt).toContain("model=fixture/model");
   });
+});
+
+// Review on #148: relative prompt paths must stay resolvable by file tools on every platform.
+describe("buildAgentSystemPrompt omitPromptIdentifiers path resolution", () => {
+  const headings = (prompt: string) =>
+    [...prompt.matchAll(/^## (.+\.md)$/gmu)].map((match) => match[1]!);
+
+  it("relativizes Windows backslash paths and keeps paths outside the workspace", () => {
+    const ws = "C:\\Users\\fixture\\instances\\private-instance-148";
+    const prompt = buildAgentSystemPrompt({
+      workspaceDir: ws,
+      omitPromptIdentifiers: true,
+      contextFiles: [
+        { path: `${ws}\\AGENTS.md`, content: "a" },
+        { path: `${ws}\\memory\\USER.md`, content: "b" },
+        { path: `${ws}-other\\SOUL.md`, content: "c" },
+        { path: "D:\\shared\\IDENTITY.md", content: "d" },
+      ],
+    });
+    // Context files keep the prompt's own ordering; only the rendered paths matter here.
+    expect(headings(prompt).toSorted()).toEqual(
+      [
+        "AGENTS.md",
+        "memory\\USER.md",
+        `${ws}-other\\SOUL.md`,
+        "D:\\shared\\IDENTITY.md",
+      ].toSorted(),
+    );
+    expect(prompt).toContain("Working directory: .");
+  });
+
+  it("does not treat a sibling directory with the same prefix as inside the workspace", () => {
+    const prompt = buildAgentSystemPrompt({
+      workspaceDir: "/data/ai/tax/inst-148",
+      omitPromptIdentifiers: true,
+      contextFiles: [
+        { path: "/data/ai/tax/inst-148/AGENTS.md", content: "a" },
+        { path: "/data/ai/tax/inst-148-other/SOUL.md", content: "b" },
+      ],
+    });
+    expect(headings(prompt)).toEqual(["AGENTS.md", "/data/ai/tax/inst-148-other/SOUL.md"]);
+  });
+
+  it.each([
+    ["outside the working directory", "/data/instances/private-instance-148"],
+    ["inside the working directory", "/srv/task-repo/.agent"],
+  ])(
+    "separate runtime cwd, workspace %s: every file reference resolves from the tool root",
+    (_label, ws) => {
+      const runtimeCwd = "/srv/task-repo";
+      const files = [`${ws}/AGENTS.md`, `${ws}/SOUL.md`];
+      const prompt = buildAgentSystemPrompt({
+        workspaceDir: ws,
+        runtimeCwd,
+        omitPromptIdentifiers: true,
+        contextFiles: files.map((file) => ({ path: file, content: "x" })),
+      });
+      // File tools resolve relative paths against the runtime cwd (agent-tools codingRoot).
+      expect(headings(prompt).map((ref) => path.posix.resolve(runtimeCwd, ref))).toEqual(files);
+      const workspaceLine = prompt
+        .split("\n")
+        .find((line) => line.startsWith("Agent workspace: "))!;
+      const shown = /^Agent workspace: (\S+) /u.exec(workspaceLine)![1]!;
+      expect(path.posix.resolve(runtimeCwd, shown)).toBe(ws);
+      expect(workspaceLine).toContain(
+        path.posix.isAbsolute(shown)
+          ? "use absolute paths"
+          : "paths relative to the working directory",
+      );
+    },
+  );
 });

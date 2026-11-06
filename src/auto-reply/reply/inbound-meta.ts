@@ -461,6 +461,22 @@ function buildReplyChainPayload(
   });
 }
 
+const PROMPT_IDENTIFIER_KEYS = [
+  "message_id",
+  "thread_id",
+  "sender_id",
+  "reply_to_id",
+  "forwarded_from_id",
+] as const;
+
+function omitPromptIdentifiers(entry: Record<string, unknown>): Record<string, unknown> {
+  const copy = { ...entry };
+  for (const key of PROMPT_IDENTIFIER_KEYS) {
+    delete copy[key];
+  }
+  return copy;
+}
+
 function isTelegramInboundContext(ctx: TemplateContext): boolean {
   return [ctx.OriginatingChannel, ctx.Surface, ctx.Provider].some(
     (value) => normalizePromptMetadataString(value) === "telegram",
@@ -620,6 +636,10 @@ export function buildInboundUserContextPrefix(
     directChannelValue && directChannelValue !== "webchat",
   );
   const shouldIncludeConversationInfo = !isDirect || includeDirectConversationInfo;
+  // Channel-declared: platform ids stay in ctx for routing and authorization but are not
+  // shown to the model.
+  const omitIdentifiers = ctx.OmitPromptIdentifiers === true;
+  const includeIdentifiers = shouldIncludeConversationInfo && !omitIdentifiers;
 
   const messageId = normalizePromptMetadataString(ctx.MessageSid);
   const messageIdFull = normalizePromptMetadataString(ctx.MessageSidFull);
@@ -647,7 +667,7 @@ export function buildInboundUserContextPrefix(
   const senderIdDigits = senderId?.replace(/\D/gu, "");
   const senderE164Digits = senderE164?.replace(/\D/gu, "");
   const senderIdentity = {
-    id: senderId,
+    id: omitIdentifiers ? undefined : senderId,
     name: normalizePromptMetadataString(ctx.SenderName),
     username: normalizePromptMetadataString(ctx.SenderUsername),
     e164: senderE164Digits && senderE164Digits === senderIdDigits ? undefined : senderE164,
@@ -657,11 +677,9 @@ export function buildInboundUserContextPrefix(
   // Keep volatile conversation/message identifiers in the user-role block so the system
   // prompt stays byte-stable across task-scoped sessions and reply turns.
   const conversationInfo = {
-    chat_id: shouldIncludeConversationInfo ? normalizeOptionalString(ctx.OriginatingTo) : undefined,
-    message_id: shouldIncludeConversationInfo ? resolvedMessageId : undefined,
-    reply_to_id: shouldIncludeConversationInfo
-      ? normalizePromptMetadataString(ctx.ReplyToId)
-      : undefined,
+    chat_id: includeIdentifiers ? normalizeOptionalString(ctx.OriginatingTo) : undefined,
+    message_id: includeIdentifiers ? resolvedMessageId : undefined,
+    reply_to_id: includeIdentifiers ? normalizePromptMetadataString(ctx.ReplyToId) : undefined,
     conversation_label: isDirect ? undefined : normalizePromptMetadataString(ctx.ConversationLabel),
     sender: shouldIncludeConversationInfo
       ? Object.values(senderIdentity).some((value) => value !== undefined)
@@ -709,13 +727,13 @@ export function buildInboundUserContextPrefix(
     blocks.push(
       formatContextJsonBlock(
         markInboundContextLabel("Reply chain of current user message (nearest first):"),
-        replyChainPayload,
+        omitIdentifiers ? replyChainPayload.map(omitPromptIdentifiers) : replyChainPayload,
       ),
     );
   } else if (hasReplyTargetMetadata && !chatWindowCoversReplyContext && !currentMessageContext) {
     blocks.push(
       formatContextJsonBlock(markInboundContextLabel("Reply target of current user message:"), {
-        message_id: replyToId,
+        message_id: omitIdentifiers ? undefined : replyToId,
         sender_label: replyToSender,
         is_quote: ctx.ReplyToIsQuote === true ? true : undefined,
         body: replyToBody || undefined,
@@ -779,7 +797,7 @@ export function buildInboundUserContextPrefix(
       ];
       const line = formatChatWindowMessage(
         {
-          message_id: entry.messageId,
+          message_id: omitIdentifiers ? undefined : entry.messageId,
           sender: entry.sender,
           timestamp_ms: entry.timestamp,
           body: entry.body,

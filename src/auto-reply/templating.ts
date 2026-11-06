@@ -312,6 +312,11 @@ export type MsgContext = Partial<CanonicalInboundText> & {
   OwnerAllowFrom?: Array<string | number>;
   SenderName?: string;
   SenderId?: string;
+  /**
+   * Channel-declared: keep platform identifiers (chat, message, reply and sender ids) out of
+   * model-visible inbound context. The ids stay on this context for routing and authorization.
+   */
+  OmitPromptIdentifiers?: boolean;
   /** Trusted in-process creation provenance; never populated from channel payloads. */
   SessionCreation?: {
     skillLibrarySelections?: import("../../packages/gateway-protocol/src/schema/skill-library.js").SkillLibrarySelection[];

@@ -1204,6 +1204,8 @@ export function buildAgentSystemPrompt(params: {
     reasoningLevel,
     userTimezone,
     sandboxInfo: params.sandboxInfo,
+    // Path rendering (relative vs absolute) and the sandbox mount line depend on this switch.
+    omitPromptIdentifiers: omitIdentifiers,
     displayWorkspaceDir,
     workspaceGuidance,
     workspaceOnlyGuidance,

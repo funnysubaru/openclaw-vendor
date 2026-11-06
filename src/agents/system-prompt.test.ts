@@ -2794,4 +2794,31 @@ describe("buildAgentSystemPrompt omitPromptIdentifiers path resolution", () => {
       );
     },
   );
+  // Review on #148: the stable-prefix cache must not reuse a prefix rendered under the other setting.
+  it.each([
+    ["off then on", [false, true]],
+    ["on then off", [true, false]],
+  ] as const)("stable prefix cache separates the switch (%s)", (label, order) => {
+    const slug = label.replaceAll(" ", "-");
+    const ws = `/data/review148-cache-${slug}/workspace`;
+    const runtimeCwd = `/srv/review148-cache-${slug}/task-id-148`;
+    const build = (omit: boolean) =>
+      buildAgentSystemPrompt({
+        workspaceDir: ws,
+        runtimeCwd,
+        omitPromptIdentifiers: omit,
+        contextFiles: [{ path: `${runtimeCwd}/AGENTS.md`, content: "x" }],
+      });
+    for (const omit of order) {
+      const prompt = build(omit);
+      if (omit) {
+        expect(prompt).toContain("Working directory: . (tools and deliverables).");
+        expect(prompt).toContain("## AGENTS.md");
+        expect(prompt).not.toContain(runtimeCwd);
+      } else {
+        expect(prompt).toContain(`Working directory: ${runtimeCwd} (tools and deliverables).`);
+        expect(prompt).toContain(`## ${runtimeCwd}/AGENTS.md`);
+      }
+    }
+  });
 });

@@ -439,6 +439,8 @@ export async function dispatchCronDelivery(
           to: delivery.to,
           threadId: stringifyRouteThreadId(delivery.threadId),
           partialDelivered: payloadMayHaveReachedRecipientBeforeFailure,
+          omitIdentifiers:
+            params.cfgWithAgentDefaults.agents?.defaults?.omitPromptIdentifiers === true,
         });
         await queueCronAwarenessSystemEvent({
           cfg: params.cfgWithAgentDefaults,

@@ -59,6 +59,26 @@ describe("runCronIsolatedAgentTurn hook content wrapping", () => {
     });
   });
 
+  it("omits job identifiers from wrapped hook content when omitPromptIdentifiers is set", async () => {
+    await withTempHome(async (home) => {
+      await runCronTurn(home, {
+        jobPayload: { kind: "agentTurn", message: "Hello" },
+        message: "Hello",
+        sessionKey: "hook:gmail:msg-1",
+        cfgOverrides: {
+          agents: {
+            entries: { main: { default: true } },
+            defaults: { model: "anthropic/claude-opus-4-6", omitPromptIdentifiers: true },
+          },
+        },
+      });
+
+      const prompt = lastEmbeddedPrompt();
+      expect(prompt).toContain("EXTERNAL, UNTRUSTED");
+      expect(prompt).not.toContain("job-1");
+    });
+  });
+
   it("wraps normalized webhook hook content using preserved provenance", async () => {
     await withTempHome(async (home) => {
       const { res } = await runCronTurn(home, {

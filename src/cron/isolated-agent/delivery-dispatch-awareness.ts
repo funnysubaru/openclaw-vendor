@@ -148,6 +148,8 @@ export function formatTargetCronDeliveryFailureAwarenessText(params: {
   to: string;
   threadId?: string;
   partialDelivered?: boolean;
+  /** omitPromptIdentifiers: drop the Job and Target lines (job name and delivery target can carry ids). */
+  omitIdentifiers?: boolean;
 }): string {
   const targetParts = [`${params.channel}:${params.to}`];
   if (params.threadId) {
@@ -155,8 +157,9 @@ export function formatTargetCronDeliveryFailureAwarenessText(params: {
   }
   return [
     "A scheduled automation attempted to deliver to this channel, but delivery failed.",
-    `Job: ${params.job.name || params.job.id}`,
-    `Target: ${targetParts.join(" ")}`,
+    ...(params.omitIdentifiers
+      ? []
+      : [`Job: ${params.job.name || params.job.id}`, `Target: ${targetParts.join(" ")}`]),
     "Check automation history for delivery error details.",
     params.partialDelivered
       ? "One or more scheduled message payloads may already have been delivered."

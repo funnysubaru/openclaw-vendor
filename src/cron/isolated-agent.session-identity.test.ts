@@ -166,6 +166,28 @@ describe("runCronIsolatedAgentTurn session identity", () => {
     });
   });
 
+  it("writes a bare [cron] header when omitPromptIdentifiers is set", async () => {
+    await withTempHome(async (home) => {
+      await runCronTurn(home, {
+        jobPayload: DEFAULT_AGENT_TURN_PAYLOAD,
+        cfgOverrides: {
+          agents: {
+            entries: { main: { default: true } },
+            defaults: {
+              model: "anthropic/claude-opus-4-6",
+              workspace: path.join(home, "openclaw"),
+              omitPromptIdentifiers: true,
+            },
+          },
+        },
+      });
+
+      const prompt = lastEmbeddedAgentCall().prompt ?? "";
+      expect(prompt.split("\n")[0]).toMatch(/^\[cron\] /);
+      expect(prompt).not.toContain("job-1");
+    });
+  });
+
   it.each([
     {
       label: "uses agentId for workspace, session key, and store paths",

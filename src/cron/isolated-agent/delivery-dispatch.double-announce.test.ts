@@ -3095,6 +3095,33 @@ describe("dispatchCronDelivery — double-announce guard", () => {
     );
   });
 
+  it("omits job and target identifiers from failure awareness when omitPromptIdentifiers is set", async () => {
+    mockResolvedOutboundRoute({
+      sessionKey: "agent:main:telegram:direct:123456",
+      baseSessionKey: "agent:main:telegram:direct:123456",
+      to: "telegram:123456",
+    });
+    vi.mocked(deliverOutboundPayloads).mockRejectedValue(new Error("boom"));
+
+    const params = makeBaseParams({
+      synthesizedText: "This delivery will fail.",
+      runStartedAt: 1_000,
+    });
+    params.cfgWithAgentDefaults = {
+      agents: { defaults: { omitPromptIdentifiers: true } },
+    } as never;
+    await dispatchCronDelivery(params);
+
+    expect(enqueueSystemEvent).toHaveBeenCalledExactlyOnceWith(
+      [
+        "A scheduled automation attempted to deliver to this channel, but delivery failed.",
+        "Check automation history for delivery error details.",
+        "No scheduled message was delivered.",
+      ].join("\n"),
+      expect.anything(),
+    );
+  });
+
   it("does not persist the outbound route when direct cron delivery fails (#112710)", async () => {
     mockResolvedOutboundRoute({
       sessionKey: "agent:main:telegram:direct:123456",

@@ -539,7 +539,10 @@ export async function prepareCronRunContext(params: {
     const message = currentConversationContext
       ? `${currentConversationContext}\n\n${resolveCronAgentTurnMessage(input)}`
       : resolveCronAgentTurnMessage(input);
-    const base = `[cron:${input.job.id} ${input.job.name}] ${message}`.trim();
+    // omitPromptIdentifiers: the model sees neither the job id nor the job name (operators may encode ids there).
+    const omitIdentifiers = cfgWithAgentDefaults.agents?.defaults?.omitPromptIdentifiers === true;
+    const header = omitIdentifiers ? "[cron]" : `[cron:${input.job.id} ${input.job.name}]`;
+    const base = `${header} ${message}`.trim();
     const isExternalHook =
       hookExternalContentSource !== undefined || isExternalHookSession(baseSessionKey);
     const allowUnsafeExternalContent =
@@ -565,8 +568,8 @@ export async function prepareCronRunContext(params: {
       const safeContent = buildSafeExternalPrompt({
         content: message,
         source: hookType,
-        jobName: input.job.name,
-        jobId: input.job.id,
+        jobName: omitIdentifiers ? undefined : input.job.name,
+        jobId: omitIdentifiers ? undefined : input.job.id,
         timestamp: formattedTime,
       });
       commandBody = `${safeContent}\n\n${timeLine}`.trim();

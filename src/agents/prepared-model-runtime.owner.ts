@@ -1,7 +1,11 @@
 import path from "node:path";
 import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
 import { tryResolveLegacyCompatibilityAgentId } from "../config/legacy.default-agent-owner.js";
-import { hashRuntimeConfigValue } from "../config/runtime-snapshot.js";
+import {
+  getRuntimeConfigSnapshot,
+  getRuntimeConfigSnapshotMetadata,
+  hashRuntimeConfigValue,
+} from "../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { isReservedSystemAgentId } from "../system-agent/agent-id.js";
 import {
@@ -192,10 +196,19 @@ export function preparedModelRuntimeConfigsMatch(
     return true;
   }
   try {
-    return hashRuntimeConfigValue(left) === hashRuntimeConfigValue(right);
+    return modelRuntimeConfigFingerprint(left) === modelRuntimeConfigFingerprint(right);
   } catch {
     return false;
   }
+}
+
+// Yuiwork collab backport of upstream openclaw #171371 (608a09cdcd5), prepared-model-runtime part only.
+// Without it every config publication re-stringifies the whole config once per agent while chat
+// metadata rebuilds each agent's projection (O(agents x config size)). See COLLAB-PATCHES.md #3.
+function modelRuntimeConfigFingerprint(config: OpenClawConfig): string {
+  // Canonical values change at publication; caller-owned projections still need a fresh hash.
+  const published = config === getRuntimeConfigSnapshot() && getRuntimeConfigSnapshotMetadata();
+  return published ? published.fingerprint : hashRuntimeConfigValue(config);
 }
 
 function stampPreparedModelRuntimeSnapshotConfig(
@@ -287,7 +300,7 @@ export function ownerKey(input: PreparedModelRuntimeInput): string {
     env: environmentFingerprint(input.env),
     allowGatewaySubagentBinding: input.allowGatewaySubagentBinding === true,
     runtimePluginSelections: input.runtimePluginSelections,
-    config: input.readOnly ? hashRuntimeConfigValue(input.config) : undefined,
+    config: input.readOnly ? modelRuntimeConfigFingerprint(input.config) : undefined,
   });
 }
 

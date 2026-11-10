@@ -10,6 +10,10 @@ import type {
 import { transformProviderMessages as transformMessages } from "./provider-transcript-transform.js";
 import type { ProviderMessage } from "./provider-types.js";
 import {
+  isGeminiToolParameterAliasModel,
+  mapGoogleToolArguments,
+} from "./providers/google-tool-parameters.js";
+import {
   describeToolResultMediaPlaceholder,
   extractToolResultText,
   isImageWithMediaPayload,
@@ -205,7 +209,13 @@ export function convertMessages(
           type: "function" as const,
           function: {
             name: toolCall.name,
-            arguments: JSON.stringify(toolCall.arguments),
+            // Gemini 系：历史里的工具调用参数要按发出去的别名 schema 再编码一次，
+            // 否则模型看到的是 `in`、schema 里却是 `in_`，前后对不上（ADR-0033 任务 150）。
+            arguments: JSON.stringify(
+              isGeminiToolParameterAliasModel(model.id)
+                ? mapGoogleToolArguments(context.tools, toolCall.name, toolCall.arguments, "encode")
+                : toolCall.arguments,
+            ),
           },
         }));
         const reasoningDetails = toolCalls.flatMap((toolCall) => {

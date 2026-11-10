@@ -310,6 +310,7 @@ export function createOpenAICompletionsTransportStreamFn(): StreamFn {
           abortFirstEventStream: firstEventAbort.abort,
           onFirstEventTimeout: getFirstStreamEventTimeoutHandler(options),
           sawStreamDONE: doneDetector.sawDone,
+          tools: context.tools,
         });
         finalizeTransportStream({ stream, output, signal: options?.signal });
       } catch (error) {

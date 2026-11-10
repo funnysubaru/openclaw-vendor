@@ -2,6 +2,10 @@ import type { CacheRetention, Context, Model } from "@openclaw/llm-core";
 import { convertMessages, hasToolCallHistory } from "../openai-completions-messages.js";
 import type { OpenAICompletionsOptions } from "../provider-options.js";
 import { resolveCacheRetention } from "../providers/cache-retention.js";
+import {
+  googleToolParameters,
+  isGeminiToolParameterAliasModel,
+} from "../providers/google-tool-parameters.js";
 import { resolveOpenAIPromptCacheParams } from "../providers/openai-prompt-cache.js";
 import {
   isOpenAIGpt54MiniModel,
@@ -259,6 +263,13 @@ function convertTools(
   mode: "direct" | "managed",
 ) {
   const projection = projectOpenAITools(tools);
+  // Gemini 遇到 Python 保留字参数名（如 automations 的 `in`、memory_get 的 `from`）会整轮生成不出
+  // 合法工具调用（Google 回 MALFORMED_FUNCTION_CALL，OpenRouter 统一成 finish_reason=error）。
+  // 发出前把这些参数改成 `in_` 之类的别名，回包时在 openai-completions-stream 里还原（ADR-0033 任务 150）。
+  const aliasParameters = (parameters: (typeof projection.tools)[number]["parameters"]) =>
+    isGeminiToolParameterAliasModel(model.id)
+      ? (googleToolParameters(parameters as never) as typeof parameters)
+      : parameters;
   const strict =
     mode === "direct"
       ? compat.supportsStrictMode
@@ -288,8 +299,12 @@ function convertTools(
         description: tool.description,
         parameters:
           mode === "direct"
-            ? tool.parameters
-            : normalizeOpenAIStrictToolParameters(tool.parameters, strict === true, model.compat),
+            ? aliasParameters(tool.parameters)
+            : normalizeOpenAIStrictToolParameters(
+                aliasParameters(tool.parameters),
+                strict === true,
+                model.compat,
+              ),
       };
       if (strict !== undefined) {
         functionTool.strict = strict;

@@ -169,6 +169,7 @@ export const streamOpenAICompletions: StreamFunction<
           firstEventTimeoutMs: getFirstStreamEventTimeoutMs(options),
           abortFirstEventStream: firstEventAbort.abort,
           onFirstEventTimeout: getFirstStreamEventTimeoutHandler(options),
+          tools: context.tools,
         });
         if (options?.signal?.aborted) {
           throw transportAbortError(options.signal);

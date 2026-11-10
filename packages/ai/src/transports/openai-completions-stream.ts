@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AssistantMessageEvent, Model } from "@openclaw/llm-core";
+import type { AssistantMessageEvent, Context, Model } from "@openclaw/llm-core";
 import { appendAssistantThinking } from "@openclaw/llm-core/event-stream";
 import type { ChatCompletionChunk } from "openai/resources/chat/completions.js";
 import type { OpenAICompletionsOptions } from "../provider-options.js";
@@ -8,7 +8,7 @@ import {
   createOpenAIEncryptedToolCallReasoningTracker,
   finalizeOpenAICompletionsToolCalls,
 } from "../providers/openai-completions-tool-calls.js";
-import { mapOpenAIStopReason } from "../providers/openai-stop-reason.js";
+import { mapOpenAIChoiceStopReason } from "../providers/openai-stop-reason.js";
 import {
   clearPendingCommentaryText,
   rememberPendingCommentaryTags,
@@ -63,6 +63,8 @@ type CompletionsStreamOptions = {
   abortFirstEventStream?: (reason: Error) => void;
   onFirstEventTimeout?: (reason: Error) => void;
   sawStreamDONE?: () => boolean;
+  // 本轮声明给模型的工具：Gemini 保留字参数别名在收尾时按它还原（ADR-0033 任务 150）。
+  tools?: Context["tools"];
 } & (
   | {
       mode: "direct";
@@ -503,7 +505,8 @@ export async function processCompletionsStream(
       hasReasoningUsageActivity = hasOpenAICompletionsReasoningUsageActivity(choiceUsage);
     }
     if (choice.finish_reason) {
-      const finishReasonResult = mapOpenAIStopReason(choice.finish_reason, {
+      // 带上 OpenRouter 的 native_finish_reason，日志才看得出 MALFORMED_FUNCTION_CALL 之类真因。
+      const finishReasonResult = mapOpenAIChoiceStopReason(choice, {
         allowSingularToolCall: true,
       });
       output.stopReason = finishReasonResult.stopReason;
@@ -673,6 +676,7 @@ export async function processCompletionsStream(
   finalizeOpenAICompletionsToolCalls(output, {
     allowSilentToolCallPromotion:
       finishReason === "stop" || (sawNativeToolCallDelta && (options?.sawStreamDONE?.() ?? false)),
+    geminiToolArguments: { modelId: model.id, tools: options?.tools },
     onConfirmedToolCall(block, contentIndex) {
       if (directMode || block.type !== "toolCall") {
         return;

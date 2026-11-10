@@ -3,8 +3,10 @@ import { convertMessages, hasToolCallHistory } from "../openai-completions-messa
 import type { OpenAICompletionsOptions } from "../provider-options.js";
 import { resolveCacheRetention } from "../providers/cache-retention.js";
 import {
-  googleToolParameters,
+  applyToolParameterAliases,
   isGeminiToolParameterAliasModel,
+  resolveToolParameterAliases,
+  type ToolParameterAliases,
 } from "../providers/google-tool-parameters.js";
 import { resolveOpenAIPromptCacheParams } from "../providers/openai-prompt-cache.js";
 import {
@@ -265,11 +267,19 @@ function convertTools(
   const projection = projectOpenAITools(tools);
   // Gemini 遇到 Python 保留字参数名（如 automations 的 `in`、memory_get 的 `from`）会整轮生成不出
   // 合法工具调用（Google 回 MALFORMED_FUNCTION_CALL，OpenRouter 统一成 finish_reason=error）。
-  // 发出前把这些参数改成 `in_` 之类的别名，回包时在 openai-completions-stream 里还原（ADR-0033 任务 150）。
-  const aliasParameters = (parameters: (typeof projection.tools)[number]["parameters"]) =>
-    isGeminiToolParameterAliasModel(model.id)
-      ? (googleToolParameters(parameters as never) as typeof parameters)
-      : parameters;
+  // 别名在「最终出站 schema」（投影 + 规范化之后）上算，按工具名记下来，供历史编码与回包还原共用（ADR-0033 任务 150）。
+  const aliasGemini = isGeminiToolParameterAliasModel(model.id);
+  const argumentAliases = new Map<string, ToolParameterAliases>();
+  const aliasParameters = <T>(name: string, parameters: T): T => {
+    if (!aliasGemini) {
+      return parameters;
+    }
+    const aliases = resolveToolParameterAliases(parameters);
+    if (aliases.size > 0) {
+      argumentAliases.set(name, aliases);
+    }
+    return applyToolParameterAliases(parameters, aliases);
+  };
   const strict =
     mode === "direct"
       ? compat.supportsStrictMode
@@ -288,6 +298,7 @@ function convertTools(
         );
   return {
     projection,
+    argumentAliases,
     tools: sortTransportToolsByName(projection.tools).map((tool) => {
       const functionTool: {
         name: string;
@@ -299,11 +310,10 @@ function convertTools(
         description: tool.description,
         parameters:
           mode === "direct"
-            ? aliasParameters(tool.parameters)
-            : normalizeOpenAIStrictToolParameters(
-                aliasParameters(tool.parameters),
-                strict === true,
-                model.compat,
+            ? aliasParameters(tool.name, tool.parameters)
+            : aliasParameters(
+                tool.name,
+                normalizeOpenAIStrictToolParameters(tool.parameters, strict === true, model.compat),
               ),
       };
       if (strict !== undefined) {
@@ -315,6 +325,20 @@ function convertTools(
       };
     }),
   };
+}
+
+// 每个请求体对应的「工具名 → 参数别名」。调用方在 onPayload 之前取出，流收尾时据此还原回包参数，
+// 保证出站改名、历史编码、回包还原用的是同一份映射（ADR-0033 任务 150）。
+const completionsToolArgumentAliases = new WeakMap<
+  object,
+  ReadonlyMap<string, ToolParameterAliases>
+>();
+
+/** 取 buildOpenAICompletionsParams / buildOpenAICompletionsRequest 刚生成的请求体的参数别名。 */
+export function getCompletionsToolArgumentAliases(
+  params: object,
+): ReadonlyMap<string, ToolParameterAliases> | undefined {
+  return completionsToolArgumentAliases.get(params);
 }
 
 export function buildOpenAICompletionsParams(
@@ -362,10 +386,16 @@ export function buildOpenAICompletionsRequest(
   const markTools =
     endpointClass !== "modelstudio-native" &&
     !(endpointClass === "default" && ["modelstudio", "dashscope", "qwen"].includes(model.provider));
+  // 工具先于消息转换：Gemini 的参数别名要在最终出站工具 schema 上算出，历史 tool_call 重放复用同一份。
+  const convertedTools =
+    (policy.mode === "direct" || supportsModelTools(model)) && context.tools
+      ? convertTools(context.tools, compat, model, policy.mode)
+      : undefined;
   const cacheOptOutIndexes = new Set<number>();
   // The converter needs intact boundaries for Runtime relocation or cache markers.
   let messages: unknown[] = convertMessages(model as never, context, compat as never, {
     cacheOptOutIndexes,
+    toolArgumentAliases: convertedTools?.argumentAliases,
     preserveSystemPromptCacheBoundary:
       cacheControl !== undefined && !managedCompat?.requiresStringContent,
   });
@@ -385,6 +415,9 @@ export function buildOpenAICompletionsRequest(
     stream: true,
     ...resolveOpenAIPromptCacheParams(model, cacheRetention, compat),
   };
+  if (convertedTools && convertedTools.argumentAliases.size > 0) {
+    completionsToolArgumentAliases.set(params, convertedTools.argumentAliases);
+  }
   if (compat.supportsUsageInStreaming) {
     params.stream_options = { include_usage: true };
   }
@@ -431,8 +464,8 @@ export function buildOpenAICompletionsRequest(
   }
   let directToolProjection: ReturnType<typeof projectOpenAITools> | undefined;
   if (policy.mode === "direct" || supportsModelTools(model)) {
-    if (context.tools) {
-      const converted = convertTools(context.tools, compat, model, policy.mode);
+    if (convertedTools) {
+      const converted = convertedTools;
       if (policy.mode === "direct") {
         directToolProjection = converted.projection;
       }

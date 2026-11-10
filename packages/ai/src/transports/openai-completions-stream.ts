@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AssistantMessageEvent, Context, Model } from "@openclaw/llm-core";
+import type { AssistantMessageEvent, Model } from "@openclaw/llm-core";
 import { appendAssistantThinking } from "@openclaw/llm-core/event-stream";
 import type { ChatCompletionChunk } from "openai/resources/chat/completions.js";
 import type { OpenAICompletionsOptions } from "../provider-options.js";
@@ -63,8 +63,8 @@ type CompletionsStreamOptions = {
   abortFirstEventStream?: (reason: Error) => void;
   onFirstEventTimeout?: (reason: Error) => void;
   sawStreamDONE?: () => boolean;
-  // 本轮声明给模型的工具：Gemini 保留字参数别名在收尾时按它还原（ADR-0033 任务 150）。
-  tools?: Context["tools"];
+  // 工具名 → 参数别名（Gemini 保留字），出站时由 openai-completions-params 算出，收尾时按它还原（ADR-0033 任务 150）。
+  toolArgumentAliases?: ReadonlyMap<string, ReadonlyMap<string, string>>;
 } & (
   | {
       mode: "direct";
@@ -676,7 +676,7 @@ export async function processCompletionsStream(
   finalizeOpenAICompletionsToolCalls(output, {
     allowSilentToolCallPromotion:
       finishReason === "stop" || (sawNativeToolCallDelta && (options?.sawStreamDONE?.() ?? false)),
-    geminiToolArguments: { modelId: model.id, tools: options?.tools },
+    toolArgumentAliases: options?.toolArgumentAliases,
     onConfirmedToolCall(block, contentIndex) {
       if (directMode || block.type !== "toolCall") {
         return;

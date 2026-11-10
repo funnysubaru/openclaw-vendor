@@ -3,10 +3,10 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { ChatCompletionChunk } from "openai/resources/chat/completions.js";
 import { measureUtf8AppendBytes } from "../transports/openai-transport-shared.js";
 import { finalizeTerminalToolCallArguments } from "../transports/transport-stream-shared.js";
-import type { Tool, ToolCall } from "../types.js";
+import type { ToolCall } from "../types.js";
 import {
-  isGeminiToolParameterAliasModel,
-  mapGoogleToolArguments,
+  mapToolArgumentsWithAliases,
+  type ToolParameterAliases,
 } from "./google-tool-parameters.js";
 
 type ChatCompletionToolCallDelta = ChatCompletionChunk.Choice.Delta.ToolCall;
@@ -23,10 +23,10 @@ type OpenAICompletionsToolCallFinalizationOptions<TBlock extends object> = {
   allowSilentToolCallPromotion?: boolean;
   onConfirmedToolCall?: (block: TBlock, contentIndex: number) => void;
   /**
-   * Gemini 出站时保留字参数被改成了 `in_` 之类的别名（openai-completions-params），
-   * 这里在工具调用确认后、交给执行前还原成原名（ADR-0033 任务 150）。
+   * 工具名 → 参数别名。Gemini 出站时保留字参数被改成了 `in_` 之类的别名（openai-completions-params），
+   * 这里在工具调用确认后、交给执行前按同一份映射还原成原名（ADR-0033 任务 150）。
    */
-  geminiToolArguments?: { modelId: string; tools?: Tool[] };
+  toolArgumentAliases?: ReadonlyMap<string, ToolParameterAliases>;
 };
 
 /** Keep encrypted provider reasoning attached to the first matching tool call. */
@@ -309,10 +309,10 @@ export function finalizeOpenAICompletionsToolCalls<TBlock extends object>(
     }
     delete (block as { partialArgs?: string }).partialArgs;
     delete (block as { streamIndex?: number }).streamIndex;
-    const gemini = options.geminiToolArguments;
-    if (gemini && isGeminiToolParameterAliasModel(gemini.modelId)) {
-      const call = block as unknown as FinalToolCall & { name: string };
-      call.arguments = mapGoogleToolArguments(gemini.tools, call.name, call.arguments, "decode");
+    const call = block as unknown as FinalToolCall & { name: string };
+    const aliases = options.toolArgumentAliases?.get(call.name);
+    if (aliases) {
+      call.arguments = mapToolArgumentsWithAliases(aliases, call.arguments, "decode");
     }
     options.onConfirmedToolCall?.(block, contentIndex);
   }

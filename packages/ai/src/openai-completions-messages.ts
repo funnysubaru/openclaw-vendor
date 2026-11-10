@@ -10,8 +10,8 @@ import type {
 import { transformProviderMessages as transformMessages } from "./provider-transcript-transform.js";
 import type { ProviderMessage } from "./provider-types.js";
 import {
-  isGeminiToolParameterAliasModel,
-  mapGoogleToolArguments,
+  mapToolArgumentsWithAliases,
+  type ToolParameterAliases,
 } from "./providers/google-tool-parameters.js";
 import {
   describeToolResultMediaPlaceholder,
@@ -57,6 +57,8 @@ export function convertMessages(
   options: {
     cacheOptOutIndexes?: Set<number>;
     preserveSystemPromptCacheBoundary?: boolean;
+    /** 工具名 → 参数别名（Gemini 保留字），由出站工具 schema 算出；历史 tool_call 按它编码。 */
+    toolArgumentAliases?: ReadonlyMap<string, ToolParameterAliases>;
   } = {},
 ): ChatCompletionMessageParam[] {
   const params: ChatCompletionMessageParam[] = [];
@@ -212,9 +214,11 @@ export function convertMessages(
             // Gemini 系：历史里的工具调用参数要按发出去的别名 schema 再编码一次，
             // 否则模型看到的是 `in`、schema 里却是 `in_`，前后对不上（ADR-0033 任务 150）。
             arguments: JSON.stringify(
-              isGeminiToolParameterAliasModel(model.id)
-                ? mapGoogleToolArguments(context.tools, toolCall.name, toolCall.arguments, "encode")
-                : toolCall.arguments,
+              mapToolArgumentsWithAliases(
+                options.toolArgumentAliases?.get(toolCall.name),
+                toolCall.arguments,
+                "encode",
+              ),
             ),
           },
         }));

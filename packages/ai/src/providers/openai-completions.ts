@@ -9,7 +9,10 @@ import {
   resolveOpenAICompletionsCompat,
   type ResolvedOpenAICompletionsCompat,
 } from "../transports/openai-completions-compat.js";
-import { buildOpenAICompletionsRequest } from "../transports/openai-completions-params.js";
+import {
+  buildOpenAICompletionsRequest,
+  getCompletionsToolArgumentAliases,
+} from "../transports/openai-completions-params.js";
 import { processCompletionsStream } from "../transports/openai-completions-stream.js";
 import {
   createOpenAIProviderAcceptanceHook,
@@ -81,6 +84,8 @@ export const streamOpenAICompletions: StreamFunction<
         compat,
         cacheRetention,
       });
+      // onPayload 可能换掉请求体对象，先取出本次出站算好的参数别名（ADR-0033 任务 150）。
+      const toolArgumentAliases = getCompletionsToolArgumentAliases(params);
       const nextParams = await options?.onPayload?.(params, model);
       if (nextParams !== undefined) {
         params = nextParams as typeof params;
@@ -169,7 +174,7 @@ export const streamOpenAICompletions: StreamFunction<
           firstEventTimeoutMs: getFirstStreamEventTimeoutMs(options),
           abortFirstEventStream: firstEventAbort.abort,
           onFirstEventTimeout: getFirstStreamEventTimeoutHandler(options),
-          tools: context.tools,
+          toolArgumentAliases,
         });
         if (options?.signal?.aborted) {
           throw transportAbortError(options.signal);

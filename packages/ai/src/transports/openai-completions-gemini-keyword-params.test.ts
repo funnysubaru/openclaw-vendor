@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { buildOpenAICompletionsParams } from "./openai-completions-params.js";
+import {
+  buildOpenAICompletionsParams,
+  getCompletionsToolArgumentAliases,
+} from "./openai-completions-params.js";
 import { processCompletionsStream } from "./openai-completions-stream.js";
 import {
   createAssistantOutput,
@@ -127,13 +130,18 @@ describe("openai completions Gemini keyword parameter aliases", () => {
       }) as never;
       yield makeCompletionsChunk({}, "tool_calls") as never;
     }
+    const params = buildOpenAICompletionsParams(
+      model,
+      { systemPrompt: "s", messages: [], tools: [keywordTool] } as never,
+      undefined,
+    );
     await processCompletionsStream(
       chunks(),
       output,
       model,
       { push: (e) => events.push(e) },
       {
-        tools: [keywordTool] as never,
+        toolArgumentAliases: getCompletionsToolArgumentAliases(params),
         sawStreamDONE: () => true,
       },
     );
@@ -167,5 +175,140 @@ describe("openai completions Gemini keyword parameter aliases", () => {
     expect(output.errorMessage).toBe(
       "Provider finish_reason: error (native_finish_reason: MALFORMED_FUNCTION_CALL)",
     );
+  });
+
+  // vendor PR #153 review：映射必须来自「最终出站 schema」，并被出站、历史编码、回包还原三处共用。
+  describe("aliases derived from the final outbound schema", () => {
+    const keywordNames = new Set(["in", "from"]);
+    // 收集函数顶层字段名：根 properties + allOf/anyOf/oneOf 分支里的 properties。
+    const topLevelNames = (schema: Record<string, unknown>): string[] => [
+      ...Object.keys((schema.properties as object | undefined) ?? {}),
+      ...["allOf", "anyOf", "oneOf"].flatMap((key) =>
+        ((schema[key] as Record<string, unknown>[] | undefined) ?? []).flatMap(topLevelNames),
+      ),
+    ];
+    const roundTrip = async (parameters: unknown, history: Record<string, unknown>) => {
+      const model = geminiModel();
+      const tool = { name: "lookup", description: "Look up", parameters };
+      const params = buildOpenAICompletionsParams(
+        model,
+        {
+          systemPrompt: "s",
+          tools: [tool],
+          messages: [
+            { role: "user", content: "go", timestamp: 1 },
+            {
+              role: "assistant",
+              content: [{ type: "toolCall", id: "call_0", name: "lookup", arguments: history }],
+              api: "openai-completions",
+              provider: "openrouter",
+              model: model.id,
+              stopReason: "toolUse",
+              timestamp: 2,
+            },
+            {
+              role: "toolResult",
+              toolCallId: "call_0",
+              toolName: "lookup",
+              content: [{ type: "text", text: "ok" }],
+              isError: false,
+              timestamp: 3,
+            },
+          ],
+        } as never,
+        undefined,
+      );
+      const shaped = params as unknown as ParamsShape;
+      const outbound = shaped.tools?.[0]?.function.parameters as unknown as Record<string, unknown>;
+      const wireHistory = JSON.parse(
+        shaped.messages.find((m) => m.role === "assistant")?.tool_calls?.[0]?.function.arguments ??
+          "{}",
+      ) as Record<string, unknown>;
+      // 模型照着出站 schema、用历史里同样的参数名回一次工具调用，收尾后应还原成原名。
+      const output = createAssistantOutput(model);
+      async function* chunks() {
+        yield makeCompletionsChunk({
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_1",
+              function: { name: "lookup", arguments: JSON.stringify(wireHistory) },
+            },
+          ],
+        }) as never;
+        yield makeCompletionsChunk({}, "tool_calls") as never;
+      }
+      await processCompletionsStream(
+        chunks(),
+        output,
+        model,
+        { push: () => {} },
+        {
+          toolArgumentAliases: getCompletionsToolArgumentAliases(params),
+          sawStreamDONE: () => true,
+        },
+      );
+      return {
+        outboundNames: topLevelNames(outbound),
+        wireHistory,
+        decoded: (output.content[0] as { arguments: unknown }).arguments,
+      };
+    };
+
+    it("renames keyword parameters behind a root $ref", async () => {
+      const result = await roundTrip(
+        {
+          $ref: "#/$defs/Args",
+          $defs: {
+            Args: { type: "object", properties: { in: { type: "string" } }, required: ["in"] },
+          },
+        },
+        { in: "5m" },
+      );
+      expect(result.outboundNames.filter((name) => keywordNames.has(name))).toEqual([]);
+      expect(result.wireHistory).toEqual({ in_: "5m" });
+      expect(result.decoded).toEqual({ in: "5m" });
+    });
+
+    it("renames keyword parameters declared in root anyOf branches", async () => {
+      const result = await roundTrip(
+        {
+          anyOf: [
+            { type: "object", properties: { in: { type: "string" } }, required: ["in"] },
+            { type: "object", properties: { from: { type: "string" } }, required: ["from"] },
+          ],
+        },
+        { in: "5m", from: "now" },
+      );
+      expect(result.outboundNames.filter((name) => keywordNames.has(name))).toEqual([]);
+      expect(result.decoded).toEqual({ in: "5m", from: "now" });
+    });
+
+    it("avoids aliases that collide with top-level fields from allOf branches", async () => {
+      const result = await roundTrip(
+        {
+          type: "object",
+          properties: { in: { type: "string" } },
+          allOf: [{ type: "object", properties: { in_: { type: "number" } } }],
+        },
+        { in: "5m", in_: 7 },
+      );
+      expect(result.outboundNames.filter((name) => keywordNames.has(name))).toEqual([]);
+      expect(Object.keys(result.wireHistory)).toHaveLength(2);
+      expect(result.decoded).toEqual({ in: "5m", in_: 7 });
+    });
+
+    it("restores arguments for schemas serialized through toJSON", async () => {
+      const parameters = {
+        toJSON: () => ({
+          type: "object",
+          properties: { in: { type: "string" } },
+          required: ["in"],
+        }),
+      };
+      const result = await roundTrip(parameters, { in: "5m" });
+      expect(result.outboundNames).toEqual(["in_"]);
+      expect(result.decoded).toEqual({ in: "5m" });
+    });
   });
 });

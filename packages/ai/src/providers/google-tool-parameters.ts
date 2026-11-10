@@ -22,6 +22,9 @@ const PYTHON_KEYWORDS = new Set(
 
 const COMBINATOR_KEYS = ["allOf", "anyOf", "oneOf"] as const;
 
+// 这些关键字的值是数据（字面量、示例），里面出现 `$ref` 键也不是 schema 引用，不改写。
+const DATA_KEYWORDS = new Set(["const", "default", "enum", "examples"]);
+
 /** 原名 → 别名；空表示这个工具不用改名。 */
 export type ToolParameterAliases = ReadonlyMap<string, string>;
 
@@ -50,8 +53,30 @@ function topLevelObjectLayers(schema: Record<string, unknown>): Record<string, u
   return layers;
 }
 
+/**
+ * schema 里有没有引用重新指回「函数顶层对象层」（`#`、`#/allOf/0` 这类递归结构）。
+ * 有的话，嵌套数据也会套用改过名的顶层，而回包只还原顶层，嵌套层会留着别名交给工具，
+ * 所以这种工具整体不做别名（vendor PR #153 第四轮自检）。
+ */
+function reentersTopLevel(node: unknown): boolean {
+  if (Array.isArray(node)) {
+    return node.some(reentersTopLevel);
+  }
+  if (!node || typeof node !== "object") {
+    return false;
+  }
+  return Object.entries(node).some(([key, value]) =>
+    key === "$ref" && typeof value === "string"
+      ? /^#(?:\/(?:allOf|anyOf|oneOf)\/\d+)*\/?$/.test(value)
+      : !DATA_KEYWORDS.has(key) && reentersTopLevel(value),
+  );
+}
+
 /** 在最终出站 schema 上算保留字参数的别名；所有顶层字段名都参与避碰。 */
 export function resolveToolParameterAliases(schema: unknown): ToolParameterAliases {
+  if (reentersTopLevel(schema)) {
+    return new Map();
+  }
   const layers = topLevelObjectLayers(asRecord(schema));
   const taken = new Set(layers.flatMap((layer) => Object.keys(asRecord(layer.properties))));
   const aliases = new Map<string, string>();
@@ -69,6 +94,8 @@ export function resolveToolParameterAliases(schema: unknown): ToolParameterAlias
   return aliases;
 }
 
+// 范围：只改 properties / required / propertyOrdering 和组合分支。if/then/else、not、dependentRequired 里
+// 提到的顶层字段名不跟着改（Gemini 函数声明基本不支持这些关键字）。
 function renameLayer(
   layer: Record<string, unknown>,
   aliases: ToolParameterAliases,
@@ -101,12 +128,90 @@ function renameLayer(
   return renamed;
 }
 
-/** 按别名改写函数顶层参数（根 + 组合分支），不改嵌套对象，也不改传入的原 schema。 */
+/**
+ * 把指向「被改名的函数顶层参数」的本地 JSON Pointer 改成别名，其它引用原样返回。
+ * 顶层参数所在位置是：根或根上组合分支（可多层）里的 `properties/<名字>`，与 topLevelObjectLayers 一致；
+ * 嵌套对象里的同名字段是用户数据，指向它们的引用不动。
+ */
+function rewriteLocalRef(ref: string, aliases: ToolParameterAliases): string {
+  if (!ref.startsWith("#/")) {
+    return ref;
+  }
+  const tokens = ref
+    .slice(2)
+    .split("/")
+    .map((token) => token.replaceAll("~1", "/").replaceAll("~0", "~"));
+  let i = 0;
+  // 沿组合关键字 + 下标往下走，停在某个顶层对象层。
+  while (
+    (COMBINATOR_KEYS as readonly string[]).includes(tokens[i] ?? "") &&
+    /^\d+$/.test(tokens[i + 1] ?? "")
+  ) {
+    i += 2;
+  }
+  const alias = tokens[i] === "properties" ? aliases.get(tokens[i + 1] ?? "") : undefined;
+  if (alias === undefined) {
+    return ref;
+  }
+  tokens[i + 1] = alias;
+  return `#/${tokens.map((token) => token.replaceAll("~", "~0").replaceAll("/", "~1")).join("/")}`;
+}
+
+// 这些关键字的值是「名字 → 子 schema」表：表里的键是字段名，不是关键字。
+const NAME_MAP_KEYWORDS = new Set([
+  "properties",
+  "patternProperties",
+  "$defs",
+  "definitions",
+  "dependentSchemas",
+]);
+
+/**
+ * 遍历整个 schema 改写本地 `$ref`；有改动的路径才复制，不改传入对象。
+ * isNameMap：当前对象是 properties 这类名字表，此时键是字段名（字段可能就叫 `default`），不按关键字跳过。
+ */
+function rewriteLocalRefs(
+  node: unknown,
+  aliases: ToolParameterAliases,
+  isNameMap = false,
+): unknown {
+  if (Array.isArray(node)) {
+    const next = node.map((item) => rewriteLocalRefs(item, aliases));
+    return next.some((item, index) => item !== node[index]) ? next : node;
+  }
+  if (!node || typeof node !== "object") {
+    return node;
+  }
+  let copy: Record<string, unknown> | undefined;
+  for (const [key, value] of Object.entries(node)) {
+    let next: unknown;
+    if (isNameMap) {
+      next = rewriteLocalRefs(value, aliases);
+    } else if (key === "$ref" && typeof value === "string") {
+      next = rewriteLocalRef(value, aliases);
+    } else if (DATA_KEYWORDS.has(key)) {
+      next = value;
+    } else {
+      next = rewriteLocalRefs(value, aliases, NAME_MAP_KEYWORDS.has(key));
+    }
+    if (next !== value) {
+      copy ??= { ...(node as Record<string, unknown>) };
+      copy[key] = next;
+    }
+  }
+  return copy ?? node;
+}
+
+/**
+ * 按别名改写函数顶层参数（根 + 组合分支），不改嵌套对象，也不改传入的原 schema。
+ * direct 路径不展开引用，所以同时改写指向被改名参数的本地 `$ref`（如 `#/properties/in` → `#/properties/in_`），
+ * 否则引用会悬空（vendor PR #153 第三轮 review）。
+ */
 export function applyToolParameterAliases<T>(schema: T, aliases: ToolParameterAliases): T {
   if (aliases.size === 0 || !schema || typeof schema !== "object" || Array.isArray(schema)) {
     return schema;
   }
-  return renameLayer(schema as Record<string, unknown>, aliases) as T;
+  return rewriteLocalRefs(renameLayer(schema as Record<string, unknown>, aliases), aliases) as T;
 }
 
 /** encode：原名 → 别名（历史 tool_call 重放）；decode：别名 → 原名（模型回包交给工具执行前）。 */

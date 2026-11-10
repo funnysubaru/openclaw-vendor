@@ -135,4 +135,110 @@ describe("direct openai-completions Gemini keyword aliases", () => {
       });
     }
   });
+  // PR #153 第三轮 review：direct 不展开引用，改名后指向被改名字段的本地 $ref 必须同步改写，不能悬空。
+  it("keeps local $ref pointers to renamed parameters resolvable", async () => {
+    let requestBody = "";
+    const server = createServer((req, res) => {
+      req.setEncoding("utf8");
+      req.on("data", (part) => {
+        requestBody += part;
+      });
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+        res.write(sse({ content: "ok" }, "stop"));
+        res.write("data: [DONE]\n\n");
+        res.end();
+      });
+    });
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("Missing loopback server address");
+      }
+      const parameters = {
+        type: "object",
+        properties: {
+          in: { type: "string", minLength: 2 },
+          copy: { $ref: "#/properties/in" },
+          nested: { type: "object", properties: { in: { $ref: "#/properties/in" } } },
+          viaDefs: { $ref: "#/$defs/Wrapper" },
+          // 字段名恰好是关键字也要照常改写引用；const 里的 `$ref` 是字面数据，不能动。
+          default: { $ref: "#/properties/in" },
+          literal: { const: { $ref: "#/properties/in" } },
+        },
+        $defs: { Wrapper: { allOf: [{ $ref: "#/properties/in" }] } },
+        allOf: [
+          {
+            properties: {
+              from: { type: "number" },
+              alsoFrom: { $ref: "#/allOf/0/properties/from" },
+            },
+          },
+        ],
+      };
+      const original = JSON.stringify(parameters);
+      const stream = streamOpenAICompletions(
+        {
+          id: "google/gemini-2.5-flash-lite",
+          name: "Gemini 2.5 Flash Lite",
+          api: "openai-completions",
+          provider: "openrouter",
+          baseUrl: `http://127.0.0.1:${address.port}/v1`,
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 1_000_000,
+          maxTokens: 8192,
+        },
+        {
+          systemPrompt: "s",
+          tools: [{ name: "automations", description: "Schedule", parameters }],
+          messages: [{ role: "user", content: "hi", timestamp: 1 }],
+        } as never,
+        { apiKey: "test-key" },
+      );
+      await stream.result();
+
+      const sent = (
+        JSON.parse(requestBody) as { tools: Array<{ function: { parameters: unknown } }> }
+      ).tools[0]?.function.parameters as Record<string, any>;
+      // 按 JSON Pointer 在出站 schema 里解析本地引用，确认仍指向原来的约束。
+      const resolve = (ref: string) =>
+        ref
+          .slice(2)
+          .split("/")
+          .reduce<any>(
+            (node, token) => node?.[token.replaceAll("~1", "/").replaceAll("~0", "~")],
+            sent,
+          );
+      expect(Object.keys(sent.properties)).toEqual([
+        "in_",
+        "copy",
+        "nested",
+        "viaDefs",
+        "default",
+        "literal",
+      ]);
+      expect(resolve(sent.properties.default.$ref)).toEqual({ type: "string", minLength: 2 });
+      expect(sent.properties.literal.const).toEqual({ $ref: "#/properties/in" });
+      expect(resolve(sent.properties.copy.$ref)).toEqual({ type: "string", minLength: 2 });
+      // 嵌套对象里的字段名是用户数据，不改名；但它的引用目标被改名了，引用要跟着改。
+      expect(Object.keys(sent.properties.nested.properties)).toEqual(["in"]);
+      expect(resolve(sent.properties.nested.properties.in.$ref)).toEqual({
+        type: "string",
+        minLength: 2,
+      });
+      expect(resolve(sent.$defs.Wrapper.allOf[0].$ref)).toEqual({ type: "string", minLength: 2 });
+      expect(resolve(sent.allOf[0].properties.alsoFrom.$ref)).toEqual({ type: "number" });
+      // 不改调用方传入的原 schema。
+      expect(JSON.stringify(parameters)).toBe(original);
+    } finally {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
+    }
+  });
 });

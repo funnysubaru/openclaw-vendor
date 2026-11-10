@@ -229,7 +229,7 @@ export function createEmbeddedRunFailoverRetryController(input: {
       ) {
         return false;
       }
-      // 厂家已判定生成出的工具调用不合法（MALFORMED_FUNCTION_CALL）：原样重发必然同样失败，
+      // 厂家已判定生成出的工具调用不合法（MALFORMED_FUNCTION_CALL）：原样重发大概率同样失败，
       // 跳过同型号重试、直接交给 failover 换型号（ADR-0033 任务 150）。
       if (retry.message && isDeterministicProviderFinishMessage(retry.message)) {
         log.warn(

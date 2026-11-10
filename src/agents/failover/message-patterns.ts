@@ -366,7 +366,7 @@ const PROVIDER_COMPLETED_ERROR_FINISH_REASON_PATTERNS = [
 ] as const satisfies readonly ErrorPattern[];
 /**
  * 厂家明确告诉我们「这次生成出的工具调用本身不合法」（Gemini 的 MALFORMED_FUNCTION_CALL，
- * 经 OpenRouter 时只剩 native_finish_reason 能看出来）。同一请求同一型号重发几乎必然再失败，
+ * 经 OpenRouter 时只剩 native_finish_reason 能看出来）。同一请求同一型号重发大概率再失败，
  * 同型号重试只会让一轮卡 70–90 秒；仍归 server_error 让 failover 换型号（ADR-0033 任务 150）。
  */
 export function isDeterministicProviderFinishMessage(raw: string): boolean {

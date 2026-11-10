@@ -364,6 +364,17 @@ describe("isFailoverErrorMessage", () => {
     ]);
   });
 
+  it("classifies finish_reason error with OpenRouter native_finish_reason (ADR-0033 task 150)", () => {
+    // 错误信息里会拼上 native_finish_reason。Google 的配额耗尽变成 rate_limit 是更准确的分类；
+    // 其余原因仍按 server_error，可以换型号。
+    const withNative = (native: string) =>
+      `Provider finish_reason: error (native_finish_reason: ${native})`;
+    expect(classifyFailoverReason(withNative("RESOURCE_EXHAUSTED"))).toBe("rate_limit");
+    for (const native of ["MALFORMED_FUNCTION_CALL", "DEADLINE_EXCEEDED", "SAFETY"]) {
+      expect(classifyFailoverReason(withNative(native))).toBe("server_error");
+    }
+  });
+
   it("classifies Provider finish_reason: error as server_error, not timeout (#109218)", () => {
     // OpenRouter/Google can complete quickly with finish_reason:error; that is a
     // provider-completed failure, not a hung request. Fallback must remain eligible.

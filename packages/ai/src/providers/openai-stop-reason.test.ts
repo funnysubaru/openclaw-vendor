@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mapOpenAIStopReason } from "./openai-stop-reason.js";
+import { mapOpenAIChoiceStopReason, mapOpenAIStopReason } from "./openai-stop-reason.js";
 
 describe("mapOpenAIStopReason", () => {
   it.each([
@@ -32,5 +32,28 @@ describe("mapOpenAIStopReason", () => {
       stopReason: "error",
       errorMessage: "Provider finish_reason: unexpected",
     });
+  });
+});
+
+describe("mapOpenAIChoiceStopReason", () => {
+  it("appends a well-formed native_finish_reason to error results only", () => {
+    expect(
+      mapOpenAIChoiceStopReason({
+        finish_reason: "error",
+        native_finish_reason: "MALFORMED_FUNCTION_CALL",
+      }).errorMessage,
+    ).toBe("Provider finish_reason: error (native_finish_reason: MALFORMED_FUNCTION_CALL)");
+    expect(
+      mapOpenAIChoiceStopReason({ finish_reason: "stop", native_finish_reason: "STOP" }),
+    ).toEqual(mapOpenAIStopReason("stop"));
+  });
+
+  it("drops native_finish_reason values that are not plain enum-like tokens", () => {
+    for (const native of ["bad\nline", "x".repeat(65), "", 42]) {
+      expect(
+        mapOpenAIChoiceStopReason({ finish_reason: "error", native_finish_reason: native })
+          .errorMessage,
+      ).toBe("Provider finish_reason: error");
+    }
   });
 });

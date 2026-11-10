@@ -1,6 +1,7 @@
 /**
  * Repairs malformed tool-call arguments in embedded-agent stream results.
  */
+import { decodeToolCallArgumentsForBlock } from "@openclaw/ai/internal/openai";
 import { extractBalancedJsonPrefix } from "@openclaw/normalization-core";
 import { safeParseJsonRecord } from "@openclaw/normalization-core/json-coercion";
 import { normalizeProviderId } from "../../model-selection.js";
@@ -594,7 +595,8 @@ function repairToolCallArgumentsInMessage(
   if (!isRunnerToolCallBlockType(typedBlock.type)) {
     return;
   }
-  typedBlock.arguments = repairedArgs;
+  // repairedArgs 解析自原始 delta 文本；传输层若给这个块改过参数名（Gemini 保留字别名），先还原再写回。
+  typedBlock.arguments = decodeToolCallArgumentsForBlock(block, repairedArgs);
 }
 
 function hasMeaningfulToolCallArgumentsInMessage(message: unknown, contentIndex: number): boolean {
@@ -744,7 +746,10 @@ function wrapStreamRepairMalformedToolCallArguments(
       const repairedArgs = repairedArgsByIndex.get(event.contentIndex);
       if (repairedArgs) {
         if (event.toolCall && typeof event.toolCall === "object") {
-          (event.toolCall as { arguments?: unknown }).arguments = repairedArgs;
+          (event.toolCall as { arguments?: unknown }).arguments = decodeToolCallArgumentsForBlock(
+            event.toolCall,
+            repairedArgs,
+          );
         }
         repairToolCallArgumentsInMessage(event.partial, event.contentIndex, repairedArgs);
         repairToolCallArgumentsInMessage(event.message, event.contentIndex, repairedArgs);

@@ -30,6 +30,7 @@ export type ToolParameterAliases = ReadonlyMap<string, string>;
  * 判据只看模型 id 里有没有 "gemini"：直连 Google 的 OpenAI 兼容端点是 `gemini-2.5-flash`，
  * OpenRouter 是 `google/gemini-2.5-flash-lite`，两种写法都要命中。
  * 别名是可逆的（发出前改名、回包后还原），误命中非 Gemini 模型也不会改变工具语义，只是参数名多个下划线。
+ * 局限：id 里不含 "gemini" 的 Gemini（自定义别名、代理改名）不会命中，仍按原名发送。
  */
 export function isGeminiToolParameterAliasModel(modelId: string): boolean {
   return /gemini/i.test(modelId);
@@ -114,7 +115,8 @@ export function mapToolArgumentsWithAliases(
   args: Record<string, unknown>,
   direction: "encode" | "decode",
 ): Record<string, unknown> {
-  if (!aliases || aliases.size === 0) {
+  // 历史里参数可能缺失或不是对象（如 undefined），这种情况原样返回，不让请求构建抛错。
+  if (!aliases || aliases.size === 0 || !args || typeof args !== "object" || Array.isArray(args)) {
     return args;
   }
   const mapping =
@@ -124,4 +126,25 @@ export function mapToolArgumentsWithAliases(
   return Object.fromEntries(
     Object.entries(args).map(([name, value]) => [mapping.get(name) ?? name, value]),
   );
+}
+
+// 已确认的工具调用块 → 它的参数别名。传输层收尾还原时登记；runner 的「工具参数修复」包装器会拿原始
+// delta 文本（里面是 `in_` 这类别名）重新解析并写回块上，写回前必须按这里还原，否则会把已还原的参数
+// 覆盖回别名（vendor PR #153 自检发现）。按块对象登记，只影响确实改过名的块。
+const toolCallArgumentAliasesByBlock = new WeakMap<object, ToolParameterAliases>();
+
+/** 传输层在工具调用确认、参数还原后调用：记下这个块用过的别名。 */
+export function rememberToolCallArgumentAliases(
+  block: object,
+  aliases: ToolParameterAliases,
+): void {
+  toolCallArgumentAliasesByBlock.set(block, aliases);
+}
+
+/** 往已确认的工具调用块写参数前调用：若该块登记过别名，把别名键还原成原名；否则原样返回。 */
+export function decodeToolCallArgumentsForBlock(
+  block: object,
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  return mapToolArgumentsWithAliases(toolCallArgumentAliasesByBlock.get(block), args, "decode");
 }

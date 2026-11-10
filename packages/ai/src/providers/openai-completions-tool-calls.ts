@@ -6,6 +6,7 @@ import { finalizeTerminalToolCallArguments } from "../transports/transport-strea
 import type { ToolCall } from "../types.js";
 import {
   mapToolArgumentsWithAliases,
+  rememberToolCallArgumentAliases,
   type ToolParameterAliases,
 } from "./google-tool-parameters.js";
 
@@ -309,10 +310,13 @@ export function finalizeOpenAICompletionsToolCalls<TBlock extends object>(
     }
     delete (block as { partialArgs?: string }).partialArgs;
     delete (block as { streamIndex?: number }).streamIndex;
+    // 只在确认时还原：之前流式 toolcall_delta 里的 partialArgs 预览仍是别名（`in_`），
+    // 只用于界面预览，不交给工具执行。
     const call = block as unknown as FinalToolCall & { name: string };
     const aliases = options.toolArgumentAliases?.get(call.name);
     if (aliases) {
       call.arguments = mapToolArgumentsWithAliases(aliases, call.arguments, "decode");
+      rememberToolCallArgumentAliases(call, aliases);
     }
     options.onConfirmedToolCall?.(block, contentIndex);
   }

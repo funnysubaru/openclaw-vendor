@@ -310,7 +310,9 @@ function convertTools(
         description: tool.description,
         parameters:
           mode === "direct"
-            ? aliasParameters(tool.name, tool.parameters)
+            ? // direct 不做规范化，发的就是原始 schema：根 $ref / 根 anyOf 不会被展开，
+              // 藏在 $defs 里的参数也就不会被改名（与实际出站一致，只是覆盖面比 managed 窄）。
+              aliasParameters(tool.name, tool.parameters)
             : aliasParameters(
                 tool.name,
                 normalizeOpenAIStrictToolParameters(tool.parameters, strict === true, model.compat),

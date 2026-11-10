@@ -54,7 +54,8 @@ export function mapOpenAIChoiceStopReason(
   if (
     !result.errorMessage ||
     typeof native !== "string" ||
-    native.length === 0 ||
+    // 远端字段原样进日志和错误信息：只收常见的枚举形态，防止换行或超长内容污染日志。
+    !/^[A-Za-z0-9_.-]{1,64}$/.test(native) ||
     native === choice.finish_reason
   ) {
     return result;

@@ -36,6 +36,8 @@ const TOOLCALL_REPAIR_KNOWN_ARG_KEYS = new Set([
   "filePath",
   "filepath",
   "from",
+  // Gemini 保留字参数别名（packages/ai google-tool-parameters）：修复器看到的是传输层改名后的原始文本。
+  "from_",
   "line_end",
   "line_start",
   "lines",

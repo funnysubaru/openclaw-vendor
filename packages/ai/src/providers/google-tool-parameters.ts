@@ -22,8 +22,12 @@ const PYTHON_KEYWORDS = new Set(
 
 const COMBINATOR_KEYS = ["allOf", "anyOf", "oneOf"] as const;
 
+// 引用关键字：`$recursiveRef`/`$dynamicRef` 指回 `#` 同样是递归结构，要参与递归检测；
+// 它们指向锚点或 `#`，不是 `#/properties/...` 指针，改写时会原样保留。
+const REF_KEYWORDS = new Set(["$ref", "$recursiveRef", "$dynamicRef"]);
+
 // 这些关键字的值是数据（字面量、示例），里面出现 `$ref` 键也不是 schema 引用，不改写。
-const DATA_KEYWORDS = new Set(["const", "default", "enum", "examples"]);
+const DATA_KEYWORDS = new Set(["const", "default", "enum", "example", "examples"]);
 
 /** 原名 → 别名；空表示这个工具不用改名。 */
 export type ToolParameterAliases = ReadonlyMap<string, string>;
@@ -58,18 +62,13 @@ function topLevelObjectLayers(schema: Record<string, unknown>): Record<string, u
  * 有的话，嵌套数据也会套用改过名的顶层，而回包只还原顶层，嵌套层会留着别名交给工具，
  * 所以这种工具整体不做别名（vendor PR #153 第四轮自检）。
  */
-function reentersTopLevel(node: unknown): boolean {
-  if (Array.isArray(node)) {
-    return node.some(reentersTopLevel);
-  }
-  if (!node || typeof node !== "object") {
-    return false;
-  }
-  return Object.entries(node).some(([key, value]) =>
-    key === "$ref" && typeof value === "string"
-      ? /^#(?:\/(?:allOf|anyOf|oneOf)\/\d+)*\/?$/.test(value)
-      : !DATA_KEYWORDS.has(key) && reentersTopLevel(value),
-  );
+function reentersTopLevel(schema: unknown): boolean {
+  let reenters = false;
+  mapSchemaRefs(schema, (ref) => {
+    reenters ||= /^#(?:\/(?:allOf|anyOf|oneOf)\/\d+)*\/?$/.test(ref);
+    return ref;
+  });
+  return reenters;
 }
 
 /** 在最终出站 schema 上算保留字参数的别名；所有顶层字段名都参与避碰。 */
@@ -78,7 +77,23 @@ export function resolveToolParameterAliases(schema: unknown): ToolParameterAlias
     return new Map();
   }
   const layers = topLevelObjectLayers(asRecord(schema));
-  const taken = new Set(layers.flatMap((layer) => Object.keys(asRecord(layer.properties))));
+  // required / propertyOrdering 里出现的名字也算占用：只在 required 里出现的 `in_` 不能被拿来当 `in` 的别名。
+  const taken = new Set<string>();
+  for (const layer of layers) {
+    for (const name of Object.keys(asRecord(layer.properties))) {
+      taken.add(name);
+    }
+    for (const key of ["required", "propertyOrdering"] as const) {
+      const names = layer[key];
+      if (Array.isArray(names)) {
+        for (const name of names) {
+          if (typeof name === "string") {
+            taken.add(name);
+          }
+        }
+      }
+    }
+  }
   const aliases = new Map<string, string>();
   for (const name of taken) {
     if (!PYTHON_KEYWORDS.has(name)) {
@@ -164,19 +179,19 @@ const NAME_MAP_KEYWORDS = new Set([
   "$defs",
   "definitions",
   "dependentSchemas",
+  // 草案 07：字段名 → 子 schema 或字段名数组。
+  "dependencies",
 ]);
 
 /**
- * 遍历整个 schema 改写本地 `$ref`；有改动的路径才复制，不改传入对象。
- * isNameMap：当前对象是 properties 这类名字表，此时键是字段名（字段可能就叫 `default`），不按关键字跳过。
+ * 遍历整个 schema，对每个 `$ref` 字符串调用 mapRef；有改动的路径才复制，不改传入对象。
+ * 改写引用和检测递归引用都走这里，保证两处对「哪里是引用、哪里是数据」的判断一致（vendor PR #153 第四轮 review）：
+ * - 名字表（properties、$defs 等）里的键是字段名，字段可能就叫 `default`/`const`，照常往下遍历；
+ * - schema 层上的 const/default/enum/examples 是字面数据，里面形如 `$ref` 的内容不是引用，跳过。
  */
-function rewriteLocalRefs(
-  node: unknown,
-  aliases: ToolParameterAliases,
-  isNameMap = false,
-): unknown {
+function mapSchemaRefs(node: unknown, mapRef: (ref: string) => string, isNameMap = false): unknown {
   if (Array.isArray(node)) {
-    const next = node.map((item) => rewriteLocalRefs(item, aliases));
+    const next = node.map((item) => mapSchemaRefs(item, mapRef));
     return next.some((item, index) => item !== node[index]) ? next : node;
   }
   if (!node || typeof node !== "object") {
@@ -186,13 +201,13 @@ function rewriteLocalRefs(
   for (const [key, value] of Object.entries(node)) {
     let next: unknown;
     if (isNameMap) {
-      next = rewriteLocalRefs(value, aliases);
-    } else if (key === "$ref" && typeof value === "string") {
-      next = rewriteLocalRef(value, aliases);
+      next = mapSchemaRefs(value, mapRef);
+    } else if (REF_KEYWORDS.has(key) && typeof value === "string") {
+      next = mapRef(value);
     } else if (DATA_KEYWORDS.has(key)) {
       next = value;
     } else {
-      next = rewriteLocalRefs(value, aliases, NAME_MAP_KEYWORDS.has(key));
+      next = mapSchemaRefs(value, mapRef, NAME_MAP_KEYWORDS.has(key));
     }
     if (next !== value) {
       copy ??= { ...(node as Record<string, unknown>) };
@@ -211,7 +226,9 @@ export function applyToolParameterAliases<T>(schema: T, aliases: ToolParameterAl
   if (aliases.size === 0 || !schema || typeof schema !== "object" || Array.isArray(schema)) {
     return schema;
   }
-  return rewriteLocalRefs(renameLayer(schema as Record<string, unknown>, aliases), aliases) as T;
+  return mapSchemaRefs(renameLayer(schema as Record<string, unknown>, aliases), (ref) =>
+    rewriteLocalRef(ref, aliases),
+  ) as T;
 }
 
 /** encode：原名 → 别名（历史 tool_call 重放）；decode：别名 → 原名（模型回包交给工具执行前）。 */
@@ -228,15 +245,29 @@ export function mapToolArgumentsWithAliases(
     direction === "encode"
       ? aliases
       : new Map([...aliases].map(([name, alias]) => [alias, name] as const));
-  return Object.fromEntries(
-    Object.entries(args).map(([name, value]) => [mapping.get(name) ?? name, value]),
-  );
+  // 映射来的键优先：回包里同时有 `in_`（schema 声明的）和 `in` 时，以 `in_` 的值为准，与键顺序无关。
+  const mapped: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(args)) {
+    const target = mapping.get(name);
+    if (target !== undefined) {
+      mapped[target] = value;
+    } else if (!Object.hasOwn(mapped, name)) {
+      mapped[name] = value;
+    }
+  }
+  return mapped;
 }
 
 // 已确认的工具调用块 → 它的参数别名。传输层收尾还原时登记；runner 的「工具参数修复」包装器会拿原始
 // delta 文本（里面是 `in_` 这类别名）重新解析并写回块上，写回前必须按这里还原，否则会把已还原的参数
 // 覆盖回别名（vendor PR #153 自检发现）。按块对象登记，只影响确实改过名的块。
-const toolCallArgumentAliasesByBlock = new WeakMap<object, ToolParameterAliases>();
+// 挂在 globalThis 上：传输层（相对路径）和 runner（@openclaw/ai/internal/openai）经两条导入路径用到这张表，
+// 打包时若被拆成两份模块副本，各自 new 一张就查不到对方登记的别名。
+const ALIAS_REGISTRY_KEY = Symbol.for("openclaw.toolCallArgumentAliasesByBlock");
+const aliasRegistryHost = globalThis as {
+  [ALIAS_REGISTRY_KEY]?: WeakMap<object, ToolParameterAliases>;
+};
+const toolCallArgumentAliasesByBlock = (aliasRegistryHost[ALIAS_REGISTRY_KEY] ??= new WeakMap());
 
 /** 传输层在工具调用确认、参数还原后调用：记下这个块用过的别名。 */
 export function rememberToolCallArgumentAliases(

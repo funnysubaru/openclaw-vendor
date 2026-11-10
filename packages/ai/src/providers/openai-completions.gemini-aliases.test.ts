@@ -14,6 +14,42 @@ const sse = (delta: unknown, finishReason: string | null = null) =>
     choices: [{ index: 0, delta, finish_reason: finishReason }],
   })}\n\n`;
 
+/** 起本机回环 SSE 服务，回放给定分片，返回捕获的请求体。 */
+async function withLoopback(
+  chunks: string[],
+  run: (baseUrl: string) => Promise<void>,
+): Promise<Record<string, any>> {
+  let requestBody = "";
+  const server = createServer((req, res) => {
+    req.setEncoding("utf8");
+    req.on("data", (part) => {
+      requestBody += part;
+    });
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+      for (const chunk of chunks) {
+        res.write(chunk);
+      }
+      res.end();
+    });
+  });
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Missing loopback server address");
+    }
+    await run(`http://127.0.0.1:${address.port}/v1`);
+    return JSON.parse(requestBody) as Record<string, any>;
+  } finally {
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+  }
+}
+
 describe("direct openai-completions Gemini keyword aliases", () => {
   it("renames outbound, encodes history and restores the streamed call", async () => {
     let requestBody = "";
@@ -241,4 +277,62 @@ describe("direct openai-completions Gemini keyword aliases", () => {
       });
     }
   });
+  // PR #153 第四轮 review：属性恰好叫 `default` 等关键字名时，它下面的递归引用 `#` 也要被识别，
+  // 整个工具不改名；否则嵌套层会把别名原样交给工具。
+  it.each(["default", "const", "enum", "examples"])(
+    "does not alias a tool whose property named %s re-enters the root",
+    async (name) => {
+      const parameters = {
+        type: "object",
+        properties: { in: { type: "string" }, [name]: { $ref: "#" } },
+      };
+      const args = { in: "outer", [name]: { in: "inner" } };
+      const ends: unknown[] = [];
+      const body = await withLoopback(
+        [
+          sse({
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_1",
+                type: "function",
+                function: { name: "automations", arguments: JSON.stringify(args) },
+              },
+            ],
+          }),
+          sse({}, "tool_calls"),
+          "data: [DONE]\n\n",
+        ],
+        async (baseUrl) => {
+          const stream = streamOpenAICompletions(
+            {
+              id: "google/gemini-2.5-flash-lite",
+              name: "Gemini 2.5 Flash Lite",
+              api: "openai-completions",
+              provider: "openrouter",
+              baseUrl,
+              reasoning: false,
+              input: ["text"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 1_000_000,
+              maxTokens: 8192,
+            },
+            {
+              systemPrompt: "s",
+              tools: [{ name: "automations", description: "Schedule", parameters }],
+              messages: [{ role: "user", content: "hi", timestamp: 1 }],
+            } as never,
+            { apiKey: "test-key" },
+          );
+          for await (const event of stream) {
+            if (event.type === "toolcall_end") {
+              ends.push(event.toolCall.arguments);
+            }
+          }
+        },
+      );
+      expect(Object.keys(body.tools[0].function.parameters.properties)).toEqual(["in", name]);
+      expect(ends).toEqual([args]);
+    },
+  );
 });

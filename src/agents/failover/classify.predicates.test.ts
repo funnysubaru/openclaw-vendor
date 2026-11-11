@@ -370,6 +370,12 @@ describe("isFailoverErrorMessage", () => {
     const withNative = (native: string) =>
       `Provider finish_reason: error (native_finish_reason: ${native})`;
     expect(classifyFailoverReason(withNative("RESOURCE_EXHAUSTED"))).toBe("rate_limit");
+    // 厂家明说的原因比笼统的 server_error 更准：上下文超长走压缩、额度不足归计费、过载归过载（PR #153 合并前自检固定）。
+    expect(classifyFailoverReason(withNative("model_context_window_exceeded"))).toBe(
+      "context_overflow",
+    );
+    expect(classifyFailoverReason(withNative("insufficient_quota"))).toBe("billing");
+    expect(classifyFailoverReason(withNative("overloaded"))).toBe("overloaded");
     for (const native of ["MALFORMED_FUNCTION_CALL", "DEADLINE_EXCEEDED", "SAFETY"]) {
       expect(classifyFailoverReason(withNative(native))).toBe("server_error");
     }

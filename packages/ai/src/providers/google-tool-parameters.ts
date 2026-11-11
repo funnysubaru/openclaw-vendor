@@ -76,12 +76,26 @@ function topLevelObjectLayers(schema: Record<string, unknown>): Record<string, u
  * 所以这种工具整体不做别名（vendor PR #153 第四轮自检）。
  */
 function reentersTopLevel(schema: unknown): boolean {
+  // 除了 `#` 形式，空引用 `""` 和按根 `$id` 写的引用（`urn:t`、`urn:t#`）同样指回根。
+  const rootId = asRecord(schema).$id;
   let reenters = false;
   mapSchemaRefs(schema, (ref) => {
-    reenters ||= /^#(?:\/(?:allOf|anyOf|oneOf)\/\d+)*\/?$/.test(ref);
+    reenters ||=
+      ref === "" ||
+      (typeof rootId === "string" && (ref === rootId || ref === `${rootId}#`)) ||
+      /^#(?:\/(?:allOf|anyOf|oneOf)\/\d+)*\/?$/.test(decodePointerUri(ref));
     return ref;
   });
   return reenters;
+}
+
+/** URI 片段里的 JSON Pointer 可能带百分号编码（`#/properties/%69n`），先解码；非法编码原样返回。 */
+function decodePointerUri(ref: string): string {
+  try {
+    return decodeURIComponent(ref);
+  } catch {
+    return ref;
+  }
 }
 
 /** 在最终出站 schema 上算保留字参数的别名；所有顶层字段名都参与避碰。 */
@@ -165,7 +179,7 @@ function rewriteLocalRef(ref: string, aliases: ToolParameterAliases): string {
   if (!ref.startsWith("#/")) {
     return ref;
   }
-  const tokens = ref
+  const tokens = decodePointerUri(ref)
     .slice(2)
     .split("/")
     .map((token) => token.replaceAll("~1", "/").replaceAll("~0", "~"));
@@ -287,6 +301,27 @@ export function rememberToolCallArgumentAliases(
   block: object,
   aliases: ToolParameterAliases,
 ): void {
+  toolCallArgumentAliasesByBlock.set(block, aliases);
+}
+
+/**
+ * runner 在纠正工具名（`default_api.automations` → `automations`）、把文本形式的工具调用提升成块之后调用：
+ * 按块「当前的」名字查这一轮请求的别名表，还原参数并登记。传输层只按回包里的原始名字还原，
+ * 名字被纠正或块是 runner 新建的都会漏（vendor PR #153 合并前自检）。还原是幂等的，重复调用无害。
+ */
+export function decodeToolCallBlockByName(
+  block: { name?: unknown; arguments?: unknown },
+  aliasesByTool: ReadonlyMap<string, ToolParameterAliases>,
+): void {
+  const aliases = typeof block.name === "string" ? aliasesByTool.get(block.name) : undefined;
+  if (!aliases || !block.arguments || typeof block.arguments !== "object") {
+    return;
+  }
+  block.arguments = mapToolArgumentsWithAliases(
+    aliases,
+    block.arguments as Record<string, unknown>,
+    "decode",
+  );
   toolCallArgumentAliasesByBlock.set(block, aliases);
 }
 

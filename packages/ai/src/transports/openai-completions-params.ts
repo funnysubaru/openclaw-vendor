@@ -331,10 +331,15 @@ function convertTools(
 
 // 每个请求体对应的「工具名 → 参数别名」。调用方在 onPayload 之前取出，流收尾时据此还原回包参数，
 // 保证出站改名、历史编码、回包还原用的是同一份映射（ADR-0033 任务 150）。
-const completionsToolArgumentAliases = new WeakMap<
-  object,
-  ReadonlyMap<string, ToolParameterAliases>
->();
+// runner 的还原包装器在 onPayload 回调里经 @openclaw/ai/internal/openai 取这张表，与传输层走的是两条导入路径；
+// 挂在 globalThis 上，打包拆出两份模块副本时仍是同一张表。
+const COMPLETIONS_ALIAS_REGISTRY_KEY = Symbol.for("openclaw.completionsToolArgumentAliases");
+const completionsAliasRegistryHost = globalThis as {
+  [COMPLETIONS_ALIAS_REGISTRY_KEY]?: WeakMap<object, ReadonlyMap<string, ToolParameterAliases>>;
+};
+const completionsToolArgumentAliases = (completionsAliasRegistryHost[
+  COMPLETIONS_ALIAS_REGISTRY_KEY
+] ??= new WeakMap());
 
 /** 取 buildOpenAICompletionsParams / buildOpenAICompletionsRequest 刚生成的请求体的参数别名。 */
 export function getCompletionsToolArgumentAliases(

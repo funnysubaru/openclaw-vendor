@@ -120,3 +120,33 @@ describe("own __proto__ keys", () => {
     expect(ownProto(schema.properties)).toEqual({ $ref: "#/properties/in" });
   });
 });
+
+// vendor PR #153 合并前自检：其它指回根的写法、百分号编码的指针。
+describe("root references and percent-encoded pointers", () => {
+  it.each([
+    { name: "empty $ref", schema: { properties: { in: {}, kids: { items: { $ref: "" } } } } },
+    {
+      name: "$ref to the root $id",
+      schema: { $id: "urn:t", properties: { in: {}, kids: { items: { $ref: "urn:t" } } } },
+    },
+    {
+      name: "$ref to the root $id with an empty fragment",
+      schema: { $id: "urn:t", properties: { in: {}, kids: { items: { $ref: "urn:t#" } } } },
+    },
+    {
+      name: "percent-encoded #",
+      schema: { properties: { in: {}, kids: { $ref: "#/%61llOf/0" } } },
+    },
+  ])("skips aliasing for $name", ({ schema }) => {
+    expect(resolveToolParameterAliases({ type: "object", ...schema }).size).toBe(0);
+  });
+
+  it("rewrites percent-encoded pointers to renamed parameters", () => {
+    const schema = {
+      type: "object",
+      properties: { in: { type: "string" }, other: { $ref: "#/properties/%69n" } },
+    };
+    const renamed = applyToolParameterAliases(schema, resolveToolParameterAliases(schema));
+    expect(renamed.properties.other.$ref).toBe("#/properties/in_");
+  });
+});

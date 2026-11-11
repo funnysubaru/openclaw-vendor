@@ -30,6 +30,7 @@ import {
   isSessionsYieldAbortReason,
 } from "./attempt-sessions-yield.js";
 import { wrapStreamFnHandleSensitiveStopReason } from "./attempt-stop-reason-recovery.js";
+import { wrapStreamFnDecodeToolArgumentAliases } from "./attempt-tool-call-argument-aliases.js";
 import {
   sanitizeOpenAIResponsesReplayForStream,
   sanitizeReplayToolCallIdsForStream,
@@ -285,6 +286,9 @@ export function installEmbeddedAttemptStreamGuards(
       unknownToolThreshold: UNKNOWN_TOOL_THRESHOLD,
     },
   );
+  // Gemini 保留字参数别名（`in_` → `in`）按纠正后的工具名再还原一次，覆盖被提升的文本工具调用；
+  // 必须在名字纠正、文本提升之后，参数修复之前（ADR-0033 任务 150）。
+  session.agent.streamFn = wrapStreamFnDecodeToolArgumentAliases(session.agent.streamFn);
 
   if (
     shouldRepairMalformedToolCallArguments({

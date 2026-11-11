@@ -10,7 +10,11 @@ export * from "../providers/openai-responses-tool-call-tracker.js";
 export * from "../providers/openai-stop-reason.js";
 export * from "../providers/openai-tool-projection.js";
 // runner 的工具参数修复包装器写回前要按块还原 Gemini 保留字别名（ADR-0033 任务 150）。
-export { decodeToolCallArgumentsForBlock } from "../providers/google-tool-parameters.js";
+export {
+  decodeToolCallArgumentsForBlock,
+  decodeToolCallBlockByName,
+} from "../providers/google-tool-parameters.js";
+export { getCompletionsToolArgumentAliases } from "../transports/openai-completions-params.js";
 export {
   codeModeToolSurfaceObserver,
   reasoningTagTextPolicy,

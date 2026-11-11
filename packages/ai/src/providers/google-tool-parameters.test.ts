@@ -150,3 +150,50 @@ describe("root references and percent-encoded pointers", () => {
     expect(renamed.properties.other.$ref).toBe("#/properties/in_");
   });
 });
+
+// vendor PR #153 第七轮 review：改写后的引用必须重新做 URI fragment 编码，改名前后解析到同一个目标。
+describe("URI fragment encoding of rewritten refs", () => {
+  /** RFC 6901 §6：先对 fragment 做百分号解码，再按 JSON Pointer 拆分、反转义。 */
+  const resolve = (root: unknown, ref: string) =>
+    decodeURIComponent(ref.slice(1))
+      .split("/")
+      .slice(1)
+      .map((token) => token.replaceAll("~1", "/").replaceAll("~0", "~"))
+      .reduce<any>((node, token) => node?.[token], root);
+
+  it.each([
+    "#/properties/in/properties/rate%252Fday",
+    "#/properties/in/properties/a%20b",
+    "#/properties/in/properties/x~1y",
+    "#/properties/%69n/properties/rate%252Fday",
+  ])("keeps %s resolving to the same target after renaming", (ref) => {
+    const schema = {
+      type: "object",
+      properties: {
+        in: {
+          type: "object",
+          properties: {
+            "rate%2Fday": { type: "number" },
+            "a b": { type: "boolean" },
+            "x/y": { type: "integer" },
+          },
+        },
+        other: { $ref: ref },
+      },
+    };
+    const target = resolve(schema, ref);
+    expect(target).toBeDefined();
+    const renamed = applyToolParameterAliases(schema, resolveToolParameterAliases(schema));
+    expect(renamed.properties.other.$ref).not.toBe(ref);
+    expect(resolve(renamed, renamed.properties.other.$ref)).toBe(target);
+  });
+
+  it("leaves refs with invalid percent-encoding unchanged", () => {
+    const schema = {
+      type: "object",
+      properties: { in: { type: "string" }, other: { $ref: "#/properties/in/%zz" } },
+    };
+    const renamed = applyToolParameterAliases(schema, resolveToolParameterAliases(schema));
+    expect(renamed.properties.other.$ref).toBe("#/properties/in/%zz");
+  });
+});

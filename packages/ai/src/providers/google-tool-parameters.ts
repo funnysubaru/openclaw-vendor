@@ -179,7 +179,14 @@ function rewriteLocalRef(ref: string, aliases: ToolParameterAliases): string {
   if (!ref.startsWith("#/")) {
     return ref;
   }
-  const tokens = decodePointerUri(ref)
+  // RFC 6901 §6：fragment 先百分号解码，再按 JSON Pointer 拆分。编码不合法的引用本来就解析不了，不碰它。
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(ref);
+  } catch {
+    return ref;
+  }
+  const tokens = decoded
     .slice(2)
     .split("/")
     .map((token) => token.replaceAll("~1", "/").replaceAll("~0", "~"));
@@ -196,7 +203,13 @@ function rewriteLocalRef(ref: string, aliases: ToolParameterAliases): string {
     return ref;
   }
   tokens[i + 1] = alias;
-  return `#/${tokens.map((token) => token.replaceAll("~", "~0").replaceAll("/", "~1")).join("/")}`;
+  // 重组时先做 JSON Pointer 转义，原引用带百分号编码的再做 URI 编码，保证再解析时落在同一个目标上
+  // （如字段名 `rate%2Fday` 原写作 `rate%252Fday`，不能变成 `rate%2Fday` 被当成两段，vendor PR #153 第七轮 review）。
+  // 原引用没有 `%` 时解码是恒等的，按原字符输出即可，不改动既有写法。
+  const encodeFragment = ref.includes("%") ? encodeURIComponent : (token: string) => token;
+  return `#/${tokens
+    .map((token) => encodeFragment(token.replaceAll("~", "~0").replaceAll("/", "~1")))
+    .join("/")}`;
 }
 
 // 这些关键字的值是「名字 → 子 schema」表：表里的键是字段名，不是关键字。

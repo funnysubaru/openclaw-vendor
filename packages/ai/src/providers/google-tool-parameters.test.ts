@@ -86,3 +86,37 @@ describe("schema traversal edge cases", () => {
     });
   });
 });
+
+// vendor PR #153 第五轮 review：参数或 schema 里合法的自有字段 `__proto__` 不能因为普通赋值触发继承 setter 而丢失。
+describe("own __proto__ keys", () => {
+  const aliases = new Map([["in", "in_"]]);
+  const ownProto = (value: object) => Object.getOwnPropertyDescriptor(value, "__proto__")?.value;
+
+  it("keeps an own __proto__ argument when encoding and decoding", () => {
+    const encoded = mapToolArgumentsWithAliases(
+      aliases,
+      JSON.parse('{"__proto__":{"x":1},"in":"a"}') as Record<string, unknown>,
+      "encode",
+    );
+    expect(ownProto(encoded)).toEqual({ x: 1 });
+    expect(encoded["in_"]).toBe("a");
+    expect(Object.getPrototypeOf(encoded)).toBe(Object.prototype);
+    const decoded = mapToolArgumentsWithAliases(
+      aliases,
+      JSON.parse('{"__proto__":{"x":1},"in_":"a"}') as Record<string, unknown>,
+      "decode",
+    );
+    expect(ownProto(decoded)).toEqual({ x: 1 });
+    expect(decoded.in).toBe("a");
+  });
+
+  it("keeps an own __proto__ property while rewriting refs below it", () => {
+    const schema = JSON.parse(
+      '{"type":"object","properties":{"in":{"type":"string"},"__proto__":{"$ref":"#/properties/in"}}}',
+    ) as Record<string, any>;
+    const renamed = applyToolParameterAliases(schema, resolveToolParameterAliases(schema));
+    expect(Object.keys(renamed.properties)).toEqual(["in_", "__proto__"]);
+    expect(ownProto(renamed.properties)).toEqual({ $ref: "#/properties/in_" });
+    expect(ownProto(schema.properties)).toEqual({ $ref: "#/properties/in" });
+  });
+});

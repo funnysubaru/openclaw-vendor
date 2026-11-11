@@ -29,6 +29,19 @@ const REF_KEYWORDS = new Set(["$ref", "$recursiveRef", "$dynamicRef"]);
 // 这些关键字的值是数据（字面量、示例），里面出现 `$ref` 键也不是 schema 引用，不改写。
 const DATA_KEYWORDS = new Set(["const", "default", "enum", "example", "examples"]);
 
+/**
+ * 用外部数据（模型回包、工具 schema）里的键往对象上写值时一律走这里：建成自有数据属性。
+ * 普通赋值 `obj[key] = v` 遇到合法字段名 `__proto__` 会触发继承的 setter，字段直接丢失（vendor PR #153 第五轮 review）。
+ */
+function setOwn(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
 /** 原名 → 别名；空表示这个工具不用改名。 */
 export type ToolParameterAliases = ReadonlyMap<string, string>;
 
@@ -211,7 +224,7 @@ function mapSchemaRefs(node: unknown, mapRef: (ref: string) => string, isNameMap
     }
     if (next !== value) {
       copy ??= { ...(node as Record<string, unknown>) };
-      copy[key] = next;
+      setOwn(copy, key, next);
     }
   }
   return copy ?? node;
@@ -250,9 +263,9 @@ export function mapToolArgumentsWithAliases(
   for (const [name, value] of Object.entries(args)) {
     const target = mapping.get(name);
     if (target !== undefined) {
-      mapped[target] = value;
+      setOwn(mapped, target, value);
     } else if (!Object.hasOwn(mapped, name)) {
-      mapped[name] = value;
+      setOwn(mapped, name, value);
     }
   }
   return mapped;

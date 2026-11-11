@@ -335,4 +335,60 @@ describe("direct openai-completions Gemini keyword aliases", () => {
       expect(ends).toEqual([args]);
     },
   );
+  // PR #153 第五轮 review：模型回包里合法的自有字段 `__proto__` 在 direct 解码后不能丢。
+  it("keeps an own __proto__ argument through direct decoding", async () => {
+    const ends: Array<Record<string, unknown>> = [];
+    await withLoopback(
+      [
+        sse({
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_1",
+              type: "function",
+              function: { name: "automations", arguments: '{"in_":"5m","__proto__":{"x":1}}' },
+            },
+          ],
+        }),
+        sse({}, "tool_calls"),
+        "data: [DONE]\n\n",
+      ],
+      async (baseUrl) => {
+        const stream = streamOpenAICompletions(
+          {
+            id: "google/gemini-2.5-flash-lite",
+            name: "Gemini 2.5 Flash Lite",
+            api: "openai-completions",
+            provider: "openrouter",
+            baseUrl,
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 1_000_000,
+            maxTokens: 8192,
+          },
+          {
+            systemPrompt: "s",
+            tools: [
+              {
+                name: "automations",
+                description: "Schedule",
+                parameters: { type: "object", properties: { in: { type: "string" } } },
+              },
+            ],
+            messages: [{ role: "user", content: "hi", timestamp: 1 }],
+          } as never,
+          { apiKey: "test-key" },
+        );
+        for await (const event of stream) {
+          if (event.type === "toolcall_end") {
+            ends.push(event.toolCall.arguments);
+          }
+        }
+      },
+    );
+    expect(ends).toHaveLength(1);
+    expect(ends[0]?.in).toBe("5m");
+    expect(Object.getOwnPropertyDescriptor(ends[0], "__proto__")?.value).toEqual({ x: 1 });
+  });
 });

@@ -38,6 +38,7 @@ const TOOLCALL_REPAIR_KNOWN_ARG_KEYS = new Set([
   "from",
   // Gemini 保留字参数别名（packages/ai google-tool-parameters）：修复器看到的是传输层改名后的原始文本。
   "from_",
+  "in_",
   "line_end",
   "line_start",
   "lines",
@@ -447,7 +448,13 @@ function parseSmartQuotedToolCallObject(
     if (!value) {
       return undefined;
     }
-    args[key.value] = value.value;
+    // 键来自模型回包：用自有数据属性写入，合法字段名 `__proto__` 不能触发继承 setter 而丢失（vendor PR #153 第六轮自检）。
+    Object.defineProperty(args, key.value, {
+      value: value.value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
 
     index = skipWhitespace(raw, value.endIndex);
     if (raw[index] === ",") {

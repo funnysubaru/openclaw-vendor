@@ -71,38 +71,121 @@ function topLevelObjectLayers(schema: Record<string, unknown>): Record<string, u
 }
 
 /**
- * schema 里有没有引用重新指回「函数顶层对象层」（`#`、`#/allOf/0` 这类递归结构）。
- * 有的话，嵌套数据也会套用改过名的顶层，而回包只还原顶层，嵌套层会留着别名交给工具，
- * 所以这种工具整体不做别名（vendor PR #153 第四轮自检）。
+ * 解析一个 schema 引用（RFC 3986 片段 + RFC 6901）。只认本文档内的引用：`#...`、空引用、按根 `$id` 写的引用。
+ * 规则：先对片段做百分号解码，再按 `/` 拆段、`~1`→`/`、`~0`→`~` 反转义。
+ * 外部文档、锚点（`#name`）、百分号编码不合法等无法确定的写法返回 undefined。
+ * 改写和递归检测都只走这一个函数（vendor PR #153 第八轮 review 收口）。
  */
-function reentersTopLevel(schema: unknown): boolean {
-  // 除了 `#` 形式，空引用 `""` 和按根 `$id` 写的引用（`urn:t`、`urn:t#`）同样指回根。
-  const rootId = asRecord(schema).$id;
-  let reenters = false;
-  mapSchemaRefs(schema, (ref) => {
-    reenters ||=
-      ref === "" ||
-      (typeof rootId === "string" && (ref === rootId || ref === `${rootId}#`)) ||
-      /^#(?:\/(?:allOf|anyOf|oneOf)\/\d+)*\/?$/.test(decodePointerUri(ref));
-    return ref;
-  });
-  return reenters;
-}
+type ParsedLocalRef = { base: string; tokens: string[]; percentEncoded: boolean };
 
-/** URI 片段里的 JSON Pointer 可能带百分号编码（`#/properties/%69n`），先解码；非法编码原样返回。 */
-function decodePointerUri(ref: string): string {
+function parseLocalRef(ref: string, rootId: string | undefined): ParsedLocalRef | undefined {
+  const hash = ref.indexOf("#");
+  const base = hash === -1 ? ref : ref.slice(0, hash);
+  if (base !== "" && base !== rootId) {
+    return undefined;
+  }
+  const fragment = hash === -1 ? "" : ref.slice(hash + 1);
+  let pointer: string;
   try {
-    return decodeURIComponent(ref);
+    pointer = decodeURIComponent(fragment);
   } catch {
-    return ref;
+    return undefined;
   }
+  if (pointer !== "" && !pointer.startsWith("/")) {
+    return undefined;
+  }
+  const tokens =
+    pointer === ""
+      ? []
+      : pointer
+          .slice(1)
+          .split("/")
+          .map((token) => token.replaceAll("~1", "/").replaceAll("~0", "~"));
+  return { base, tokens, percentEncoded: fragment.includes("%") };
 }
 
-/** 在最终出站 schema 上算保留字参数的别名；所有顶层字段名都参与避碰。 */
-export function resolveToolParameterAliases(schema: unknown): ToolParameterAliases {
-  if (reentersTopLevel(schema)) {
-    return new Map();
+/** parseLocalRef 的逆过程：原引用带百分号编码的逐段重新编码，保证再解析落在同一个目标上。 */
+function formatLocalRef({ base, tokens, percentEncoded }: ParsedLocalRef): string {
+  const encode = percentEncoded ? encodeURIComponent : (token: string) => token;
+  return `${base}#${tokens
+    .map((token) => `/${encode(token.replaceAll("~", "~0").replaceAll("/", "~1"))}`)
+    .join("")}`;
+}
+
+/** 按指针段在 schema 里取值；只走自有属性，取不到返回 undefined。 */
+function resolvePointer(schema: unknown, tokens: string[]): unknown {
+  let node: unknown = schema;
+  for (const token of tokens) {
+    if (!node || typeof node !== "object" || !Object.hasOwn(node, token)) {
+      return undefined;
+    }
+    node = (node as Record<string, unknown>)[token];
   }
+  return node;
+}
+
+/**
+ * 判断一个引用在改名之后怎么处理：返回改写后的引用（不受影响时就是原引用），
+ * 或返回 { unsafe: 原因 }，表示这个工具不能安全改名。不安全的情况：
+ * - 写法无法确定（外部文档、锚点、编码不合法）或指针在 schema 里解析不到；
+ * - 指回函数顶层对象层（`#`、`#/allOf/0` 等递归结构）：嵌套数据也会套用改过名的顶层，回包只还原顶层；
+ * - 指向某层整张 properties 表：表的键被改名，引用目标的内容跟着变。
+ * 指向被改名参数（`.../properties/in/...`）的引用把那一段换成别名，其余段原样保留。
+ */
+function planRefAfterRenaming(
+  ref: string,
+  schema: unknown,
+  rootId: string | undefined,
+  aliases: ToolParameterAliases,
+): string | { unsafe: string } {
+  const parsed = parseLocalRef(ref, rootId);
+  if (!parsed) {
+    return { unsafe: `unsupported ref ${JSON.stringify(ref)}` };
+  }
+  if (resolvePointer(schema, parsed.tokens) === undefined) {
+    return { unsafe: `unresolvable ref ${JSON.stringify(ref)}` };
+  }
+  const { tokens } = parsed;
+  let i = 0;
+  // 沿组合关键字 + 下标往下走，停在某个顶层对象层。
+  while (
+    (COMBINATOR_KEYS as readonly string[]).includes(tokens[i] ?? "") &&
+    /^\d+$/.test(tokens[i + 1] ?? "")
+  ) {
+    i += 2;
+  }
+  if (i === tokens.length) {
+    return { unsafe: `ref re-enters the top level ${JSON.stringify(ref)}` };
+  }
+  if (tokens[i] !== "properties") {
+    return ref;
+  }
+  if (i + 1 === tokens.length) {
+    return { unsafe: `ref targets a renamed properties map ${JSON.stringify(ref)}` };
+  }
+  const alias = aliases.get(tokens[i + 1] ?? "");
+  if (alias === undefined) {
+    return ref;
+  }
+  const renamedTokens = [...tokens];
+  renamedTokens[i + 1] = alias;
+  return formatLocalRef({ ...parsed, tokens: renamedTokens });
+}
+
+function rootIdOf(schema: unknown): string | undefined {
+  const id = asRecord(schema).$id;
+  return typeof id === "string" ? id : undefined;
+}
+
+/**
+ * 在最终出站 schema 上算保留字参数的别名；所有顶层字段名都参与避碰。
+ * 只要 schema 里有任何引用不能确定地解析或改写，整个工具不改名，原因交给 onSkip（调用方记 debug 日志）：
+ * 宁可这个工具在 Gemini 上偶发 MALFORMED_FUNCTION_CALL，也不发出引用悬空的 schema。
+ */
+export function resolveToolParameterAliases(
+  schema: unknown,
+  onSkip?: (reason: string) => void,
+): ToolParameterAliases {
   const layers = topLevelObjectLayers(asRecord(schema));
   // required / propertyOrdering 里出现的名字也算占用：只在 required 里出现的 `in_` 不能被拿来当 `in` 的别名。
   const taken = new Set<string>();
@@ -132,6 +215,25 @@ export function resolveToolParameterAliases(schema: unknown): ToolParameterAlias
     }
     taken.add(alias);
     aliases.set(name, alias);
+  }
+  if (aliases.size === 0) {
+    return aliases;
+  }
+  // 逐个检查 schema 里的引用（含 $recursiveRef / $dynamicRef），有一个不安全就整体放弃改名。
+  const rootId = rootIdOf(schema);
+  let unsafe: string | undefined;
+  mapSchemaRefs(schema, (ref) => {
+    if (unsafe === undefined) {
+      const plan = planRefAfterRenaming(ref, schema, rootId, aliases);
+      if (typeof plan !== "string") {
+        unsafe = plan.unsafe;
+      }
+    }
+    return ref;
+  });
+  if (unsafe !== undefined) {
+    onSkip?.(unsafe);
+    return new Map();
   }
   return aliases;
 }
@@ -168,48 +270,6 @@ function renameLayer(
     }
   }
   return renamed;
-}
-
-/**
- * 把指向「被改名的函数顶层参数」的本地 JSON Pointer 改成别名，其它引用原样返回。
- * 顶层参数所在位置是：根或根上组合分支（可多层）里的 `properties/<名字>`，与 topLevelObjectLayers 一致；
- * 嵌套对象里的同名字段是用户数据，指向它们的引用不动。
- */
-function rewriteLocalRef(ref: string, aliases: ToolParameterAliases): string {
-  if (!ref.startsWith("#/")) {
-    return ref;
-  }
-  // RFC 6901 §6：fragment 先百分号解码，再按 JSON Pointer 拆分。编码不合法的引用本来就解析不了，不碰它。
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(ref);
-  } catch {
-    return ref;
-  }
-  const tokens = decoded
-    .slice(2)
-    .split("/")
-    .map((token) => token.replaceAll("~1", "/").replaceAll("~0", "~"));
-  let i = 0;
-  // 沿组合关键字 + 下标往下走，停在某个顶层对象层。
-  while (
-    (COMBINATOR_KEYS as readonly string[]).includes(tokens[i] ?? "") &&
-    /^\d+$/.test(tokens[i + 1] ?? "")
-  ) {
-    i += 2;
-  }
-  const alias = tokens[i] === "properties" ? aliases.get(tokens[i + 1] ?? "") : undefined;
-  if (alias === undefined) {
-    return ref;
-  }
-  tokens[i + 1] = alias;
-  // 重组时先做 JSON Pointer 转义，原引用带百分号编码的再做 URI 编码，保证再解析时落在同一个目标上
-  // （如字段名 `rate%2Fday` 原写作 `rate%252Fday`，不能变成 `rate%2Fday` 被当成两段，vendor PR #153 第七轮 review）。
-  // 原引用没有 `%` 时解码是恒等的，按原字符输出即可，不改动既有写法。
-  const encodeFragment = ref.includes("%") ? encodeURIComponent : (token: string) => token;
-  return `#/${tokens
-    .map((token) => encodeFragment(token.replaceAll("~", "~0").replaceAll("/", "~1")))
-    .join("/")}`;
 }
 
 // 这些关键字的值是「名字 → 子 schema」表：表里的键是字段名，不是关键字。
@@ -266,9 +326,13 @@ export function applyToolParameterAliases<T>(schema: T, aliases: ToolParameterAl
   if (aliases.size === 0 || !schema || typeof schema !== "object" || Array.isArray(schema)) {
     return schema;
   }
-  return mapSchemaRefs(renameLayer(schema as Record<string, unknown>, aliases), (ref) =>
-    rewriteLocalRef(ref, aliases),
-  ) as T;
+  // 引用里的指针段写的是原名，所以按「改名前」的 schema 解析；不安全的引用原样保留
+  // （resolveToolParameterAliases 已保证真正用到的别名表不会遇到这种引用）。
+  const rootId = rootIdOf(schema);
+  return mapSchemaRefs(renameLayer(schema as Record<string, unknown>, aliases), (ref) => {
+    const plan = planRefAfterRenaming(ref, schema, rootId, aliases);
+    return typeof plan === "string" ? plan : ref;
+  }) as T;
 }
 
 /** encode：原名 → 别名（历史 tool_call 重放）；decode：别名 → 原名（模型回包交给工具执行前）。 */

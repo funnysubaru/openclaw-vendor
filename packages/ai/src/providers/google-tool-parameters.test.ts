@@ -197,3 +197,97 @@ describe("URI fragment encoding of rewritten refs", () => {
     expect(renamed.properties.other.$ref).toBe("#/properties/in/%zz");
   });
 });
+
+// vendor PR #153 第八轮 review 收口：各种引用写法要么改名前后解析到同一目标，要么整个工具不改名。
+// 解析器按 RFC 3986 片段 + RFC 6901 独立实现，不复用被测代码。
+describe("ref forms: same target after renaming, or no renaming at all", () => {
+  const resolveRef = (root: Record<string, any>, ref: string): unknown => {
+    const hash = ref.indexOf("#");
+    const base = hash === -1 ? ref : ref.slice(0, hash);
+    if (base !== "" && base !== root.$id) {
+      return undefined;
+    }
+    let pointer: string;
+    try {
+      pointer = decodeURIComponent(hash === -1 ? "" : ref.slice(hash + 1));
+    } catch {
+      return undefined;
+    }
+    if (pointer === "") {
+      return root;
+    }
+    if (!pointer.startsWith("/")) {
+      return undefined;
+    }
+    return pointer
+      .slice(1)
+      .split("/")
+      .map((token) => token.replaceAll("~1", "/").replaceAll("~0", "~"))
+      .reduce<any>(
+        (node, token) => (node && Object.hasOwn(node, token) ? node[token] : undefined),
+        root,
+      );
+  };
+
+  const makeSchema = (ref: string) => ({
+    $id: "urn:t",
+    type: "object",
+    properties: {
+      in: {
+        type: "object",
+        properties: {
+          "a b": { type: "boolean" },
+          "rate%2Fday": { type: "number" },
+          "x/y": { type: "integer" },
+          "t~s": { type: "null" },
+        },
+      },
+      other: { $ref: ref },
+    },
+    $defs: { Wrapper: { type: "string" } },
+  });
+
+  it.each([
+    "#/properties/in",
+    "#/properties/in/properties/a b",
+    "#/properties/in/properties/a%20b",
+    "#/properties/in/properties/rate%252Fday",
+    "#%2Fproperties%2Fin",
+    "#%2Fproperties/in/properties/x~1y",
+    "#/properties/%69n",
+    "#/properties/in/properties/x~1y",
+    "#/properties/in/properties/t~0s",
+    "urn:t#/properties/in",
+    "urn:t#%2Fproperties%2Fin",
+    "#/$defs/Wrapper",
+  ])("renames and keeps %j resolving to the same target", (ref) => {
+    const schema = makeSchema(ref);
+    const target = resolveRef(schema, ref);
+    expect(target).toBeDefined();
+    const aliases = resolveToolParameterAliases(schema);
+    expect(aliases).toEqual(new Map([["in", "in_"]]));
+    const renamed = applyToolParameterAliases(schema, aliases);
+    expect(Object.keys(renamed.properties)).toEqual(["in_", "other"]);
+    expect(resolveRef(renamed, renamed.properties.other.$ref)).toBe(target);
+  });
+
+  it.each([
+    ["invalid percent-encoding", "#/properties/in/%zz"],
+    ["external document", "https://example.test/s.json#/properties/in"],
+    ["relative external document", "other.json"],
+    ["plain-name anchor", "#anchor"],
+    ["root via #", "#"],
+    ["root via empty ref", ""],
+    ["root via $id", "urn:t"],
+    ["root via $id with empty fragment", "urn:t#"],
+    ["dangling pointer", "#/properties/missing"],
+    ["the properties map itself", "#/properties"],
+    ["root via trailing slash", "#/"],
+  ])("does not rename when a ref is %s", (_label, ref) => {
+    const notified: string[] = [];
+    expect(
+      resolveToolParameterAliases(makeSchema(ref), (reason) => notified.push(reason)).size,
+    ).toBe(0);
+    expect(notified).toHaveLength(1);
+  });
+});

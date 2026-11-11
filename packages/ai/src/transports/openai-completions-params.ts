@@ -274,7 +274,10 @@ function convertTools(
     if (!aliasGemini) {
       return parameters;
     }
-    const aliases = resolveToolParameterAliases(parameters);
+    const aliases = resolveToolParameterAliases(parameters, (reason) => {
+      // 有引用无法确定地改写时整个工具保留原参数名：宁可偶发 MALFORMED，也不发引用悬空的 schema。
+      log.debug("skip Gemini keyword parameter aliases", { tool: name, model: model.id, reason });
+    });
     if (aliases.size > 0) {
       argumentAliases.set(name, aliases);
     }

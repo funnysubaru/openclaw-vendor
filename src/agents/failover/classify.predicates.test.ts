@@ -9,7 +9,10 @@ import {
   isFailoverErrorMessage,
   isTimeoutErrorMessage,
 } from "./classify.js";
-import { isAuthPermanentErrorMessage } from "./message-patterns.js";
+import {
+  isAuthPermanentErrorMessage,
+  isDeterministicProviderFinishMessage,
+} from "./message-patterns.js";
 
 const PLAIN_INTERNAL_SERVER_ERROR_STATUS_SAMPLE = "Proxy notice: Status: Internal Server Error";
 const MIXED_INTERNAL_SERVER_ERROR_STATUS_SAMPLE = `${PLAIN_INTERNAL_SERVER_ERROR_STATUS_SAMPLE}; upstream connect error`;
@@ -400,8 +403,22 @@ describe("isFailoverErrorMessage", () => {
   it("does not classify MALFORMED_FUNCTION_CALL as timeout", () => {
     const sample = "Unhandled stop reason: MALFORMED_FUNCTION_CALL";
     expect(isTimeoutErrorMessage(sample)).toBe(false);
+    expect(isDeterministicProviderFinishMessage(sample)).toBe(false);
     expect(classifyFailoverReason(sample)).toBe(null);
     expect(isFailoverErrorMessage(sample)).toBe(false);
+  });
+
+  it("classifies direct OpenAI-compatible finish_reason: MALFORMED_FUNCTION_CALL as deterministic server_error", () => {
+    for (const sample of [
+      "Provider finish_reason: MALFORMED_FUNCTION_CALL",
+      "finish_reason: MALFORMED_FUNCTION_CALL",
+      "Provider finish_reason: error (native_finish_reason: MALFORMED_FUNCTION_CALL)",
+    ]) {
+      expect(isTimeoutErrorMessage(sample)).toBe(false);
+      expect(isDeterministicProviderFinishMessage(sample)).toBe(true);
+      expect(classifyFailoverReason(sample)).toBe("server_error");
+      expect(isFailoverErrorMessage(sample)).toBe(true);
+    }
   });
 
   it("matches google INTERNAL status errors as timeout", () => {

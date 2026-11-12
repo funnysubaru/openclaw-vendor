@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { mapOpenAIChoiceStopReason, mapOpenAIStopReason } from "./openai-stop-reason.js";
+import {
+  createOpenAIChoiceStopReasonTracker,
+  mapOpenAIChoiceStopReason,
+  mapOpenAIStopReason,
+} from "./openai-stop-reason.js";
 
 describe("mapOpenAIStopReason", () => {
   it.each([
@@ -55,5 +59,40 @@ describe("mapOpenAIChoiceStopReason", () => {
           .errorMessage,
       ).toBe("Provider finish_reason: error");
     }
+  });
+});
+
+describe("createOpenAIChoiceStopReasonTracker", () => {
+  it("retains native_finish_reason when a trailing chunk repeats the same finish_reason", () => {
+    const track = createOpenAIChoiceStopReasonTracker(true);
+    const output: {
+      stopReason: "stop" | "length" | "toolUse" | "error" | "aborted";
+      errorMessage?: string;
+    } = {
+      stopReason: "stop",
+    };
+    expect(
+      track({ finish_reason: "error", native_finish_reason: "MALFORMED_FUNCTION_CALL" }, output),
+    ).toBe("error");
+    expect(track({ finish_reason: "error" }, output)).toBe("error");
+    expect(output.errorMessage).toBe(
+      "Provider finish_reason: error (native_finish_reason: MALFORMED_FUNCTION_CALL)",
+    );
+  });
+
+  it("clears stale native_finish_reason and deletes errorMessage when a later chunk changes finish_reason", () => {
+    const track = createOpenAIChoiceStopReasonTracker(true);
+    const output: {
+      stopReason: "stop" | "length" | "toolUse" | "error" | "aborted";
+      errorMessage?: string;
+    } = {
+      stopReason: "stop",
+    };
+    track({ finish_reason: "error", native_finish_reason: "MALFORMED_FUNCTION_CALL" }, output);
+    track({ finish_reason: "content_filter" }, output);
+    expect(output.errorMessage).toBe("Provider finish_reason: content_filter");
+    track({ finish_reason: "stop" }, output);
+    expect(output.stopReason).toBe("stop");
+    expect(Object.hasOwn(output, "errorMessage")).toBe(false);
   });
 });

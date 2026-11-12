@@ -1,4 +1,4 @@
-import { asRecord } from "@openclaw/normalization-core/record-coerce";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 
 // 源自上游 openclaw PR #191561（merge 7b0cfe35941f）的 google-tool-parameters.ts：保留字清单、
 // 别名规则（`name_`，撞名继续加 `_`）、「只改函数顶层参数、嵌套对象是用户数据不动」的边界都与上游一致。
@@ -21,6 +21,10 @@ const PYTHON_KEYWORDS = new Set(
 );
 
 const COMBINATOR_KEYS = ["allOf", "anyOf", "oneOf"] as const;
+const COMBINATOR_KEY_SET: ReadonlySet<string> = new Set(COMBINATOR_KEYS);
+
+// RFC 6901 §4：JSON Pointer 数组下标只能是 `"0"` 或不带前导零的非负整数，排除 `"00"`、`"length"` 等自有属性名。
+const ARRAY_INDEX_RE = /^(?:0|[1-9]\d*)$/;
 
 // 引用关键字：`$recursiveRef`/`$dynamicRef` 指回 `#` 同样是递归结构，要参与递归检测；
 // 它们指向锚点或 `#`，不是 `#/properties/...` 指针，改写时会原样保留。
@@ -28,6 +32,19 @@ const REF_KEYWORDS = new Set(["$ref", "$recursiveRef", "$dynamicRef"]);
 
 // 这些关键字的值是数据（字面量、示例），里面出现 `$ref` 键也不是 schema 引用，不改写。
 const DATA_KEYWORDS = new Set(["const", "default", "enum", "example", "examples"]);
+
+// 这些关键字的值是「属性名/定义名 → 子 schema（或依赖字段数组）」表：表自身的键是用户侧名字而非 schema 关键字，
+// 因此名叫 `$id`、`default` 的参数不会误触发关键字特殊分支。
+const NAME_MAP_KEYWORDS = new Set([
+  "properties",
+  "patternProperties",
+  "$defs",
+  "definitions",
+  "dependentSchemas",
+  "dependentRequired",
+  // 草案 07：字段名 → 子 schema 或字段名数组。
+  "dependencies",
+]);
 
 /**
  * 用外部数据（模型回包、工具 schema）里的键往对象上写值时一律走这里：建成自有数据属性。
@@ -56,14 +73,26 @@ export function isGeminiToolParameterAliasModel(modelId: string): boolean {
   return /gemini/i.test(modelId);
 }
 
-/** 函数顶层的各个「对象层」：根本身 + 根上组合关键字（可多层嵌套组合）里的分支。 */
+/**
+ * 判断键名是否属于 Gemini Python 保留字别名形态（`<保留字>_` 及避碰追加下划线的 `<保留字>__` 等）。
+ * runner 的智能引号参数修复器工作在别名还原之前，收到的原始流式文本里可能是任意 35 个保留字别名或避碰后缀；
+ * 统一走同一份保留字集合判定，避免修复器硬编码部分键名导致其余保留字参数被吞进前一个字符串值。
+ */
+export function isGeminiToolParameterAliasKey(key: string): boolean {
+  const match = /^([A-Za-z]+)_+$/.exec(key);
+  return match?.[1] !== undefined && PYTHON_KEYWORDS.has(match[1]);
+}
+
+/** 函数顶层的各个「对象层」：根本身 + 根上组合关键字（可多层嵌套组合）里的对象分支。 */
 function topLevelObjectLayers(schema: Record<string, unknown>): Record<string, unknown>[] {
   const layers = [schema];
   for (const key of COMBINATOR_KEYS) {
     const branches = schema[key];
     if (Array.isArray(branches)) {
       for (const branch of branches) {
-        layers.push(...topLevelObjectLayers(asRecord(branch)));
+        if (isRecord(branch)) {
+          layers.push(...topLevelObjectLayers(branch));
+        }
       }
     }
   }
@@ -75,12 +104,6 @@ function topLevelObjectLayers(schema: Record<string, unknown>): Record<string, u
 // if/then/else、not、对象字面量的 const/enum/default/examples、OpenAPI discriminator……），改名后就会
 // 和参数对不上：要么撞名把两个参数压成一个，要么约束静默失效或恒为假（vendor PR #153 第九、十轮 review）。
 // 用白名单而不是黑名单：以后遇到没列出的关键字，默认整个工具不改名，不靠逐个补漏。
-// - 只描述层本身、不涉及字段名的：type、description、title、$schema、$id、$comment、deprecated、
-//   readOnly、writeOnly、minProperties、maxProperties；
-// - additionalProperties / unevaluatedProperties：只约束「没列出的字段」，改名后别名已在 properties 里；
-// - $defs / definitions：只存放定义；参数内部指向它们的引用由 planRefAfterRenaming 单独检查，
-//   顶层自身带 $ref 不在白名单里，会直接不改名；
-// - default、examples 不在白名单：值是对象时里面的键就是字段名，改名不会同步改它们。
 const SAFE_TOP_LEVEL_KEYS = new Set([
   "type",
   "properties",
@@ -107,7 +130,11 @@ const SAFE_TOP_LEVEL_KEYS = new Set([
 // （vendor PR #153 第十一轮 review）。`$schema` 同理只在根上有意义。
 const ROOT_ONLY_KEYS = new Set(["$id", "$schema"]);
 
-/** 顶层任一层出现白名单以外的键时返回原因（带键名，进 debug 日志）；都在白名单里返回 undefined。 */
+/**
+ * 校验顶层各对象层的键白名单与结构值类型：
+ * 白名单内的键若值形态本身畸形（如 `properties: []`、`required: ["in", 123]`、`allOf: { "0": ... }`），
+ * 后续收集字段、改写层与指针解析会产生分歧，必须同样拒绝改名。
+ */
 function unsafeTopLevelReason(layers: Record<string, unknown>[]): string | undefined {
   for (const [index, layer] of layers.entries()) {
     for (const key of Object.keys(layer)) {
@@ -115,8 +142,86 @@ function unsafeTopLevelReason(layers: Record<string, unknown>[]): string | undef
         return `top-level layer has non-allowlisted keyword ${JSON.stringify(key)}`;
       }
     }
+    for (const mapKey of ["properties", "$defs", "definitions"] as const) {
+      if (layer[mapKey] !== undefined && !isRecord(layer[mapKey])) {
+        return `top-level keyword ${JSON.stringify(mapKey)} must be a plain object`;
+      }
+    }
+    for (const listKey of ["required", "propertyOrdering"] as const) {
+      const list = layer[listKey];
+      if (
+        list !== undefined &&
+        (!Array.isArray(list) || !list.every((item) => typeof item === "string"))
+      ) {
+        return `top-level keyword ${JSON.stringify(listKey)} must be a string array`;
+      }
+    }
+    for (const combinatorKey of COMBINATOR_KEYS) {
+      const branches = layer[combinatorKey];
+      if (
+        branches !== undefined &&
+        (!Array.isArray(branches) ||
+          !branches.every((branch) => isRecord(branch) || typeof branch === "boolean"))
+      ) {
+        return `top-level keyword ${JSON.stringify(combinatorKey)} must be an array of object or boolean subschemas`;
+      }
+    }
   }
   return undefined;
+}
+
+/**
+ * 归一化并校验根上的 `$id`：
+ * - draft-04/07 常见末尾带空片段（`"https://example.com/tool.json#"`），去掉末尾 `#` 作为基准 URI；
+ * - 非字符串 `$id` 或带非空片段（`"#anchor"`、`"urn:t#sub"`）会改变本地引用基准或引入锚点语义，直接跳过改名。
+ */
+function normalizeRootId(schema: Record<string, unknown>): {
+  rootId: string | undefined;
+  unsafeReason?: string;
+} {
+  if (!Object.hasOwn(schema, "$id") || schema.$id === undefined) {
+    return { rootId: undefined };
+  }
+  const raw = schema.$id;
+  if (typeof raw !== "string") {
+    return { rootId: undefined, unsafeReason: "root $id must be a string" };
+  }
+  const hash = raw.indexOf("#");
+  if (hash === -1) {
+    return { rootId: raw };
+  }
+  if (hash === raw.length - 1) {
+    return { rootId: raw.slice(0, -1) };
+  }
+  return {
+    rootId: undefined,
+    unsafeReason:
+      "root $id has a non-empty fragment; refs may not resolve cleanly against the root",
+  };
+}
+
+/**
+ * 统一分类对象成员在 schema 遍历中的角色，供 nestedResourceReason 与 mapSchemaRefs 共用：
+ * 两处走完全相同的分支条件，杜绝「一边跳过非字符串 $ref、另一边递归进去」之类的遍历分叉。
+ */
+function classifySchemaMember(
+  isNameMap: boolean,
+  key: string,
+  value: unknown,
+): "ref" | "data" | "nameMap" | "schema" {
+  if (isNameMap) {
+    return "schema";
+  }
+  if (REF_KEYWORDS.has(key) && typeof value === "string") {
+    return "ref";
+  }
+  if (DATA_KEYWORDS.has(key)) {
+    return "data";
+  }
+  if (NAME_MAP_KEYWORDS.has(key) && isRecord(value)) {
+    return "nameMap";
+  }
+  return "schema";
 }
 
 // 会改变引用解析基准、或给引用提供另一个落点的键。引用解析（parseLocalRef）只认「相对最外层根」这一种基准：
@@ -124,61 +229,61 @@ function unsafeTopLevelReason(layers: Record<string, unknown>[]): string | undef
 //   按最外层根去改写会改错或误判；
 // - `$anchor` / `$dynamicAnchor` / `$recursiveAnchor`：给 `#name`、`$dynamicRef`、`$recursiveRef` 提供落点，
 //   这些落点不在按指针的解析范围内。
-// 根上的 `$id` 就是解析基准本身，允许；其余节点上出现这些键，整个工具不改名。
 const RESOURCE_KEYS = ["$id", "id", "$anchor", "$dynamicAnchor", "$recursiveAnchor"] as const;
 
 /**
- * 遍历整棵 schema，找出非根 schema 节点上的 RESOURCE_KEYS。遍历规则与 mapSchemaRefs 一致：
- * 名字表（properties、$defs 等）本身不是 schema 节点，里面的键是字段名，名叫 `$id` 的参数不算；
- * const/default/enum/examples 是字面数据，跳过。draft-04 的 `id` 只认字符串值，避免误伤别的写法。
+ * 遍历整棵 schema，找出非根 schema 节点上的 RESOURCE_KEYS 或隐式引用映射（OpenAPI discriminator.mapping）。
+ * 内部递归函数显式要求传入全部四个参数（无默认值），从类型层面杜绝数组递归漏传参数把 `isRoot` 重置回 `true`。
  */
-function nestedResourceReason(
-  node: unknown,
-  path = "#",
-  isNameMap = false,
-  isRoot = true,
-): string | undefined {
-  if (Array.isArray(node)) {
-    for (const [index, item] of node.entries()) {
-      const reason = nestedResourceReason(item, `${path}/${index}`);
+function nestedResourceReason(schema: unknown): string | undefined {
+  function visit(
+    node: unknown,
+    path: string,
+    isNameMap: boolean,
+    isRoot: boolean,
+  ): string | undefined {
+    if (Array.isArray(node)) {
+      for (const [index, item] of node.entries()) {
+        const reason = visit(item, `${path}/${index}`, false, false);
+        if (reason !== undefined) {
+          return reason;
+        }
+      }
+      return undefined;
+    }
+    if (!isRecord(node)) {
+      return undefined;
+    }
+    if (!isNameMap) {
+      for (const key of RESOURCE_KEYS) {
+        if (!Object.hasOwn(node, key)) {
+          continue;
+        }
+        if (key === "id" && typeof node.id !== "string") {
+          continue;
+        }
+        if (isRoot && key === "$id") {
+          continue;
+        }
+        return `schema node ${path} has ${key}; refs inside it may not resolve against the root`;
+      }
+      if (isRecord(node.discriminator) && isRecord(node.discriminator.mapping)) {
+        return `schema node ${path} has discriminator.mapping; implicit schema refs are not rewritten`;
+      }
+    }
+    for (const [key, value] of Object.entries(node)) {
+      const kind = classifySchemaMember(isNameMap, key, value);
+      if (kind === "ref" || kind === "data") {
+        continue;
+      }
+      const reason = visit(value, `${path}/${key}`, kind === "nameMap", false);
       if (reason !== undefined) {
         return reason;
       }
     }
     return undefined;
   }
-  if (!node || typeof node !== "object") {
-    return undefined;
-  }
-  if (!isNameMap) {
-    for (const key of RESOURCE_KEYS) {
-      if (!Object.hasOwn(node, key)) {
-        continue;
-      }
-      if (key === "id" && typeof (node as Record<string, unknown>).id !== "string") {
-        continue;
-      }
-      if (isRoot && key === "$id") {
-        continue;
-      }
-      return `schema node ${path} has ${key}; refs inside it may not resolve against the root`;
-    }
-  }
-  for (const [key, value] of Object.entries(node)) {
-    if (!isNameMap && (DATA_KEYWORDS.has(key) || REF_KEYWORDS.has(key))) {
-      continue;
-    }
-    const reason = nestedResourceReason(
-      value,
-      `${path}/${key}`,
-      !isNameMap && NAME_MAP_KEYWORDS.has(key),
-      false,
-    );
-    if (reason !== undefined) {
-      return reason;
-    }
-  }
-  return undefined;
+  return visit(schema, "#", false, true);
 }
 
 /**
@@ -223,14 +328,21 @@ function formatLocalRef({ base, tokens, percentEncoded }: ParsedLocalRef): strin
     .join("")}`;
 }
 
-/** 按指针段在 schema 里取值；只走自有属性，取不到返回 undefined。 */
+/** 按 RFC 6901 指针段在 schema 里取值：数组段只接受规范非负整数下标，对象段只走自有属性。 */
 function resolvePointer(schema: unknown, tokens: string[]): unknown {
   let node: unknown = schema;
   for (const token of tokens) {
-    if (!node || typeof node !== "object" || !Object.hasOwn(node, token)) {
+    if (Array.isArray(node)) {
+      if (!ARRAY_INDEX_RE.test(token) || !Object.hasOwn(node, token)) {
+        return undefined;
+      }
+      node = node[Number(token)];
+      continue;
+    }
+    if (!isRecord(node) || !Object.hasOwn(node, token)) {
       return undefined;
     }
-    node = (node as Record<string, unknown>)[token];
+    node = node[token];
   }
   return node;
 }
@@ -239,7 +351,7 @@ function resolvePointer(schema: unknown, tokens: string[]): unknown {
  * 判断一个引用在改名之后怎么处理：返回改写后的引用（不受影响时就是原引用），
  * 或返回 { unsafe: 原因 }，表示这个工具不能安全改名。不安全的情况：
  * - 写法无法确定（外部文档、锚点、编码不合法）或指针在 schema 里解析不到；
- * - 指回函数顶层对象层（`#`、`#/allOf/0` 等递归结构）：嵌套数据也会套用改过名的顶层，回包只还原顶层；
+ * - 指回函数顶层对象层或组合分支（`#`、`#/allOf/0` 等递归结构）：嵌套数据也会套用改过名的顶层，回包只还原顶层；
  * - 指向某层整张 properties 表：表的键被改名，引用目标的内容跟着变。
  * 指向被改名参数（`.../properties/in/...`）的引用把那一段换成别名，其余段原样保留。
  */
@@ -258,17 +370,26 @@ function planRefAfterRenaming(
   }
   const { tokens } = parsed;
   let i = 0;
-  // 沿组合关键字 + 下标往下走，停在某个顶层对象层。
-  while (
-    (COMBINATOR_KEYS as readonly string[]).includes(tokens[i] ?? "") &&
-    /^\d+$/.test(tokens[i + 1] ?? "")
-  ) {
+  let cur: unknown = schema;
+  // 沿真实组合数组 + RFC 6901 下标同步下钻，确保只有真正落在顶层对象层上的 properties 才会被改写。
+  while (isRecord(cur)) {
+    const key = tokens[i] ?? "";
+    const nextIndex = tokens[i + 1] ?? "";
+    const branches = cur[key];
+    if (
+      !COMBINATOR_KEY_SET.has(key) ||
+      !Array.isArray(branches) ||
+      !ARRAY_INDEX_RE.test(nextIndex)
+    ) {
+      break;
+    }
+    cur = branches[Number(nextIndex)];
     i += 2;
   }
   if (i === tokens.length) {
     return { unsafe: `ref re-enters the top level ${JSON.stringify(ref)}` };
   }
-  if (tokens[i] !== "properties") {
+  if (!isRecord(cur) || tokens[i] !== "properties" || !isRecord(cur.properties)) {
     return ref;
   }
   if (i + 1 === tokens.length) {
@@ -283,26 +404,26 @@ function planRefAfterRenaming(
   return formatLocalRef({ ...parsed, tokens: renamedTokens });
 }
 
-function rootIdOf(schema: unknown): string | undefined {
-  const id = asRecord(schema).$id;
-  return typeof id === "string" ? id : undefined;
-}
-
 /**
  * 在最终出站 schema 上算保留字参数的别名；所有顶层字段名都参与避碰。
- * 只要 schema 里有任何引用不能确定地解析或改写，整个工具不改名，原因交给 onSkip（调用方记 debug 日志）：
- * 宁可这个工具在 Gemini 上偶发 MALFORMED_FUNCTION_CALL，也不发出引用悬空的 schema。
+ * 只要 schema 里有任何引用或顶层结构不能确定地解析或改写，整个工具不改名，原因交给 onSkip（调用方记 debug 日志）：
+ * 宁可这个工具在 Gemini 上偶发 MALFORMED_FUNCTION_CALL，也不发出引用悬空或结构失配的 schema。
  */
 export function resolveToolParameterAliases(
   schema: unknown,
   onSkip?: (reason: string) => void,
 ): ToolParameterAliases {
-  const layers = topLevelObjectLayers(asRecord(schema));
+  if (!isRecord(schema)) {
+    return new Map();
+  }
+  const layers = topLevelObjectLayers(schema);
   // required / propertyOrdering 里出现的名字也算占用：只在 required 里出现的 `in_` 不能被拿来当 `in` 的别名。
   const taken = new Set<string>();
   for (const layer of layers) {
-    for (const name of Object.keys(asRecord(layer.properties))) {
-      taken.add(name);
+    if (isRecord(layer.properties)) {
+      for (const name of Object.keys(layer.properties)) {
+        taken.add(name);
+      }
     }
     for (const key of ["required", "propertyOrdering"] as const) {
       const names = layer[key];
@@ -330,13 +451,13 @@ export function resolveToolParameterAliases(
   if (aliases.size === 0) {
     return aliases;
   }
-  const openReason = unsafeTopLevelReason(layers) ?? nestedResourceReason(schema);
+  const { rootId, unsafeReason: rootIdReason } = normalizeRootId(schema);
+  const openReason = unsafeTopLevelReason(layers) ?? rootIdReason ?? nestedResourceReason(schema);
   if (openReason !== undefined) {
     onSkip?.(openReason);
     return new Map();
   }
   // 逐个检查 schema 里的引用（含 $recursiveRef / $dynamicRef），有一个不安全就整体放弃改名。
-  const rootId = rootIdOf(schema);
   let unsafe: string | undefined;
   mapSchemaRefs(schema, (ref) => {
     if (unsafe === undefined) {
@@ -355,19 +476,18 @@ export function resolveToolParameterAliases(
 }
 
 // 范围：只改 properties / required / propertyOrdering 和组合分支。顶层出现白名单（SAFE_TOP_LEVEL_KEYS）
-// 以外的关键字时，resolveToolParameterAliases 已整体放弃改名，走不到这里。
+// 以外的关键字或畸形值类型时，resolveToolParameterAliases 已整体放弃改名。
 function renameLayer(
   layer: Record<string, unknown>,
   aliases: ToolParameterAliases,
 ): Record<string, unknown> {
   const renamed: Record<string, unknown> = { ...layer };
-  if (layer.properties && typeof layer.properties === "object") {
-    renamed.properties = Object.fromEntries(
-      Object.entries(asRecord(layer.properties)).map(([name, propertySchema]) => [
-        aliases.get(name) ?? name,
-        propertySchema,
-      ]),
-    );
+  if (isRecord(layer.properties)) {
+    const renamedProps: Record<string, unknown> = {};
+    for (const [name, propertySchema] of Object.entries(layer.properties)) {
+      setOwn(renamedProps, aliases.get(name) ?? name, propertySchema);
+    }
+    renamed.properties = renamedProps;
   }
   for (const key of ["required", "propertyOrdering"] as const) {
     const value = layer[key];
@@ -379,54 +499,38 @@ function renameLayer(
     const branches = layer[key];
     if (Array.isArray(branches)) {
       renamed[key] = branches.map((branch) =>
-        branch && typeof branch === "object" && !Array.isArray(branch)
-          ? renameLayer(branch as Record<string, unknown>, aliases)
-          : branch,
+        isRecord(branch) ? renameLayer(branch, aliases) : branch,
       );
     }
   }
   return renamed;
 }
 
-// 这些关键字的值是「名字 → 子 schema」表：表里的键是字段名，不是关键字。
-const NAME_MAP_KEYWORDS = new Set([
-  "properties",
-  "patternProperties",
-  "$defs",
-  "definitions",
-  "dependentSchemas",
-  // 草案 07：字段名 → 子 schema 或字段名数组。
-  "dependencies",
-]);
-
 /**
- * 遍历整个 schema，对每个 `$ref` 字符串调用 mapRef；有改动的路径才复制，不改传入对象。
- * 改写引用和检测递归引用都走这里，保证两处对「哪里是引用、哪里是数据」的判断一致（vendor PR #153 第四轮 review）：
- * - 名字表（properties、$defs 等）里的键是字段名，字段可能就叫 `default`/`const`，照常往下遍历；
- * - schema 层上的 const/default/enum/examples 是字面数据，里面形如 `$ref` 的内容不是引用，跳过。
+ * 遍历整个 schema，对每个引用字符串调用 mapRef；有改动的路径才复制，不改传入对象。
+ * 通过 classifySchemaMember 与 nestedResourceReason 共享同一套节点分类规则。
  */
 function mapSchemaRefs(node: unknown, mapRef: (ref: string) => string, isNameMap = false): unknown {
   if (Array.isArray(node)) {
-    const next = node.map((item) => mapSchemaRefs(item, mapRef));
+    const next = node.map((item) => mapSchemaRefs(item, mapRef, false));
     return next.some((item, index) => item !== node[index]) ? next : node;
   }
-  if (!node || typeof node !== "object") {
+  if (!isRecord(node)) {
     return node;
   }
   let copy: Record<string, unknown> | undefined;
   for (const [key, value] of Object.entries(node)) {
+    const kind = classifySchemaMember(isNameMap, key, value);
     let next: unknown;
-    if (isNameMap) {
-      next = mapSchemaRefs(value, mapRef);
-    } else if (REF_KEYWORDS.has(key) && typeof value === "string") {
+    if (kind === "ref" && typeof value === "string") {
       next = mapRef(value);
-    } else if (DATA_KEYWORDS.has(key)) {
+    } else if (kind === "data") {
       next = value;
     } else {
-      next = mapSchemaRefs(value, mapRef, NAME_MAP_KEYWORDS.has(key));
+      next = mapSchemaRefs(value, mapRef, kind === "nameMap");
     }
     if (next !== value) {
-      copy ??= { ...(node as Record<string, unknown>) };
+      copy ??= { ...node };
       setOwn(copy, key, next);
     }
   }
@@ -439,16 +543,21 @@ function mapSchemaRefs(node: unknown, mapRef: (ref: string) => string, isNameMap
  * 否则引用会悬空（vendor PR #153 第三轮 review）。
  */
 export function applyToolParameterAliases<T>(schema: T, aliases: ToolParameterAliases): T {
-  if (aliases.size === 0 || !schema || typeof schema !== "object" || Array.isArray(schema)) {
+  if (aliases.size === 0 || !isRecord(schema)) {
+    return schema;
+  }
+  const { rootId, unsafeReason } = normalizeRootId(schema);
+  if (unsafeReason !== undefined) {
     return schema;
   }
   // 引用里的指针段写的是原名，所以按「改名前」的 schema 解析；不安全的引用原样保留
   // （resolveToolParameterAliases 已保证真正用到的别名表不会遇到这种引用）。
-  const rootId = rootIdOf(schema);
-  return mapSchemaRefs(renameLayer(schema as Record<string, unknown>, aliases), (ref) => {
+  const rewritten = mapSchemaRefs(renameLayer(schema, aliases), (ref) => {
     const plan = planRefAfterRenaming(ref, schema, rootId, aliases);
     return typeof plan === "string" ? plan : ref;
-  }) as T;
+  });
+  // SAFETY: renameLayer 与 mapSchemaRefs 只浅拷贝改写后的顶层 schema 对象，保持入参 T 的外层对象契约不变。
+  return rewritten as T;
 }
 
 /** encode：原名 → 别名（历史 tool_call 重放）；decode：别名 → 原名（模型回包交给工具执行前）。 */
@@ -457,8 +566,8 @@ export function mapToolArgumentsWithAliases(
   args: Record<string, unknown>,
   direction: "encode" | "decode",
 ): Record<string, unknown> {
-  // 历史里参数可能缺失或不是对象（如 undefined），这种情况原样返回，不让请求构建抛错。
-  if (!aliases || aliases.size === 0 || !args || typeof args !== "object" || Array.isArray(args)) {
+  // 历史里参数可能缺失或不是纯对象（如 undefined 或数组），这种情况原样返回，不让请求构建抛错。
+  if (!aliases || aliases.size === 0 || !isRecord(args)) {
     return args;
   }
   const mapping =
@@ -484,7 +593,8 @@ export function mapToolArgumentsWithAliases(
 // 挂在 globalThis 上：传输层（相对路径）和 runner（@openclaw/ai/internal/openai）经两条导入路径用到这张表，
 // 打包时若被拆成两份模块副本，各自 new 一张就查不到对方登记的别名。
 const ALIAS_REGISTRY_KEY = Symbol.for("openclaw.toolCallArgumentAliasesByBlock");
-const aliasRegistryHost = globalThis as {
+// SAFETY: 以全局唯一 Symbol.for 键在 globalThis 上挂载跨 bundle 共享的块级别名 WeakMap。
+const aliasRegistryHost = globalThis as typeof globalThis & {
   [ALIAS_REGISTRY_KEY]?: WeakMap<object, ToolParameterAliases>;
 };
 const toolCallArgumentAliasesByBlock = (aliasRegistryHost[ALIAS_REGISTRY_KEY] ??= new WeakMap());
@@ -499,23 +609,23 @@ export function rememberToolCallArgumentAliases(
 
 /**
  * runner 在纠正工具名（`default_api.automations` → `automations`）、把文本形式的工具调用提升成块之后调用：
- * 按块「当前的」名字查这一轮请求的别名表，还原参数并登记。传输层只按回包里的原始名字还原，
- * 名字被纠正或块是 runner 新建的都会漏（vendor PR #153 合并前自检）。还原是幂等的，重复调用无害。
+ * 按块「当前的」名字查这一轮请求的别名表，先登记到块级 WeakMap，再对已有对象参数做幂等还原。
+ * 先登记再判 `isRecord(block.arguments)`：若流式阶段 JSON 破损导致此刻 `arguments` 尚未成型，
+ * 外层参数修复器稍后补齐并写回时仍能命中 WeakMap 完成还原。
  */
 export function decodeToolCallBlockByName(
   block: { name?: unknown; arguments?: unknown },
   aliasesByTool: ReadonlyMap<string, ToolParameterAliases>,
 ): void {
   const aliases = typeof block.name === "string" ? aliasesByTool.get(block.name) : undefined;
-  if (!aliases || !block.arguments || typeof block.arguments !== "object") {
+  if (!aliases || aliases.size === 0) {
     return;
   }
-  block.arguments = mapToolArgumentsWithAliases(
-    aliases,
-    block.arguments as Record<string, unknown>,
-    "decode",
-  );
   toolCallArgumentAliasesByBlock.set(block, aliases);
+  if (!isRecord(block.arguments)) {
+    return;
+  }
+  block.arguments = mapToolArgumentsWithAliases(aliases, block.arguments, "decode");
 }
 
 /** 往已确认的工具调用块写参数前调用：若该块登记过别名，把别名键还原成原名；否则原样返回。 */

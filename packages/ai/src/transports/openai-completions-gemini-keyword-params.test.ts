@@ -177,6 +177,114 @@ describe("openai completions Gemini keyword parameter aliases", () => {
     );
   });
 
+  it.each([
+    [
+      "trailing usage chunk repeating finish_reason without native_finish_reason",
+      () => {
+        const first = makeCompletionsChunk({}, "error");
+        (first.choices[0] as unknown as Record<string, unknown>).native_finish_reason =
+          "MALFORMED_FUNCTION_CALL";
+        const usageTail = makeCompletionsChunk({}, "error");
+        return [first, usageTail];
+      },
+    ],
+    [
+      "finish_reason and native_finish_reason split across consecutive chunks",
+      () => {
+        const first = makeCompletionsChunk({}, "error");
+        const second = makeCompletionsChunk({}, null);
+        (second.choices[0] as unknown as Record<string, unknown>).native_finish_reason =
+          "MALFORMED_FUNCTION_CALL";
+        return [first, second];
+      },
+    ],
+  ])("preserves native_finish_reason across multi-chunk streams (%s)", async (_label, build) => {
+    const model = geminiModel();
+    const output = createAssistantOutput(model);
+    async function* chunks() {
+      for (const item of build()) {
+        yield item as never;
+      }
+    }
+    await processCompletionsStream(
+      chunks(),
+      output,
+      model,
+      { push: () => {} },
+      { sawStreamDONE: () => true },
+    );
+    expect(output.stopReason).toBe("error");
+    expect(output.errorMessage).toBe(
+      "Provider finish_reason: error (native_finish_reason: MALFORMED_FUNCTION_CALL)",
+    );
+  });
+
+  it("skips aliasing in managed mode when an array-nested subschema defines its own $id", () => {
+    const nestedIdTool = {
+      name: "complex_tool",
+      description: "Nested $id inside anyOf",
+      parameters: {
+        type: "object",
+        properties: {
+          in: { type: "string" },
+          items: {
+            anyOf: [
+              {
+                $id: "urn:inner",
+                type: "object",
+                properties: { in: { type: "number" }, ref: { $ref: "#/properties/in" } },
+              },
+            ],
+          },
+        },
+        required: ["in"],
+      },
+    };
+    const params = buildOpenAICompletionsParams(
+      geminiModel(),
+      { systemPrompt: "s", messages: [], tools: [nestedIdTool] } as never,
+      undefined,
+    );
+    const shaped = params as unknown as ParamsShape;
+    const outbound = shaped.tools?.[0]?.function.parameters;
+    expect(Object.keys(outbound?.properties ?? {})).toContain("in");
+    expect(JSON.stringify(outbound)).not.toContain("in_");
+    expect(getCompletionsToolArgumentAliases(params)?.size).toBe(0);
+  });
+
+  it("registers an empty alias map when no tools are aliased and clears duplicate-name entries", () => {
+    const plainTool = {
+      name: "plain",
+      description: "No Python keywords",
+      parameters: { type: "object", properties: { in_: { type: "string" } } },
+    };
+    const noAliasParams = buildOpenAICompletionsParams(
+      geminiModel(),
+      { systemPrompt: "s", messages: [], tools: [plainTool] } as never,
+      undefined,
+    );
+    expect(getCompletionsToolArgumentAliases(noAliasParams)).toEqual(new Map());
+
+    const duplicateTools = [
+      {
+        name: "dup",
+        description: "First has keyword",
+        parameters: { type: "object", properties: { in: { type: "string" } } },
+      },
+      {
+        name: "dup",
+        description: "Second has no keyword",
+        parameters: { type: "object", properties: { in_: { type: "string" } } },
+      },
+    ];
+    const dupParams = buildOpenAICompletionsParams(
+      geminiModel(),
+      { systemPrompt: "s", messages: [], tools: duplicateTools } as never,
+      undefined,
+    );
+    expect(getCompletionsToolArgumentAliases(dupParams)?.has("dup")).toBe(false);
+  });
+
   // vendor PR #153 review：映射必须来自「最终出站 schema」，并被出站、历史编码、回包还原三处共用。
   describe("aliases derived from the final outbound schema", () => {
     const keywordNames = new Set(["in", "from"]);

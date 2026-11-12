@@ -62,3 +62,45 @@ export function mapOpenAIChoiceStopReason(
   }
   return { ...result, errorMessage: `${result.errorMessage} (native_finish_reason: ${native})` };
 }
+
+/**
+ * 流式 SSE 下跨多个 chunk 累积 choice 的 finish_reason 与 native_finish_reason：
+ * OpenRouter 开启 include_usage 时，常在结束块带 `{ finish_reason: "error", native_finish_reason: "MALFORMED_FUNCTION_CALL" }`，
+ * 随后在末尾 usage 块重复 `{ finish_reason: "error" }`（不含 native_finish_reason），或把两个字段拆在相邻块里。
+ * 逐块独立映射会把已拿到的 native_finish_reason 覆盖回裸 `Provider finish_reason: error` 或漏掉。
+ */
+export function createOpenAIChoiceStopReasonTracker(allowSingularToolCall = false) {
+  let finishReason: string | null = null;
+  let nativeFinishReason: unknown;
+  return (
+    choice: { finish_reason?: string | null; native_finish_reason?: unknown },
+    output: { stopReason: StopReason; errorMessage?: string },
+  ): StopReason | undefined => {
+    const hasFinish = typeof choice.finish_reason === "string" && choice.finish_reason.length > 0;
+    const hasNative =
+      typeof choice.native_finish_reason === "string" && choice.native_finish_reason.length > 0;
+    if (hasFinish) {
+      if (finishReason !== null && finishReason !== choice.finish_reason && !hasNative) {
+        nativeFinishReason = undefined;
+      }
+      finishReason = choice.finish_reason ?? null;
+    }
+    if (hasNative) {
+      nativeFinishReason = choice.native_finish_reason;
+    }
+    if (!finishReason || (!hasFinish && !hasNative)) {
+      return undefined;
+    }
+    const result = mapOpenAIChoiceStopReason(
+      { finish_reason: finishReason, native_finish_reason: nativeFinishReason },
+      { allowSingularToolCall },
+    );
+    output.stopReason = result.stopReason;
+    if (result.errorMessage) {
+      output.errorMessage = result.errorMessage;
+    } else {
+      delete output.errorMessage;
+    }
+    return result.stopReason;
+  };
+}

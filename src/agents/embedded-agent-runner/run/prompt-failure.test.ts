@@ -328,4 +328,30 @@ describe("handleEmbeddedPromptFailure", () => {
 
     await vi.waitFor(() => expect(events).toEqual(["advance", "mark-start", "mark-finish"]));
   });
+
+  it.each([
+    ["Provider finish_reason: error (native_finish_reason: MALFORMED_FUNCTION_CALL)", true],
+    ["Provider finish_reason: MALFORMED_FUNCTION_CALL", false],
+  ])(
+    "skips same-model profile rotation on deterministic prompt error %s (fallback=%s)",
+    async (message, fallbackConfigured) => {
+      const params = makeParams({
+        promptError: new Error(message),
+        fallbackConfigured,
+        failover: {
+          advanceAuthProfile: vi.fn(async () => true),
+          resolveAuthProfileFailureReason: vi.fn(() => null),
+        },
+      });
+
+      await expect(handleEmbeddedPromptFailure(params)).rejects.toHaveProperty("message", message);
+      expect(params.failover.advanceAuthProfile).not.toHaveBeenCalled();
+      expect(params.traceAttempts).toEqual([
+        expect.objectContaining({
+          result: fallbackConfigured ? "fallback_model" : "surface_error",
+          reason: "server_error",
+        }),
+      ]);
+    },
+  );
 });

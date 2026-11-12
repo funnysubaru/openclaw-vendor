@@ -420,6 +420,20 @@ const re = /\d+/;
     expectAllToolCallArgs(result, { path: "safe.txt", offset: 5, limit: 20 });
   });
 
+  it("repairs smart-quoted non-freeform args before any Gemini Python-keyword alias or collision suffix", async () => {
+    const result = await runToolCallRepairCase({
+      toolName: "automations",
+      delta: "{“path”:“notes/a.md”,“with_”:“summary”,“class_”:“daily”,“in__”:“5m”}",
+    });
+
+    expectAllToolCallArgs(result, {
+      path: "notes/a.md",
+      with_: "summary",
+      class_: "daily",
+      in__: "5m",
+    });
+  });
+
   it("repairs prefixless smart-quoted read args before schema-specific option keys", async () => {
     const result = await runToolCallRepairCase({
       toolName: "read",

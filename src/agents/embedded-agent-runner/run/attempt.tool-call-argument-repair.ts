@@ -1,7 +1,10 @@
 /**
  * Repairs malformed tool-call arguments in embedded-agent stream results.
  */
-import { decodeToolCallArgumentsForBlock } from "@openclaw/ai/internal/openai";
+import {
+  decodeToolCallArgumentsForBlock,
+  isGeminiToolParameterAliasKey,
+} from "@openclaw/ai/internal/openai";
 import { extractBalancedJsonPrefix } from "@openclaw/normalization-core";
 import { safeParseJsonRecord } from "@openclaw/normalization-core/json-coercion";
 import { normalizeProviderId } from "../../model-selection.js";
@@ -36,9 +39,6 @@ const TOOLCALL_REPAIR_KNOWN_ARG_KEYS = new Set([
   "filePath",
   "filepath",
   "from",
-  // Gemini 保留字参数别名（packages/ai google-tool-parameters）：修复器看到的是传输层改名后的原始文本。
-  "from_",
-  "in_",
   "line_end",
   "line_start",
   "lines",
@@ -275,6 +275,8 @@ function shouldCloseSmartQuotedValueAt(
   if (!TOOLCALL_REPAIR_FREEFORM_VALUE_KEYS.has(valueKey)) {
     return (
       TOOLCALL_REPAIR_KNOWN_ARG_KEYS.has(nextKey) ||
+      // Gemini 保留字参数别名（全量 35 个 Python 保留字 + 避碰下划线后缀）在还原前直接出现在原始文本里。
+      isGeminiToolParameterAliasKey(nextKey) ||
       isToolSpecificValueSuccessor({ toolName, valueKey, nextKey })
     );
   }

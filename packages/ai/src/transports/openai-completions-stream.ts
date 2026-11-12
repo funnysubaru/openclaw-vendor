@@ -8,7 +8,7 @@ import {
   createOpenAIEncryptedToolCallReasoningTracker,
   finalizeOpenAICompletionsToolCalls,
 } from "../providers/openai-completions-tool-calls.js";
-import { mapOpenAIChoiceStopReason } from "../providers/openai-stop-reason.js";
+import { createOpenAIChoiceStopReasonTracker } from "../providers/openai-stop-reason.js";
 import {
   clearPendingCommentaryText,
   rememberPendingCommentaryTags,
@@ -49,6 +49,8 @@ type OpenAICompatibleChoice = ChatCompletionChunk["choices"][number] & {
   usage?: ChatCompletionChunk["usage"];
   // Some compatible providers stream a complete message in place of delta.
   message?: ChatCompletionChunk["choices"][number]["delta"];
+  // OpenRouter 透传上游厂家的原始结束原因（如 Gemini 的 MALFORMED_FUNCTION_CALL）。
+  native_finish_reason?: unknown;
 };
 
 type OpenAICompatibleChatCompletionChunk = Omit<ChatCompletionChunk, "choices"> & {
@@ -145,6 +147,7 @@ export async function processCompletionsStream(
   const toolCallBlockIndices = new WeakMap<ToolCallBlock, number>();
   let explicitVisibleTextBlocks: Set<TextBlock> | undefined;
   const normalizeToolCallDeltas = createOpenAICompletionsToolCallDeltaNormalizer();
+  const trackChoiceStopReason = createOpenAIChoiceStopReasonTracker(true);
   let finishReason: string | undefined;
   let sawNativeToolCallDelta = false;
   const blockIndex = () =>
@@ -504,17 +507,8 @@ export async function processCompletionsStream(
       });
       hasReasoningUsageActivity = hasOpenAICompletionsReasoningUsageActivity(choiceUsage);
     }
-    if (choice.finish_reason) {
-      // 带上 OpenRouter 的 native_finish_reason，日志才看得出 MALFORMED_FUNCTION_CALL 之类真因。
-      const finishReasonResult = mapOpenAIChoiceStopReason(choice, {
-        allowSingularToolCall: true,
-      });
-      output.stopReason = finishReasonResult.stopReason;
-      finishReason = finishReasonResult.stopReason;
-      if (finishReasonResult.errorMessage) {
-        output.errorMessage = finishReasonResult.errorMessage;
-      }
-    }
+    // 跨多块保留 OpenRouter 的 native_finish_reason，避免末尾 usage 块重复 finish_reason 时冲掉真因。
+    finishReason = trackChoiceStopReason(choice, output) ?? finishReason;
     const rawChoiceDelta = choice.delta ?? choice.message;
     if (!rawChoiceDelta) {
       emitReasoningUsageActivity(hasReasoningUsageActivity);

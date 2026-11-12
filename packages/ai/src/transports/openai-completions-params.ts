@@ -280,6 +280,9 @@ function convertTools(
     });
     if (aliases.size > 0) {
       argumentAliases.set(name, aliases);
+    } else {
+      // 同名工具重复定义时若后一个不再需要别名，及时清掉前一个留下的条目，保持映射与最终定义一致。
+      argumentAliases.delete(name);
     }
     return applyToolParameterAliases(parameters, aliases);
   };
@@ -337,12 +340,14 @@ function convertTools(
 // runner 的还原包装器在 onPayload 回调里经 @openclaw/ai/internal/openai 取这张表，与传输层走的是两条导入路径；
 // 挂在 globalThis 上，打包拆出两份模块副本时仍是同一张表。
 const COMPLETIONS_ALIAS_REGISTRY_KEY = Symbol.for("openclaw.completionsToolArgumentAliases");
-const completionsAliasRegistryHost = globalThis as {
+// SAFETY: 以全局唯一 Symbol.for 键在 globalThis 上挂载跨导入路径共享的请求体别名 WeakMap。
+const completionsAliasRegistryHost = globalThis as typeof globalThis & {
   [COMPLETIONS_ALIAS_REGISTRY_KEY]?: WeakMap<object, ReadonlyMap<string, ToolParameterAliases>>;
 };
 const completionsToolArgumentAliases = (completionsAliasRegistryHost[
   COMPLETIONS_ALIAS_REGISTRY_KEY
 ] ??= new WeakMap());
+const EMPTY_TOOL_ARGUMENT_ALIASES: ReadonlyMap<string, ToolParameterAliases> = new Map();
 
 /** 取 buildOpenAICompletionsParams / buildOpenAICompletionsRequest 刚生成的请求体的参数别名。 */
 export function getCompletionsToolArgumentAliases(
@@ -425,9 +430,14 @@ export function buildOpenAICompletionsRequest(
     stream: true,
     ...resolveOpenAIPromptCacheParams(model, cacheRetention, compat),
   };
-  if (convertedTools && convertedTools.argumentAliases.size > 0) {
-    completionsToolArgumentAliases.set(params, convertedTools.argumentAliases);
-  }
+  // 始终登记（无别名时登记空表），让 runner 的 onPayload 能区分「新一轮零别名请求体（应清空旧表）」
+  // 与「同一轮内层包装器浅拷贝出的未知对象（应保留当前表）」。
+  completionsToolArgumentAliases.set(
+    params,
+    convertedTools && convertedTools.argumentAliases.size > 0
+      ? convertedTools.argumentAliases
+      : EMPTY_TOOL_ARGUMENT_ALIASES,
+  );
   if (compat.supportsUsageInStreaming) {
     params.stream_options = { include_usage: true };
   }

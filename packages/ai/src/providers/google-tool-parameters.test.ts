@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   applyToolParameterAliases,
+  decodeToolCallArgumentsForBlock,
+  decodeToolCallBlockByName,
+  isGeminiToolParameterAliasKey,
   mapToolArgumentsWithAliases,
   resolveToolParameterAliases,
 } from "./google-tool-parameters.js";
@@ -551,5 +554,255 @@ describe("nested schema resources", () => {
   it("ignores a non-string id (not a draft-04 resource id)", () => {
     const schema = { ...base, properties: { ...base.properties, x: { type: "object", id: 3 } } };
     expect(resolveToolParameterAliases(schema)).toEqual(new Map([["in", "in_"]]));
+  });
+
+  // vendor PR #153 第十三轮收口：数组子项不能把 isRoot 重置回 true，否则 anyOf/prefixItems 里的 $id 会漏检。
+  it("does not rename when an array-nested subschema carries its own $id or $anchor", () => {
+    const schemaWithArrayNestedId = {
+      type: "object",
+      properties: {
+        in: { type: "string" },
+        items: {
+          anyOf: [
+            {
+              $id: "urn:inner",
+              type: "object",
+              properties: { in: { type: "number" }, ref: { $ref: "#/properties/in" } },
+            },
+          ],
+        },
+      },
+    };
+    expect(skipReason(schemaWithArrayNestedId)).toEqual({
+      size: 0,
+      notified: [
+        "schema node #/properties/items/anyOf/0 has $id; refs inside it may not resolve against the root",
+      ],
+    });
+    expect(applyToolParameterAliases(schemaWithArrayNestedId, new Map())).toBe(
+      schemaWithArrayNestedId,
+    );
+
+    for (const candidate of [
+      {
+        ...base,
+        properties: {
+          ...base.properties,
+          tuple: { type: "array", prefixItems: [{ $id: "urn:tuple-item", type: "string" }] },
+        },
+      },
+      {
+        ...base,
+        $defs: { Sub: { allOf: [{ $anchor: "sub-anchor", type: "object" }] } },
+      },
+      {
+        ...base,
+        properties: {
+          ...base.properties,
+          union: { oneOf: [{ type: "string" }, { id: "urn:draft04-branch", type: "number" }] },
+        },
+      },
+      {
+        ...base,
+        properties: {
+          ...base.properties,
+          nonStringRef: { type: "object", $ref: { $id: "urn:inside-non-string-ref" } },
+        },
+      },
+      {
+        ...base,
+        properties: {
+          ...base.properties,
+          pet: {
+            oneOf: [{ type: "object" }],
+            discriminator: { propertyName: "kind", mapping: { dog: "#/properties/in" } },
+          },
+        },
+      },
+    ]) {
+      expect(skipReason(candidate).size).toBe(0);
+    }
+  });
+
+  it("treats nested dependentRequired as a property-name map and rewrites refs inside non-string $ref objects", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        in: { type: "string" },
+        nested: {
+          type: "object",
+          dependentRequired: { $id: ["id"], $anchor: ["other"] },
+          $ref: { properties: { x: { $ref: "#/properties/in" } } },
+        },
+      },
+    };
+    const aliases = resolveToolParameterAliases(schema);
+    expect(aliases).toEqual(new Map([["in", "in_"]]));
+    const renamed = applyToolParameterAliases(schema, aliases);
+    expect(renamed.properties.nested.$ref.properties.x.$ref).toBe("#/properties/in_");
+  });
+});
+
+// vendor PR #153 第十三轮收口：根/顶层结构类型校验、根 $id 片段归一化、RFC 6901 数组下标、全量保留字别名识别与块预登记。
+describe("structural validation, root $id fragments, and alias helpers", () => {
+  it("normalizes trailing empty # on root $id while skipping non-empty fragments or non-string $id", () => {
+    const draft07RootSchema = {
+      $id: "https://example.test/tool.json#",
+      type: "object",
+      properties: {
+        in: { type: "string" },
+        copy: { $ref: "https://example.test/tool.json#/properties/in" },
+      },
+    };
+    const aliases = resolveToolParameterAliases(draft07RootSchema);
+    expect(aliases).toEqual(new Map([["in", "in_"]]));
+    expect(applyToolParameterAliases(draft07RootSchema, aliases).properties.copy.$ref).toBe(
+      "https://example.test/tool.json#/properties/in_",
+    );
+
+    for (const badRootId of ["#plain-anchor", "urn:tool#fragment", 123]) {
+      const notified: string[] = [];
+      expect(
+        resolveToolParameterAliases(
+          { $id: badRootId, type: "object", properties: { in: { type: "string" } } },
+          (reason) => notified.push(reason),
+        ).size,
+      ).toBe(0);
+      expect(notified).toHaveLength(1);
+    }
+  });
+
+  it("rejects non-object roots, malformed top-level keyword value shapes, and non-RFC-6901 array indices", () => {
+    for (const nonObjectRoot of [null, undefined, [], true, "object", 42]) {
+      expect(resolveToolParameterAliases(nonObjectRoot).size).toBe(0);
+    }
+
+    const base = { type: "object", properties: { in: { type: "string" } } };
+    for (const malformedTopLevel of [
+      { type: "object", properties: [], required: ["in"] },
+      { type: "object", properties: "invalid", required: ["in"] },
+      { ...base, required: "in" },
+      { ...base, required: ["in", 123] },
+      { ...base, propertyOrdering: ["in", null] },
+      {
+        ...base,
+        allOf: { "0": { properties: { in: { type: "number" } } } },
+        $defs: { Ref: { $ref: "#/allOf/0/properties/in" } },
+      },
+      { ...base, anyOf: ["not-a-schema"] },
+      { ...base, $defs: [] },
+      { ...base, definitions: "not-a-map" },
+      {
+        ...base,
+        allOf: [{ properties: { x: { type: "string" } } }],
+        $defs: { LeadingZero: { $ref: "#/allOf/00/properties/x" } },
+      },
+      {
+        ...base,
+        allOf: [{ properties: { x: { type: "string" } } }],
+        $defs: { ArrayProp: { $ref: "#/allOf/length" } },
+      },
+    ]) {
+      const notified: string[] = [];
+      expect(
+        resolveToolParameterAliases(malformedTopLevel, (reason) => notified.push(reason)).size,
+      ).toBe(0);
+      expect(notified).toHaveLength(1);
+    }
+
+    // applyToolParameterAliases 直接收到畸形 properties 数组时也不能把它改写成空对象。
+    const arrayPropsSchema = { type: "object", properties: [] as unknown };
+    expect(
+      applyToolParameterAliases(arrayPropsSchema, new Map([["in", "in_"]])).properties,
+    ).toEqual([]);
+  });
+
+  it("supports boolean subschemas in top-level combinators while still blocking refs to them", () => {
+    const schema = {
+      type: "object",
+      properties: { in: { type: "string" } },
+      anyOf: [false, { type: "object", properties: { from: { type: "string" } } }],
+    };
+    const aliases = resolveToolParameterAliases(schema);
+    expect(aliases).toEqual(
+      new Map([
+        ["in", "in_"],
+        ["from", "from_"],
+      ]),
+    );
+    expect(applyToolParameterAliases(schema, aliases)).toEqual({
+      type: "object",
+      properties: { in_: { type: "string" } },
+      anyOf: [false, { type: "object", properties: { from_: { type: "string" } } }],
+    });
+
+    expect(
+      resolveToolParameterAliases({
+        ...schema,
+        $defs: { ReenterBoolBranch: { $ref: "#/anyOf/0" } },
+      }).size,
+    ).toBe(0);
+  });
+
+  it("matches every Gemini Python-keyword alias key including collision suffixes", () => {
+    const allKeywords = [
+      "False",
+      "None",
+      "True",
+      "and",
+      "as",
+      "assert",
+      "async",
+      "await",
+      "break",
+      "class",
+      "continue",
+      "def",
+      "del",
+      "elif",
+      "else",
+      "except",
+      "finally",
+      "for",
+      "from",
+      "global",
+      "if",
+      "import",
+      "in",
+      "is",
+      "lambda",
+      "nonlocal",
+      "not",
+      "or",
+      "pass",
+      "raise",
+      "return",
+      "try",
+      "while",
+      "with",
+      "yield",
+    ];
+    for (const kw of allKeywords) {
+      expect(isGeminiToolParameterAliasKey(`${kw}_`)).toBe(true);
+      expect(isGeminiToolParameterAliasKey(`${kw}__`)).toBe(true);
+      expect(isGeminiToolParameterAliasKey(kw)).toBe(false);
+    }
+    for (const nonAlias of ["", "_", "__", "path_", "old_str_", "in_put", "from_date", "IN_"]) {
+      expect(isGeminiToolParameterAliasKey(nonAlias)).toBe(false);
+    }
+  });
+
+  it("registers block aliases even when arguments are not populated until repair runs", () => {
+    const block: { name?: unknown; arguments?: unknown } = {
+      name: "automations",
+      arguments: undefined,
+    };
+    const aliasesByTool = new Map([["automations", new Map([["in", "in_"]])]]);
+    decodeToolCallBlockByName(block, aliasesByTool);
+    expect(block.arguments).toBeUndefined();
+    expect(decodeToolCallArgumentsForBlock(block, { action: "add", in_: "5m" })).toEqual({
+      action: "add",
+      in: "5m",
+    });
   });
 });

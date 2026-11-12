@@ -70,6 +70,37 @@ function topLevelObjectLayers(schema: Record<string, unknown>): Record<string, u
   return layers;
 }
 
+// 顶层对象层上出现这些关键字时，顶层字段集合就不只是 properties/required/propertyOrdering 能看到的那些：
+// - 引用（$ref 等）：目标里的字段（目标里还可能再有组合关键字）也是顶层字段；
+// - patternProperties：按正则匹配的字段名，别名可能落进去；
+// - if/then/else、dependentSchemas、dependencies：条件成立时再引入或约束顶层字段；
+// - dependentRequired、propertyNames：按字段名写约束，改名后约束和参数对不上。
+// 避碰只能看见 properties 里的名字，`in` 可能被改成这些地方已有的 `in_`，两个参数压成一个（vendor PR #153 第九轮 review）。
+// 所以只要任一顶层层带这些关键字，整个工具不改名。
+const OPEN_TOP_LEVEL_KEYWORDS = [
+  ...REF_KEYWORDS,
+  "patternProperties",
+  "if",
+  "then",
+  "else",
+  "dependentSchemas",
+  "dependencies",
+  "dependentRequired",
+  "propertyNames",
+];
+
+/** 顶层字段集合无法完整确定时返回原因；能完整确定返回 undefined。 */
+function openTopLevelReason(layers: Record<string, unknown>[]): string | undefined {
+  for (const layer of layers) {
+    for (const key of OPEN_TOP_LEVEL_KEYWORDS) {
+      if (Object.hasOwn(layer, key)) {
+        return `top-level layer has ${key}; its full field set is unknown`;
+      }
+    }
+  }
+  return undefined;
+}
+
 /**
  * 解析一个 schema 引用（RFC 3986 片段 + RFC 6901）。只认本文档内的引用：`#...`、空引用、按根 `$id` 写的引用。
  * 规则：先对片段做百分号解码，再按 `/` 拆段、`~1`→`/`、`~0`→`~` 反转义。
@@ -219,6 +250,11 @@ export function resolveToolParameterAliases(
   if (aliases.size === 0) {
     return aliases;
   }
+  const openReason = openTopLevelReason(layers);
+  if (openReason !== undefined) {
+    onSkip?.(openReason);
+    return new Map();
+  }
   // 逐个检查 schema 里的引用（含 $recursiveRef / $dynamicRef），有一个不安全就整体放弃改名。
   const rootId = rootIdOf(schema);
   let unsafe: string | undefined;
@@ -238,8 +274,8 @@ export function resolveToolParameterAliases(
   return aliases;
 }
 
-// 范围：只改 properties / required / propertyOrdering 和组合分支。if/then/else、not、dependentRequired 里
-// 提到的顶层字段名不跟着改（Gemini 函数声明基本不支持这些关键字）。
+// 范围：只改 properties / required / propertyOrdering 和组合分支。顶层带 if/then/else、dependentRequired
+// 等按字段名写约束的关键字时，resolveToolParameterAliases 已整体放弃改名，走不到这里。
 function renameLayer(
   layer: Record<string, unknown>,
   aliases: ToolParameterAliases,

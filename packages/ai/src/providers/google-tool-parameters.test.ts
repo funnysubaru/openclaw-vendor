@@ -46,15 +46,22 @@ describe("schema traversal edge cases", () => {
   it("treats draft-07 dependencies as a name map and example as literal data", () => {
     const schema = {
       type: "object",
-      properties: { in: { type: "string" } },
-      dependencies: { default: { properties: { x: { $ref: "#/properties/in" } } } },
+      properties: {
+        in: { type: "string" },
+        // 顶层带 dependencies 会整体不改名（第九轮），这里放在参数内部，只测遍历时把它当名字表。
+        other: {
+          type: "object",
+          dependencies: { default: { properties: { x: { $ref: "#/properties/in" } } } },
+        },
+      },
       example: { $ref: "#" },
     };
     const aliases = resolveToolParameterAliases(schema);
     expect(aliases).toEqual(new Map([["in", "in_"]]));
-    expect(applyToolParameterAliases(schema, aliases).dependencies.default.properties.x.$ref).toBe(
-      "#/properties/in_",
-    );
+    expect(
+      applyToolParameterAliases(schema, aliases).properties.other.dependencies.default.properties.x
+        .$ref,
+    ).toBe("#/properties/in_");
   });
 
   it.each(["$recursiveRef", "$dynamicRef"])("skips aliasing when %s re-enters the root", (key) => {
@@ -289,5 +296,84 @@ describe("ref forms: same target after renaming, or no renaming at all", () => {
       resolveToolParameterAliases(makeSchema(ref), (reason) => notified.push(reason)).size,
     ).toBe(0);
     expect(notified).toHaveLength(1);
+  });
+});
+
+// vendor PR #153 第九轮 review：顶层对象层（根，或 allOf/anyOf/oneOf 分支）的字段集合必须能完整确定，
+// 否则避碰算不全，`in` 可能被改成引用目标/条件分支里已有的 `in_`，两个参数压成一个。
+// 凡是可能额外引入或约束顶层字段名的关键字，一律整个工具不改名。
+describe("top-level layers whose field set is not fully known", () => {
+  it("does not rename when a top-level allOf branch is a $ref (review repro)", () => {
+    const schema = {
+      type: "object",
+      properties: { in: { type: "string" } },
+      allOf: [{ $ref: "#/$defs/Extra" }],
+      $defs: {
+        Extra: { type: "object", properties: { in_: { type: "number" } }, required: ["in_"] },
+      },
+    };
+    const notified: string[] = [];
+    const aliases = resolveToolParameterAliases(schema, (reason) => notified.push(reason));
+    expect(aliases.size).toBe(0);
+    expect(notified).toHaveLength(1);
+    // 不改名时编码/解码都是原样，`in` 和 `in_` 两个参数都保留。
+    expect(mapToolArgumentsWithAliases(aliases, { in: "5m", in_: 7 }, "encode")).toEqual({
+      in: "5m",
+      in_: 7,
+    });
+  });
+
+  const base = { type: "object", properties: { in: { type: "string" } } };
+  it.each([
+    ["root $ref", { ...base, $ref: "#/$defs/X", $defs: { X: { type: "object" } } }],
+    ["root $recursiveRef", { ...base, $recursiveRef: "#" }],
+    ["root $dynamicRef", { ...base, $dynamicRef: "#meta" }],
+    [
+      "$ref in a nested combinator branch",
+      {
+        ...base,
+        anyOf: [{ oneOf: [{ $ref: "#/$defs/X" }] }],
+        $defs: { X: { type: "object", properties: { in_: { type: "number" } } } },
+      },
+    ],
+    ["root patternProperties", { ...base, patternProperties: { "^in_$": { type: "number" } } }],
+    [
+      "patternProperties in a branch",
+      { ...base, allOf: [{ patternProperties: { "^i": { type: "number" } } }] },
+    ],
+    // JSON Schema 的 then 关键字：用 JSON 字面量构造，避免对象字面量写 then 键（lint no-thenable）。
+    [
+      "root if/then/else",
+      {
+        ...base,
+        ...JSON.parse('{"if":{"required":["in"]},"then":{"properties":{"in_":{}}},"else":{}}'),
+      },
+    ],
+    ["then only", { ...base, ...JSON.parse('{"then":{"properties":{"in_":{}}}}') }],
+    ["dependentSchemas", { ...base, dependentSchemas: { in: { properties: { in_: {} } } } }],
+    ["draft-07 dependencies", { ...base, dependencies: { in: ["other"] } }],
+    ["dependentRequired", { ...base, dependentRequired: { in: ["other"] } }],
+    ["propertyNames", { ...base, propertyNames: { pattern: "^[a-z]+$" } }],
+  ])("does not rename when the top level has %s", (_label, schema) => {
+    const notified: string[] = [];
+    expect(resolveToolParameterAliases(schema, (reason) => notified.push(reason)).size).toBe(0);
+    expect(notified).toHaveLength(1);
+  });
+
+  it("still renames when those keywords only appear inside a parameter", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        in: {
+          type: "object",
+          $ref: "#/$defs/X",
+          patternProperties: { "^a": {} },
+          ...JSON.parse('{"if":{},"then":{}}'),
+          dependentSchemas: {},
+        },
+      },
+      $defs: { X: { type: "object" } },
+    };
+    expect(resolveToolParameterAliases(schema)).toEqual(new Map([["in", "in_"]]));
   });
 });

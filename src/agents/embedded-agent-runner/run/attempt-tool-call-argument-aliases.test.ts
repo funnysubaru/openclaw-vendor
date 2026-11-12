@@ -131,5 +131,6 @@ describe("Gemini keyword aliases after runner tool-call normalization", () => {
       "data: [DONE]\n\n",
     ]);
     expect(result.final).toEqual(expected);
+    expect(result.ends).toEqual(expected);
   });
 });

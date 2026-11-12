@@ -475,3 +475,81 @@ describe("top-level keyword allowlist", () => {
     expect(notified).toEqual([]);
   });
 });
+
+// vendor PR #153 第十一轮 review：嵌套子 schema 带自己的 `$id` 就成了独立子文档，里面的 `#/...`
+// 相对它解析；引用改写只认最外层根这一种基准，所以这类工具整体不改名。锚点类键同理。
+describe("nested schema resources", () => {
+  const skipReason = (schema: unknown) => {
+    const notified: string[] = [];
+    const aliases = resolveToolParameterAliases(schema, (reason) => notified.push(reason));
+    return { size: aliases.size, notified };
+  };
+
+  it("does not rename when a nested property schema has its own $id (review repro)", () => {
+    // 嵌套 copy 的 `#/properties/in` 指向嵌套文档里的 in；按最外层根改写会把它改成悬空的 in_。
+    const schema = {
+      type: "object",
+      properties: {
+        in: { type: "string" },
+        nested: {
+          $id: "urn:example:nested",
+          type: "object",
+          properties: { in: { type: "number" }, copy: { $ref: "#/properties/in" } },
+        },
+      },
+    };
+    expect(skipReason(schema)).toEqual({
+      size: 0,
+      notified: [
+        "schema node #/properties/nested has $id; refs inside it may not resolve against the root",
+      ],
+    });
+    // 不改名时出站 schema 原样不动，嵌套引用仍指向嵌套文档里的 in。
+    expect(applyToolParameterAliases(schema, new Map())).toBe(schema);
+  });
+
+  const base = { type: "object", properties: { in: { type: "string" } } };
+  it.each([
+    ["$defs entry with $id", { ...base, $defs: { Embedded: { $id: "urn:e", type: "object" } } }],
+    ["allOf branch with $id", { ...base, allOf: [{ $id: "urn:b", type: "object" }] }],
+    [
+      "draft-04 string id in a property",
+      { ...base, properties: { ...base.properties, x: { id: "urn:x" } } },
+    ],
+    ["$anchor in a property", { ...base, properties: { ...base.properties, x: { $anchor: "a" } } }],
+    ["$dynamicAnchor in $defs", { ...base, $defs: { D: { $dynamicAnchor: "meta" } } }],
+    [
+      "$recursiveAnchor in a property",
+      { ...base, properties: { ...base.properties, x: { $recursiveAnchor: true } } },
+    ],
+    [
+      "$schema in an allOf branch",
+      { ...base, allOf: [{ $schema: "https://json-schema.org/draft/2020-12/schema" }] },
+    ],
+  ])("does not rename with %s", (_label, schema) => {
+    const { size, notified } = skipReason(schema);
+    expect(size).toBe(0);
+    expect(notified).toHaveLength(1);
+  });
+
+  it("still renames when a parameter is merely named $id or id", () => {
+    const schema = {
+      $id: "urn:root",
+      type: "object",
+      properties: {
+        in: { type: "string" },
+        $id: { type: "string" },
+        id: { type: "string" },
+        $anchor: { type: "string" },
+      },
+      required: ["in", "$id"],
+      $defs: { Literal: { type: "object", default: { $id: "urn:not-a-resource" } } },
+    };
+    expect(resolveToolParameterAliases(schema)).toEqual(new Map([["in", "in_"]]));
+  });
+
+  it("ignores a non-string id (not a draft-04 resource id)", () => {
+    const schema = { ...base, properties: { ...base.properties, x: { type: "object", id: 3 } } };
+    expect(resolveToolParameterAliases(schema)).toEqual(new Map([["in", "in_"]]));
+  });
+});

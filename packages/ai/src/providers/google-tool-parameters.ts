@@ -103,13 +103,79 @@ const SAFE_TOP_LEVEL_KEYS = new Set([
   "definitions",
 ]);
 
+// 只允许出现在最外层根上的键：组合分支带 `$id` 就成了独立子文档，里面的 `#/...` 不再相对最外层根解析
+// （vendor PR #153 第十一轮 review）。`$schema` 同理只在根上有意义。
+const ROOT_ONLY_KEYS = new Set(["$id", "$schema"]);
+
 /** 顶层任一层出现白名单以外的键时返回原因（带键名，进 debug 日志）；都在白名单里返回 undefined。 */
 function unsafeTopLevelReason(layers: Record<string, unknown>[]): string | undefined {
-  for (const layer of layers) {
+  for (const [index, layer] of layers.entries()) {
     for (const key of Object.keys(layer)) {
-      if (!SAFE_TOP_LEVEL_KEYS.has(key)) {
+      if (!SAFE_TOP_LEVEL_KEYS.has(key) || (index > 0 && ROOT_ONLY_KEYS.has(key))) {
         return `top-level layer has non-allowlisted keyword ${JSON.stringify(key)}`;
       }
+    }
+  }
+  return undefined;
+}
+
+// 会改变引用解析基准、或给引用提供另一个落点的键。引用解析（parseLocalRef）只认「相对最外层根」这一种基准：
+// - `$id`（及 draft-04 的字符串 `id`）：所在节点成为独立子文档，节点内的 `#/...` 相对它解析，
+//   按最外层根去改写会改错或误判；
+// - `$anchor` / `$dynamicAnchor` / `$recursiveAnchor`：给 `#name`、`$dynamicRef`、`$recursiveRef` 提供落点，
+//   这些落点不在按指针的解析范围内。
+// 根上的 `$id` 就是解析基准本身，允许；其余节点上出现这些键，整个工具不改名。
+const RESOURCE_KEYS = ["$id", "id", "$anchor", "$dynamicAnchor", "$recursiveAnchor"] as const;
+
+/**
+ * 遍历整棵 schema，找出非根 schema 节点上的 RESOURCE_KEYS。遍历规则与 mapSchemaRefs 一致：
+ * 名字表（properties、$defs 等）本身不是 schema 节点，里面的键是字段名，名叫 `$id` 的参数不算；
+ * const/default/enum/examples 是字面数据，跳过。draft-04 的 `id` 只认字符串值，避免误伤别的写法。
+ */
+function nestedResourceReason(
+  node: unknown,
+  path = "#",
+  isNameMap = false,
+  isRoot = true,
+): string | undefined {
+  if (Array.isArray(node)) {
+    for (const [index, item] of node.entries()) {
+      const reason = nestedResourceReason(item, `${path}/${index}`);
+      if (reason !== undefined) {
+        return reason;
+      }
+    }
+    return undefined;
+  }
+  if (!node || typeof node !== "object") {
+    return undefined;
+  }
+  if (!isNameMap) {
+    for (const key of RESOURCE_KEYS) {
+      if (!Object.hasOwn(node, key)) {
+        continue;
+      }
+      if (key === "id" && typeof (node as Record<string, unknown>).id !== "string") {
+        continue;
+      }
+      if (isRoot && key === "$id") {
+        continue;
+      }
+      return `schema node ${path} has ${key}; refs inside it may not resolve against the root`;
+    }
+  }
+  for (const [key, value] of Object.entries(node)) {
+    if (!isNameMap && (DATA_KEYWORDS.has(key) || REF_KEYWORDS.has(key))) {
+      continue;
+    }
+    const reason = nestedResourceReason(
+      value,
+      `${path}/${key}`,
+      !isNameMap && NAME_MAP_KEYWORDS.has(key),
+      false,
+    );
+    if (reason !== undefined) {
+      return reason;
     }
   }
   return undefined;
@@ -264,7 +330,7 @@ export function resolveToolParameterAliases(
   if (aliases.size === 0) {
     return aliases;
   }
-  const openReason = unsafeTopLevelReason(layers);
+  const openReason = unsafeTopLevelReason(layers) ?? nestedResourceReason(schema);
   if (openReason !== undefined) {
     onSkip?.(openReason);
     return new Map();

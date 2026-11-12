@@ -17,7 +17,10 @@ import {
 import { buildGuardedModelFetch } from "./host-policy.js";
 import { hasOpenAICompatibleConversationTurn } from "./openai-compatible-conversation-turn.js";
 import { isAzureOpenAICompatibleHost } from "./openai-completions-host.js";
-import { buildOpenAICompletionsParams } from "./openai-completions-params.js";
+import {
+  buildOpenAICompletionsParams,
+  getCompletionsToolArgumentAliases,
+} from "./openai-completions-params.js";
 import {
   processCompletionsStream,
   shouldEmitOpenAICompletionsReasoning,
@@ -261,6 +264,8 @@ export function createOpenAICompletionsTransportStreamFn(): StreamFn {
           context,
           options as OpenAICompletionsOptions | undefined,
         );
+        // onPayload 可能换掉请求体对象，先取出本次出站算好的参数别名（ADR-0033 任务 150）。
+        const toolArgumentAliases = getCompletionsToolArgumentAliases(params);
         const nextParams = await options?.onPayload?.(params, model);
         if (nextParams !== undefined) {
           params = nextParams as typeof params;
@@ -310,6 +315,7 @@ export function createOpenAICompletionsTransportStreamFn(): StreamFn {
           abortFirstEventStream: firstEventAbort.abort,
           onFirstEventTimeout: getFirstStreamEventTimeoutHandler(options),
           sawStreamDONE: doneDetector.sawDone,
+          toolArgumentAliases,
         });
         finalizeTransportStream({ stream, output, signal: options?.signal });
       } catch (error) {

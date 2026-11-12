@@ -2,6 +2,12 @@ import type { CacheRetention, Context, Model } from "@openclaw/llm-core";
 import { convertMessages, hasToolCallHistory } from "../openai-completions-messages.js";
 import type { OpenAICompletionsOptions } from "../provider-options.js";
 import { resolveCacheRetention } from "../providers/cache-retention.js";
+import {
+  applyToolParameterAliases,
+  isGeminiToolParameterAliasModel,
+  resolveToolParameterAliases,
+  type ToolParameterAliases,
+} from "../providers/google-tool-parameters.js";
 import { resolveOpenAIPromptCacheParams } from "../providers/openai-prompt-cache.js";
 import {
   isOpenAIGpt54MiniModel,
@@ -259,6 +265,27 @@ function convertTools(
   mode: "direct" | "managed",
 ) {
   const projection = projectOpenAITools(tools);
+  // Gemini 遇到 Python 保留字参数名（如 automations 的 `in`、memory_get 的 `from`）会整轮生成不出
+  // 合法工具调用（Google 回 MALFORMED_FUNCTION_CALL，OpenRouter 统一成 finish_reason=error）。
+  // 别名在「最终出站 schema」（投影 + 规范化之后）上算，按工具名记下来，供历史编码与回包还原共用（ADR-0033 任务 150）。
+  const aliasGemini = isGeminiToolParameterAliasModel(model.id);
+  const argumentAliases = new Map<string, ToolParameterAliases>();
+  const aliasParameters = <T>(name: string, parameters: T): T => {
+    if (!aliasGemini) {
+      return parameters;
+    }
+    const aliases = resolveToolParameterAliases(parameters, (reason) => {
+      // 有引用无法确定地改写时整个工具保留原参数名：宁可偶发 MALFORMED，也不发引用悬空的 schema。
+      log.debug("skip Gemini keyword parameter aliases", { tool: name, model: model.id, reason });
+    });
+    if (aliases.size > 0) {
+      argumentAliases.set(name, aliases);
+    } else {
+      // 同名工具重复定义时若后一个不再需要别名，及时清掉前一个留下的条目，保持映射与最终定义一致。
+      argumentAliases.delete(name);
+    }
+    return applyToolParameterAliases(parameters, aliases);
+  };
   const strict =
     mode === "direct"
       ? compat.supportsStrictMode
@@ -277,6 +304,7 @@ function convertTools(
         );
   return {
     projection,
+    argumentAliases,
     tools: sortTransportToolsByName(projection.tools).map((tool) => {
       const functionTool: {
         name: string;
@@ -288,8 +316,13 @@ function convertTools(
         description: tool.description,
         parameters:
           mode === "direct"
-            ? tool.parameters
-            : normalizeOpenAIStrictToolParameters(tool.parameters, strict === true, model.compat),
+            ? // direct 不做规范化，发的就是原始 schema：根 $ref / 根 anyOf 不会被展开，
+              // 藏在 $defs 里的参数也就不会被改名（与实际出站一致，只是覆盖面比 managed 窄）。
+              aliasParameters(tool.name, tool.parameters)
+            : aliasParameters(
+                tool.name,
+                normalizeOpenAIStrictToolParameters(tool.parameters, strict === true, model.compat),
+              ),
       };
       if (strict !== undefined) {
         functionTool.strict = strict;
@@ -300,6 +333,27 @@ function convertTools(
       };
     }),
   };
+}
+
+// 每个请求体对应的「工具名 → 参数别名」。调用方在 onPayload 之前取出，流收尾时据此还原回包参数，
+// 保证出站改名、历史编码、回包还原用的是同一份映射（ADR-0033 任务 150）。
+// runner 的还原包装器在 onPayload 回调里经 @openclaw/ai/internal/openai 取这张表，与传输层走的是两条导入路径；
+// 挂在 globalThis 上，打包拆出两份模块副本时仍是同一张表。
+const COMPLETIONS_ALIAS_REGISTRY_KEY = Symbol.for("openclaw.completionsToolArgumentAliases");
+// SAFETY: 以全局唯一 Symbol.for 键在 globalThis 上挂载跨导入路径共享的请求体别名 WeakMap。
+const completionsAliasRegistryHost = globalThis as typeof globalThis & {
+  [COMPLETIONS_ALIAS_REGISTRY_KEY]?: WeakMap<object, ReadonlyMap<string, ToolParameterAliases>>;
+};
+const completionsToolArgumentAliases = (completionsAliasRegistryHost[
+  COMPLETIONS_ALIAS_REGISTRY_KEY
+] ??= new WeakMap());
+const EMPTY_TOOL_ARGUMENT_ALIASES: ReadonlyMap<string, ToolParameterAliases> = new Map();
+
+/** 取 buildOpenAICompletionsParams / buildOpenAICompletionsRequest 刚生成的请求体的参数别名。 */
+export function getCompletionsToolArgumentAliases(
+  params: object,
+): ReadonlyMap<string, ToolParameterAliases> | undefined {
+  return completionsToolArgumentAliases.get(params);
 }
 
 export function buildOpenAICompletionsParams(
@@ -347,10 +401,16 @@ export function buildOpenAICompletionsRequest(
   const markTools =
     endpointClass !== "modelstudio-native" &&
     !(endpointClass === "default" && ["modelstudio", "dashscope", "qwen"].includes(model.provider));
+  // 工具先于消息转换：Gemini 的参数别名要在最终出站工具 schema 上算出，历史 tool_call 重放复用同一份。
+  const convertedTools =
+    (policy.mode === "direct" || supportsModelTools(model)) && context.tools
+      ? convertTools(context.tools, compat, model, policy.mode)
+      : undefined;
   const cacheOptOutIndexes = new Set<number>();
   // The converter needs intact boundaries for Runtime relocation or cache markers.
   let messages: unknown[] = convertMessages(model as never, context, compat as never, {
     cacheOptOutIndexes,
+    toolArgumentAliases: convertedTools?.argumentAliases,
     preserveSystemPromptCacheBoundary:
       cacheControl !== undefined && !managedCompat?.requiresStringContent,
   });
@@ -370,6 +430,14 @@ export function buildOpenAICompletionsRequest(
     stream: true,
     ...resolveOpenAIPromptCacheParams(model, cacheRetention, compat),
   };
+  // 始终登记（无别名时登记空表），让 runner 的 onPayload 能区分「新一轮零别名请求体（应清空旧表）」
+  // 与「同一轮内层包装器浅拷贝出的未知对象（应保留当前表）」。
+  completionsToolArgumentAliases.set(
+    params,
+    convertedTools && convertedTools.argumentAliases.size > 0
+      ? convertedTools.argumentAliases
+      : EMPTY_TOOL_ARGUMENT_ALIASES,
+  );
   if (compat.supportsUsageInStreaming) {
     params.stream_options = { include_usage: true };
   }
@@ -416,8 +484,8 @@ export function buildOpenAICompletionsRequest(
   }
   let directToolProjection: ReturnType<typeof projectOpenAITools> | undefined;
   if (policy.mode === "direct" || supportsModelTools(model)) {
-    if (context.tools) {
-      const converted = convertTools(context.tools, compat, model, policy.mode);
+    if (convertedTools) {
+      const converted = convertedTools;
       if (policy.mode === "direct") {
         directToolProjection = converted.projection;
       }

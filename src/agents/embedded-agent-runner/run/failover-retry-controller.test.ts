@@ -91,6 +91,28 @@ describe("createEmbeddedRunFailoverRetryController", () => {
     }
   });
 
+  it.each([
+    "Provider finish_reason: error (native_finish_reason: MALFORMED_FUNCTION_CALL)",
+    "Provider finish_reason: MALFORMED_FUNCTION_CALL",
+  ])("skips same-model retry for deterministic MALFORMED_FUNCTION_CALL (%s)", async (message) => {
+    // ADR-0033 任务 150：同一请求必然再失败，不要同型号重试 8 次。
+    const controller = createController(vi.fn(async () => false));
+    await expect(
+      controller.maybeRetryTransient({
+        reason: "server_error",
+        message,
+      }),
+    ).resolves.toBe(false);
+    expect(controller.transientRetryCount).toBe(0);
+    expect(mocks.sleepWithAbort).not.toHaveBeenCalled();
+    await expect(
+      controller.maybeRetryTransient({
+        reason: "server_error",
+        message: "Provider finish_reason: error",
+      }),
+    ).resolves.toBe(true);
+  });
+
   it("counts earlier transient failures toward the ten-attempt rate-limit ceiling", async () => {
     const controller = createController(vi.fn(async () => false));
     for (let retry = 0; retry < 3; retry++) {

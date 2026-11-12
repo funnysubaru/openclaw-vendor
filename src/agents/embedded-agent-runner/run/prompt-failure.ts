@@ -19,6 +19,7 @@ import {
   isCliTerminalStopCode,
   resolveFailoverStatus,
 } from "../../failover-error.js";
+import { isDeterministicProviderFinishMessage } from "../../failover/message-patterns.js";
 import { classifyRateLimitWindow } from "../../failover/retry-evidence.js";
 import {
   resolveSessionSuspensionReason,
@@ -198,7 +199,8 @@ export async function handleEmbeddedPromptFailure(input: {
       harnessOwnsTransport: input.pluginHarnessOwnsTransport,
       promptTimeoutFallbackSafe,
       timedOutByRunBudget: input.timedOutByRunBudget,
-      profileRotated,
+      // 确定性的 MALFORMED_FUNCTION_CALL 跳过同型号切 key，与 assistant-failure 保持一致。
+      profileRotated: profileRotated || isDeterministicProviderFinishMessage(errorText),
     });
   let failoverDecision = resolveDecision(false);
   let rotated = false;

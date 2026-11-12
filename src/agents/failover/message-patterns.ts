@@ -364,8 +364,22 @@ const PROVIDER_COMPLETED_ERROR_FINISH_REASON_PATTERNS = [
   // only so `reason: network_error` stays in the timeout lane.
   /\breason:\s*error\b/i,
 ] as const satisfies readonly ErrorPattern[];
+/**
+ * 厂家明确告诉我们「这次生成出的工具调用本身不合法」：
+ * - OpenRouter 等聚合网关：`finish_reason: error (native_finish_reason: MALFORMED_FUNCTION_CALL)`
+ * - 直连 Google OpenAI 兼容端点或透传代理：`Provider finish_reason: MALFORMED_FUNCTION_CALL`
+ * 注意只匹配带下划线的 `finish_reason` / `native_finish_reason`，不匹配带空格的 `stop reason: MALFORMED_FUNCTION_CALL`
+ * （Google 原生 SDK 的 `Unhandled stop reason: MALFORMED_FUNCTION_CALL` 按上游既有契约保持不进入 failover）。
+ * 同一请求同一型号重发大概率再失败，跳过同型号重试与同型号切 key，归入 server_error 直接走换型号（ADR-0033 任务 150）。
+ */
+export function isDeterministicProviderFinishMessage(raw: string): boolean {
+  return /\b(?:native_)?finish_reason:\s*MALFORMED_FUNCTION_CALL\b/i.test(raw);
+}
 export function isProviderCompletedErrorFinishReasonMessage(raw: string): boolean {
-  return matchesErrorPatterns(raw, PROVIDER_COMPLETED_ERROR_FINISH_REASON_PATTERNS);
+  return (
+    matchesErrorPatterns(raw, PROVIDER_COMPLETED_ERROR_FINISH_REASON_PATTERNS) ||
+    isDeterministicProviderFinishMessage(raw)
+  );
 }
 export function isPeriodicUsageLimitErrorMessage(raw: string): boolean {
   return PERIODIC_USAGE_LIMIT_RE.test(raw);

@@ -4,6 +4,11 @@ import type { ChatCompletionChunk } from "openai/resources/chat/completions.js";
 import { measureUtf8AppendBytes } from "../transports/openai-transport-shared.js";
 import { finalizeTerminalToolCallArguments } from "../transports/transport-stream-shared.js";
 import type { ToolCall } from "../types.js";
+import {
+  mapToolArgumentsWithAliases,
+  rememberToolCallArgumentAliases,
+  type ToolParameterAliases,
+} from "./google-tool-parameters.js";
 
 type ChatCompletionToolCallDelta = ChatCompletionChunk.Choice.Delta.ToolCall;
 const MAX_BUFFERED_TOOL_CALL_ARGUMENT_BYTES = 256_000;
@@ -18,6 +23,11 @@ type NormalizedOpenAICompletionsDelta = {
 type OpenAICompletionsToolCallFinalizationOptions<TBlock extends object> = {
   allowSilentToolCallPromotion?: boolean;
   onConfirmedToolCall?: (block: TBlock, contentIndex: number) => void;
+  /**
+   * 工具名 → 参数别名。Gemini 出站时保留字参数被改成了 `in_` 之类的别名（openai-completions-params），
+   * 这里在工具调用确认后、交给执行前按同一份映射还原成原名（ADR-0033 任务 150）。
+   */
+  toolArgumentAliases?: ReadonlyMap<string, ToolParameterAliases>;
 };
 
 /** Keep encrypted provider reasoning attached to the first matching tool call. */
@@ -300,6 +310,16 @@ export function finalizeOpenAICompletionsToolCalls<TBlock extends object>(
     }
     delete (block as { partialArgs?: string }).partialArgs;
     delete (block as { streamIndex?: number }).streamIndex;
+    // 只在确认时还原：之前流式 toolcall_delta 里的 partialArgs 预览仍是别名（`in_`），
+    // 只用于界面预览，不交给工具执行。
+    if (isRecord(block) && typeof block.name === "string" && isRecord(block.arguments)) {
+      const aliases = options.toolArgumentAliases?.get(block.name);
+      if (aliases) {
+        const callRecord: Record<string, unknown> = block;
+        callRecord.arguments = mapToolArgumentsWithAliases(aliases, block.arguments, "decode");
+        rememberToolCallArgumentAliases(block, aliases);
+      }
+    }
     options.onConfirmedToolCall?.(block, contentIndex);
   }
 }

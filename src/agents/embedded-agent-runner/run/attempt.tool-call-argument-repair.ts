@@ -1,6 +1,10 @@
 /**
  * Repairs malformed tool-call arguments in embedded-agent stream results.
  */
+import {
+  decodeToolCallArgumentsForBlock,
+  isGeminiToolParameterAliasKey,
+} from "@openclaw/ai/internal/openai";
 import { extractBalancedJsonPrefix } from "@openclaw/normalization-core";
 import { safeParseJsonRecord } from "@openclaw/normalization-core/json-coercion";
 import { normalizeProviderId } from "../../model-selection.js";
@@ -271,6 +275,8 @@ function shouldCloseSmartQuotedValueAt(
   if (!TOOLCALL_REPAIR_FREEFORM_VALUE_KEYS.has(valueKey)) {
     return (
       TOOLCALL_REPAIR_KNOWN_ARG_KEYS.has(nextKey) ||
+      // Gemini 保留字参数别名（全量 35 个 Python 保留字 + 避碰下划线后缀）在还原前直接出现在原始文本里。
+      isGeminiToolParameterAliasKey(nextKey) ||
       isToolSpecificValueSuccessor({ toolName, valueKey, nextKey })
     );
   }
@@ -444,7 +450,13 @@ function parseSmartQuotedToolCallObject(
     if (!value) {
       return undefined;
     }
-    args[key.value] = value.value;
+    // 键来自模型回包：用自有数据属性写入，合法字段名 `__proto__` 不能触发继承 setter 而丢失（vendor PR #153 第六轮自检）。
+    Object.defineProperty(args, key.value, {
+      value: value.value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
 
     index = skipWhitespace(raw, value.endIndex);
     if (raw[index] === ",") {
@@ -594,7 +606,8 @@ function repairToolCallArgumentsInMessage(
   if (!isRunnerToolCallBlockType(typedBlock.type)) {
     return;
   }
-  typedBlock.arguments = repairedArgs;
+  // repairedArgs 解析自原始 delta 文本；传输层若给这个块改过参数名（Gemini 保留字别名），先还原再写回。
+  typedBlock.arguments = decodeToolCallArgumentsForBlock(block, repairedArgs);
 }
 
 function hasMeaningfulToolCallArgumentsInMessage(message: unknown, contentIndex: number): boolean {
@@ -744,7 +757,10 @@ function wrapStreamRepairMalformedToolCallArguments(
       const repairedArgs = repairedArgsByIndex.get(event.contentIndex);
       if (repairedArgs) {
         if (event.toolCall && typeof event.toolCall === "object") {
-          (event.toolCall as { arguments?: unknown }).arguments = repairedArgs;
+          (event.toolCall as { arguments?: unknown }).arguments = decodeToolCallArgumentsForBlock(
+            event.toolCall,
+            repairedArgs,
+          );
         }
         repairToolCallArgumentsInMessage(event.partial, event.contentIndex, repairedArgs);
         repairToolCallArgumentsInMessage(event.message, event.contentIndex, repairedArgs);

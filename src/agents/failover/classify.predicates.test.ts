@@ -9,7 +9,10 @@ import {
   isFailoverErrorMessage,
   isTimeoutErrorMessage,
 } from "./classify.js";
-import { isAuthPermanentErrorMessage } from "./message-patterns.js";
+import {
+  isAuthPermanentErrorMessage,
+  isDeterministicProviderFinishMessage,
+} from "./message-patterns.js";
 
 const PLAIN_INTERNAL_SERVER_ERROR_STATUS_SAMPLE = "Proxy notice: Status: Internal Server Error";
 const MIXED_INTERNAL_SERVER_ERROR_STATUS_SAMPLE = `${PLAIN_INTERNAL_SERVER_ERROR_STATUS_SAMPLE}; upstream connect error`;
@@ -364,6 +367,23 @@ describe("isFailoverErrorMessage", () => {
     ]);
   });
 
+  it("classifies finish_reason error with OpenRouter native_finish_reason (ADR-0033 task 150)", () => {
+    // 错误信息里会拼上 native_finish_reason。Google 的配额耗尽变成 rate_limit 是更准确的分类；
+    // 其余原因仍按 server_error，可以换型号。
+    const withNative = (native: string) =>
+      `Provider finish_reason: error (native_finish_reason: ${native})`;
+    expect(classifyFailoverReason(withNative("RESOURCE_EXHAUSTED"))).toBe("rate_limit");
+    // 厂家明说的原因比笼统的 server_error 更准：上下文超长走压缩、额度不足归计费、过载归过载（PR #153 合并前自检固定）。
+    expect(classifyFailoverReason(withNative("model_context_window_exceeded"))).toBe(
+      "context_overflow",
+    );
+    expect(classifyFailoverReason(withNative("insufficient_quota"))).toBe("billing");
+    expect(classifyFailoverReason(withNative("overloaded"))).toBe("overloaded");
+    for (const native of ["MALFORMED_FUNCTION_CALL", "DEADLINE_EXCEEDED", "SAFETY"]) {
+      expect(classifyFailoverReason(withNative(native))).toBe("server_error");
+    }
+  });
+
   it("classifies Provider finish_reason: error as server_error, not timeout (#109218)", () => {
     // OpenRouter/Google can complete quickly with finish_reason:error; that is a
     // provider-completed failure, not a hung request. Fallback must remain eligible.
@@ -383,8 +403,22 @@ describe("isFailoverErrorMessage", () => {
   it("does not classify MALFORMED_FUNCTION_CALL as timeout", () => {
     const sample = "Unhandled stop reason: MALFORMED_FUNCTION_CALL";
     expect(isTimeoutErrorMessage(sample)).toBe(false);
+    expect(isDeterministicProviderFinishMessage(sample)).toBe(false);
     expect(classifyFailoverReason(sample)).toBe(null);
     expect(isFailoverErrorMessage(sample)).toBe(false);
+  });
+
+  it("classifies direct OpenAI-compatible finish_reason: MALFORMED_FUNCTION_CALL as deterministic server_error", () => {
+    for (const sample of [
+      "Provider finish_reason: MALFORMED_FUNCTION_CALL",
+      "finish_reason: MALFORMED_FUNCTION_CALL",
+      "Provider finish_reason: error (native_finish_reason: MALFORMED_FUNCTION_CALL)",
+    ]) {
+      expect(isTimeoutErrorMessage(sample)).toBe(false);
+      expect(isDeterministicProviderFinishMessage(sample)).toBe(true);
+      expect(classifyFailoverReason(sample)).toBe("server_error");
+      expect(isFailoverErrorMessage(sample)).toBe(true);
+    }
   });
 
   it("matches google INTERNAL status errors as timeout", () => {

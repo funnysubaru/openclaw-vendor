@@ -12,6 +12,7 @@ import {
   resolveFailoverReasonFromError,
   resolveFailoverStatus,
 } from "../../failover-error.js";
+import { isDeterministicProviderFinishMessage } from "../../failover/message-patterns.js";
 import { hasLongWindowRateLimitEvidence } from "../../failover/retry-evidence.js";
 import { isConfigBackedInlineProviderApiKey, type ResolvedProviderAuth } from "../../model-auth.js";
 import { log } from "../logger.js";
@@ -226,6 +227,14 @@ export function createEmbeddedRunFailoverRetryController(input: {
         retry.reason !== "server_error" &&
         retry.reason !== "timeout"
       ) {
+        return false;
+      }
+      // 厂家已判定生成出的工具调用不合法（MALFORMED_FUNCTION_CALL）：原样重发大概率同样失败，
+      // 跳过同型号重试、直接交给 failover 换型号（ADR-0033 任务 150）。
+      if (retry.message && isDeterministicProviderFinishMessage(retry.message)) {
+        log.warn(
+          `skip transient same-model retry for ${sanitizeForLog(provider)}/${sanitizeForLog(modelId)}: deterministic provider finish (${sanitizeForLog(retry.message)})`,
+        );
         return false;
       }
       const rateLimit = retry.reason === "rate_limit";

@@ -8,7 +8,7 @@ import {
   createOpenAIEncryptedToolCallReasoningTracker,
   finalizeOpenAICompletionsToolCalls,
 } from "../providers/openai-completions-tool-calls.js";
-import { mapOpenAIStopReason } from "../providers/openai-stop-reason.js";
+import { createOpenAIChoiceStopReasonTracker } from "../providers/openai-stop-reason.js";
 import {
   clearPendingCommentaryText,
   rememberPendingCommentaryTags,
@@ -49,6 +49,8 @@ type OpenAICompatibleChoice = ChatCompletionChunk["choices"][number] & {
   usage?: ChatCompletionChunk["usage"];
   // Some compatible providers stream a complete message in place of delta.
   message?: ChatCompletionChunk["choices"][number]["delta"];
+  // OpenRouter 透传上游厂家的原始结束原因（如 Gemini 的 MALFORMED_FUNCTION_CALL）。
+  native_finish_reason?: unknown;
 };
 
 type OpenAICompatibleChatCompletionChunk = Omit<ChatCompletionChunk, "choices"> & {
@@ -63,6 +65,8 @@ type CompletionsStreamOptions = {
   abortFirstEventStream?: (reason: Error) => void;
   onFirstEventTimeout?: (reason: Error) => void;
   sawStreamDONE?: () => boolean;
+  // 工具名 → 参数别名（Gemini 保留字），出站时由 openai-completions-params 算出，收尾时按它还原（ADR-0033 任务 150）。
+  toolArgumentAliases?: ReadonlyMap<string, ReadonlyMap<string, string>>;
 } & (
   | {
       mode: "direct";
@@ -143,6 +147,7 @@ export async function processCompletionsStream(
   const toolCallBlockIndices = new WeakMap<ToolCallBlock, number>();
   let explicitVisibleTextBlocks: Set<TextBlock> | undefined;
   const normalizeToolCallDeltas = createOpenAICompletionsToolCallDeltaNormalizer();
+  const trackChoiceStopReason = createOpenAIChoiceStopReasonTracker(true);
   let finishReason: string | undefined;
   let sawNativeToolCallDelta = false;
   const blockIndex = () =>
@@ -502,16 +507,8 @@ export async function processCompletionsStream(
       });
       hasReasoningUsageActivity = hasOpenAICompletionsReasoningUsageActivity(choiceUsage);
     }
-    if (choice.finish_reason) {
-      const finishReasonResult = mapOpenAIStopReason(choice.finish_reason, {
-        allowSingularToolCall: true,
-      });
-      output.stopReason = finishReasonResult.stopReason;
-      finishReason = finishReasonResult.stopReason;
-      if (finishReasonResult.errorMessage) {
-        output.errorMessage = finishReasonResult.errorMessage;
-      }
-    }
+    // 跨多块保留 OpenRouter 的 native_finish_reason，避免末尾 usage 块重复 finish_reason 时冲掉真因。
+    finishReason = trackChoiceStopReason(choice, output) ?? finishReason;
     const rawChoiceDelta = choice.delta ?? choice.message;
     if (!rawChoiceDelta) {
       emitReasoningUsageActivity(hasReasoningUsageActivity);
@@ -673,6 +670,7 @@ export async function processCompletionsStream(
   finalizeOpenAICompletionsToolCalls(output, {
     allowSilentToolCallPromotion:
       finishReason === "stop" || (sawNativeToolCallDelta && (options?.sawStreamDONE?.() ?? false)),
+    toolArgumentAliases: options?.toolArgumentAliases,
     onConfirmedToolCall(block, contentIndex) {
       if (directMode || block.type !== "toolCall") {
         return;

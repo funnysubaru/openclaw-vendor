@@ -386,4 +386,32 @@ describe("assistant failure recovery", () => {
     expect(buildRealtimeVoiceAgentErrorProviderResult(failure)).toEqual({ error: failure.message });
     expect(signal.aborted).toBe(false);
   });
+
+  it.each([
+    ["Provider finish_reason: error (native_finish_reason: MALFORMED_FUNCTION_CALL)", true],
+    ["Provider finish_reason: MALFORMED_FUNCTION_CALL", true],
+    ["Provider finish_reason: MALFORMED_FUNCTION_CALL", false],
+  ])(
+    "skips same-model profile rotation and empty-error retries on %s (fallback=%s)",
+    async (errorMessage, fallbackConfigured) => {
+      const input = makeInput(errorMessage, {
+        fallbackConfigured,
+        profileId: "openrouter:p1",
+        provider: "openrouter",
+      });
+      if (!input.attemptAssistant) {
+        throw new Error("missing test assistant");
+      }
+      input.attemptAssistant.content = [];
+      input.failover.advanceAuthProfile = vi.fn(async () => true);
+
+      const failure = await expectFailure(input);
+      expect(failure).toMatchObject({
+        reason: "server_error",
+        rawError: errorMessage,
+      });
+      expect(input.failover.advanceAuthProfile).not.toHaveBeenCalled();
+      expect(input.traceAttempts[0]?.result).toBe(fallbackConfigured ? "fallback_model" : "error");
+    },
+  );
 });

@@ -21,6 +21,7 @@ import {
 } from "../../embedded-agent-helpers.js";
 import { buildAssistantFailoverSignal } from "../../embedded-agent-helpers/assistant-message-failures.js";
 import { FailoverError, resolveFailoverStatus } from "../../failover-error.js";
+import { isDeterministicProviderFinishMessage } from "../../failover/message-patterns.js";
 import type { PreparedProviderFailoverOwner } from "../../failover/provider-patterns.js";
 import { classifyRateLimitWindow } from "../../failover/retry-evidence.js";
 import {
@@ -266,7 +267,8 @@ export async function handleEmbeddedAssistantFailure(input: {
         failoverFailure,
         failoverReason: assistantFailoverReason,
         harnessOwnsTransport: input.pluginHarnessOwnsTransport,
-        profileRotated: false,
+        // 确定性的 MALFORMED_FUNCTION_CALL 与账号额度无关：多 key 场景下不要切 key 重打同一型号，直接换型号或报出。
+        profileRotated: isDeterministicProviderFinishMessage(failedAssistant?.errorMessage ?? ""),
       });
   const authMode = input.authProfileId
     ? input.authProfileStore.profiles?.[input.authProfileId]?.type

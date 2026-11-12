@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { mapOpenAIStopReason } from "./openai-stop-reason.js";
+import {
+  createOpenAIChoiceStopReasonTracker,
+  mapOpenAIChoiceStopReason,
+  mapOpenAIStopReason,
+} from "./openai-stop-reason.js";
 
 describe("mapOpenAIStopReason", () => {
   it.each([
@@ -32,5 +36,63 @@ describe("mapOpenAIStopReason", () => {
       stopReason: "error",
       errorMessage: "Provider finish_reason: unexpected",
     });
+  });
+});
+
+describe("mapOpenAIChoiceStopReason", () => {
+  it("appends a well-formed native_finish_reason to error results only", () => {
+    expect(
+      mapOpenAIChoiceStopReason({
+        finish_reason: "error",
+        native_finish_reason: "MALFORMED_FUNCTION_CALL",
+      }).errorMessage,
+    ).toBe("Provider finish_reason: error (native_finish_reason: MALFORMED_FUNCTION_CALL)");
+    expect(
+      mapOpenAIChoiceStopReason({ finish_reason: "stop", native_finish_reason: "STOP" }),
+    ).toEqual(mapOpenAIStopReason("stop"));
+  });
+
+  it("drops native_finish_reason values that are not plain enum-like tokens", () => {
+    for (const native of ["bad\nline", "x".repeat(65), "", 42]) {
+      expect(
+        mapOpenAIChoiceStopReason({ finish_reason: "error", native_finish_reason: native })
+          .errorMessage,
+      ).toBe("Provider finish_reason: error");
+    }
+  });
+});
+
+describe("createOpenAIChoiceStopReasonTracker", () => {
+  it("retains native_finish_reason when a trailing chunk repeats the same finish_reason", () => {
+    const track = createOpenAIChoiceStopReasonTracker(true);
+    const output: {
+      stopReason: "stop" | "length" | "toolUse" | "error" | "aborted";
+      errorMessage?: string;
+    } = {
+      stopReason: "stop",
+    };
+    expect(
+      track({ finish_reason: "error", native_finish_reason: "MALFORMED_FUNCTION_CALL" }, output),
+    ).toBe("error");
+    expect(track({ finish_reason: "error" }, output)).toBe("error");
+    expect(output.errorMessage).toBe(
+      "Provider finish_reason: error (native_finish_reason: MALFORMED_FUNCTION_CALL)",
+    );
+  });
+
+  it("clears stale native_finish_reason and deletes errorMessage when a later chunk changes finish_reason", () => {
+    const track = createOpenAIChoiceStopReasonTracker(true);
+    const output: {
+      stopReason: "stop" | "length" | "toolUse" | "error" | "aborted";
+      errorMessage?: string;
+    } = {
+      stopReason: "stop",
+    };
+    track({ finish_reason: "error", native_finish_reason: "MALFORMED_FUNCTION_CALL" }, output);
+    track({ finish_reason: "content_filter" }, output);
+    expect(output.errorMessage).toBe("Provider finish_reason: content_filter");
+    track({ finish_reason: "stop" }, output);
+    expect(output.stopReason).toBe("stop");
+    expect(Object.hasOwn(output, "errorMessage")).toBe(false);
   });
 });

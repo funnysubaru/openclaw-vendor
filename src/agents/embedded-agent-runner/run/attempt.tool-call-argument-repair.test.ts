@@ -368,6 +368,19 @@ const re = /\d+/;
     });
   });
 
+  // vendor PR #153 第六轮自检：智能引号修复出来的参数里，合法字段 `__proto__` 不能因普通赋值触发 setter 而丢失。
+  it("keeps an own __proto__ key in smart-quoted repaired args", async () => {
+    const result = await runToolCallRepairCase({
+      toolName: "edit",
+      delta: String.raw` {“__proto__”:“x”,“path”:“notes/a.md”}`,
+    });
+
+    const args = result.finalArgs as Record<string, unknown>;
+    expect(args.path).toBe("notes/a.md");
+    expect(Object.getOwnPropertyDescriptor(args, "__proto__")?.value).toBe("x");
+    expect(Object.getPrototypeOf(args)).toBe(Object.prototype);
+  });
+
   it("preserves smart quotes inside ASCII-delimited JSON content with trailing junk", async () => {
     const result = await runToolCallRepairCase({
       toolName: "read",
@@ -405,6 +418,20 @@ const re = /\d+/;
     });
 
     expectAllToolCallArgs(result, { path: "safe.txt", offset: 5, limit: 20 });
+  });
+
+  it("repairs smart-quoted non-freeform args before any Gemini Python-keyword alias or collision suffix", async () => {
+    const result = await runToolCallRepairCase({
+      toolName: "automations",
+      delta: "{“path”:“notes/a.md”,“with_”:“summary”,“class_”:“daily”,“in__”:“5m”}",
+    });
+
+    expectAllToolCallArgs(result, {
+      path: "notes/a.md",
+      with_: "summary",
+      class_: "daily",
+      in__: "5m",
+    });
   });
 
   it("repairs prefixless smart-quoted read args before schema-specific option keys", async () => {

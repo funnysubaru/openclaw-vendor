@@ -52,9 +52,10 @@ describe("schema traversal edge cases", () => {
         other: {
           type: "object",
           dependencies: { default: { properties: { x: { $ref: "#/properties/in" } } } },
+          // 顶层 example 不在白名单（第十轮），放进参数内部，只测它按字面数据跳过。
+          example: { $ref: "#" },
         },
       },
-      example: { $ref: "#" },
     };
     const aliases = resolveToolParameterAliases(schema);
     expect(aliases).toEqual(new Map([["in", "in_"]]));
@@ -375,5 +376,102 @@ describe("top-level layers whose field set is not fully known", () => {
       $defs: { X: { type: "object" } },
     };
     expect(resolveToolParameterAliases(schema)).toEqual(new Map([["in", "in_"]]));
+  });
+});
+
+// vendor PR #153 第十轮 review：顶层判断从黑名单改为白名单（SAFE_TOP_LEVEL_KEYS）。
+// 白名单以外的任何键都让整个工具不改名，日志原因里带上这个键名。
+describe("top-level keyword allowlist", () => {
+  const base = { type: "object", properties: { in: { type: "string" } }, required: ["in"] };
+  it.each([
+    ["not (contradiction after renaming)", "not", { ...base, not: { required: ["in_"] } }],
+    ["not (mutual exclusion)", "not", { ...base, not: { required: ["in", "at"] } }],
+    ["object const", "const", { ...base, const: { mode: "delay", in: "5m" } }],
+    ["object enum", "enum", { ...base, enum: [{ in: "5m" }] }],
+    [
+      "OpenAPI discriminator on a oneOf",
+      "discriminator",
+      {
+        type: "object",
+        oneOf: [{ properties: { in: { const: "a" } } }, { properties: { in: { const: "b" } } }],
+        discriminator: { propertyName: "in" },
+      },
+    ],
+    ["object default", "default", { ...base, default: { in: "5m" } }],
+    ["object examples", "examples", { ...base, examples: [{ in: "5m" }] }],
+    ["an unknown keyword", "x-future-keyword", { ...base, "x-future-keyword": true }],
+    [
+      "a non-allowlisted keyword in a branch",
+      "not",
+      { ...base, allOf: [{ not: { required: ["in_"] } }] },
+    ],
+  ])("does not rename when the top level has %s", (_label, key, schema) => {
+    const notified: string[] = [];
+    expect(resolveToolParameterAliases(schema, (reason) => notified.push(reason)).size).toBe(0);
+    expect(notified).toEqual([
+      `top-level layer has non-allowlisted keyword ${JSON.stringify(key)}`,
+    ]);
+  });
+
+  it("renames with every allowlisted keyword present", () => {
+    const schema = {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      $id: "urn:tool",
+      $comment: "c",
+      title: "t",
+      description: "d",
+      type: "object",
+      properties: { in: { type: "string" } },
+      required: ["in"],
+      propertyOrdering: ["in"],
+      additionalProperties: false,
+      unevaluatedProperties: false,
+      minProperties: 1,
+      maxProperties: 3,
+      deprecated: false,
+      readOnly: false,
+      writeOnly: false,
+      $defs: {},
+      definitions: {},
+      allOf: [{ type: "object", properties: { at: { type: "string" } } }],
+    };
+    expect(resolveToolParameterAliases(schema)).toEqual(new Map([["in", "in_"]]));
+  });
+
+  // 真实引擎请求（req1.json）里这两个工具正是要修的对象；顶层只有 type / properties / required，
+  // 白名单不能把它们挡掉。这里按抓到的请求体保留顶层形状，参数内容截短。
+  it.each([
+    [
+      "automations",
+      {
+        type: "object",
+        properties: {
+          action: { type: "string" },
+          in: { type: "string", description: 'Relative duration for action="next_check"' },
+          job: { type: "object", properties: { name: { type: "string" } } },
+        },
+        required: ["action"],
+      },
+      new Map([["in", "in_"]]),
+    ],
+    [
+      "memory_get",
+      {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          from: { type: "number" },
+          lines: { type: "number" },
+        },
+        required: ["path"],
+      },
+      new Map([["from", "from_"]]),
+    ],
+  ])("still renames the real %s schema", (_name, schema, expected) => {
+    const notified: string[] = [];
+    expect(resolveToolParameterAliases(schema, (reason) => notified.push(reason))).toEqual(
+      expected,
+    );
+    expect(notified).toEqual([]);
   });
 });

@@ -70,31 +70,45 @@ function topLevelObjectLayers(schema: Record<string, unknown>): Record<string, u
   return layers;
 }
 
-// 顶层对象层上出现这些关键字时，顶层字段集合就不只是 properties/required/propertyOrdering 能看到的那些：
-// - 引用（$ref 等）：目标里的字段（目标里还可能再有组合关键字）也是顶层字段；
-// - patternProperties：按正则匹配的字段名，别名可能落进去；
-// - if/then/else、dependentSchemas、dependencies：条件成立时再引入或约束顶层字段；
-// - dependentRequired、propertyNames：按字段名写约束，改名后约束和参数对不上。
-// 避碰只能看见 properties 里的名字，`in` 可能被改成这些地方已有的 `in_`，两个参数压成一个（vendor PR #153 第九轮 review）。
-// 所以只要任一顶层层带这些关键字，整个工具不改名。
-const OPEN_TOP_LEVEL_KEYWORDS = [
-  ...REF_KEYWORDS,
-  "patternProperties",
-  "if",
-  "then",
-  "else",
-  "dependentSchemas",
-  "dependencies",
-  "dependentRequired",
-  "propertyNames",
-];
+// 顶层对象层（根 + allOf/anyOf/oneOf 分支）只允许出现这些自有键。改名只改 properties / required /
+// propertyOrdering 和组合分支；其余关键字只要可能按字段名约束顶层（$ref 目标、patternProperties、
+// if/then/else、not、对象字面量的 const/enum/default/examples、OpenAPI discriminator……），改名后就会
+// 和参数对不上：要么撞名把两个参数压成一个，要么约束静默失效或恒为假（vendor PR #153 第九、十轮 review）。
+// 用白名单而不是黑名单：以后遇到没列出的关键字，默认整个工具不改名，不靠逐个补漏。
+// - 只描述层本身、不涉及字段名的：type、description、title、$schema、$id、$comment、deprecated、
+//   readOnly、writeOnly、minProperties、maxProperties；
+// - additionalProperties / unevaluatedProperties：只约束「没列出的字段」，改名后别名已在 properties 里；
+// - $defs / definitions：只存放定义；参数内部指向它们的引用由 planRefAfterRenaming 单独检查，
+//   顶层自身带 $ref 不在白名单里，会直接不改名；
+// - default、examples 不在白名单：值是对象时里面的键就是字段名，改名不会同步改它们。
+const SAFE_TOP_LEVEL_KEYS = new Set([
+  "type",
+  "properties",
+  "required",
+  "propertyOrdering",
+  "additionalProperties",
+  "unevaluatedProperties",
+  ...COMBINATOR_KEYS,
+  "description",
+  "title",
+  "$schema",
+  "$id",
+  "$comment",
+  "deprecated",
+  "readOnly",
+  "writeOnly",
+  "minProperties",
+  "maxProperties",
+  "$defs",
+  "definitions",
+]);
 
-/** 顶层字段集合无法完整确定时返回原因；能完整确定返回 undefined。 */
-function openTopLevelReason(layers: Record<string, unknown>[]): string | undefined {
+/** 顶层任一层出现白名单以外的键时返回原因（带键名，进 debug 日志）；都在白名单里返回 undefined。 */
+function unsafeTopLevelReason(layers: Record<string, unknown>[]): string | undefined {
   for (const layer of layers) {
-    for (const key of OPEN_TOP_LEVEL_KEYWORDS) {
-      if (Object.hasOwn(layer, key)) {
-        return `top-level layer has ${key}; its full field set is unknown`;
+    for (const key of Object.keys(layer)) {
+      if (!SAFE_TOP_LEVEL_KEYS.has(key)) {
+        return `top-level layer has non-allowlisted keyword ${JSON.stringify(key)}`;
       }
     }
   }
@@ -250,7 +264,7 @@ export function resolveToolParameterAliases(
   if (aliases.size === 0) {
     return aliases;
   }
-  const openReason = openTopLevelReason(layers);
+  const openReason = unsafeTopLevelReason(layers);
   if (openReason !== undefined) {
     onSkip?.(openReason);
     return new Map();
@@ -274,8 +288,8 @@ export function resolveToolParameterAliases(
   return aliases;
 }
 
-// 范围：只改 properties / required / propertyOrdering 和组合分支。顶层带 if/then/else、dependentRequired
-// 等按字段名写约束的关键字时，resolveToolParameterAliases 已整体放弃改名，走不到这里。
+// 范围：只改 properties / required / propertyOrdering 和组合分支。顶层出现白名单（SAFE_TOP_LEVEL_KEYS）
+// 以外的关键字时，resolveToolParameterAliases 已整体放弃改名，走不到这里。
 function renameLayer(
   layer: Record<string, unknown>,
   aliases: ToolParameterAliases,

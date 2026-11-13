@@ -113,6 +113,32 @@ describe("provider-hosted tool calls at message end", () => {
     });
   });
 
+  it("reports hosted calls carried by an error message with their params and sources", async () => {
+    const runAfterToolCall = recordingHook();
+    const ctx = withHookRunner(createMessageEndContext(), runAfterToolCall);
+
+    await endMessage(ctx, {
+      message: {
+        ...assistantMessage([searchCall()]),
+        stopReason: "error",
+        errorMessage: "server_error: boom",
+      },
+    });
+
+    expect(runAfterToolCall).toHaveBeenCalledTimes(1);
+    expect(runAfterToolCall.mock.calls[0]?.[0]).toMatchObject({
+      toolName: "web_search",
+      toolCallId: "ws_1",
+      params: { query: "nishikawaguchi yakiniku", queries: ["a", "b"] },
+      result: {
+        details: {
+          status: "completed",
+          sources: ["https://example.com/a", "https://example.com/b"],
+        },
+      },
+    });
+  });
+
   it("reports a call id only once across repeated message ends", async () => {
     const runAfterToolCall = recordingHook();
     const ctx = withHookRunner(createMessageEndContext(), runAfterToolCall);

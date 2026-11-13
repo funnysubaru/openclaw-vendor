@@ -108,6 +108,82 @@ describe("Responses provider-hosted tool calls", () => {
     expect(output.hostedToolCalls?.map((call) => call.id)).toEqual(["ws_1"]);
   });
 
+  it("keeps earlier sources and action facts when a sparse terminal copy arrives", async () => {
+    const output = await run([
+      { type: "response.output_item.done", output_index: 0, item: searchItem() },
+      completed([{ type: "web_search_call", id: "ws_1", status: "completed" }]),
+    ]);
+    expect(output.hostedToolCalls).toEqual([
+      {
+        type: "web_search",
+        id: "ws_1",
+        status: "completed",
+        action: {
+          type: "search",
+          query: "kawaguchi yakiniku",
+          queries: ["kawaguchi yakiniku", "nishikawaguchi bbq"],
+        },
+        sources: ["https://example.com/a", "https://example.com/b"],
+      },
+    ]);
+  });
+
+  it("lets a later copy update only the status and fields it carries", () => {
+    const output = createOutput();
+    recordResponsesHostedToolCall(output, searchItem({ status: "in_progress" }));
+    recordResponsesHostedToolCall(output, {
+      type: "web_search_call",
+      id: "ws_1",
+      status: "failed",
+      action: { query: "kawaguchi bbq" },
+    });
+    recordResponsesHostedToolCall(output, { type: "web_search_call", id: "ws_1" });
+    expect(output.hostedToolCalls).toEqual([
+      {
+        type: "web_search",
+        id: "ws_1",
+        status: "failed",
+        action: {
+          type: "search",
+          query: "kawaguchi bbq",
+          queries: ["kawaguchi yakiniku", "nishikawaguchi bbq"],
+        },
+        sources: ["https://example.com/a", "https://example.com/b"],
+      },
+    ]);
+  });
+
+  it("collects hosted calls from a failed terminal response before rethrowing", async () => {
+    const output = createOutput();
+    await expect(
+      processResponsesStream(
+        eventStream([
+          {
+            type: "response.failed",
+            sequence_number: 99,
+            response: {
+              id: "resp_failed",
+              status: "failed",
+              error: { code: "server_error", message: "boom" },
+              output: [searchItem({ id: "ws_failed" })],
+            },
+          },
+        ]),
+        output,
+        { push: () => {} },
+        model,
+      ),
+    ).rejects.toMatchObject({ name: "ResponsesStreamFailure" });
+    expect(output.hostedToolCalls).toEqual([
+      expect.objectContaining({
+        id: "ws_failed",
+        status: "completed",
+        action: expect.objectContaining({ query: "kawaguchi yakiniku" }),
+        sources: ["https://example.com/a", "https://example.com/b"],
+      }),
+    ]);
+  });
+
   it("records calls that only appear in terminal output", async () => {
     const output = await run([completed([searchItem({ id: "ws_2", status: "failed" })])]);
     expect(output.hostedToolCalls).toMatchObject([{ id: "ws_2", status: "failed" }]);

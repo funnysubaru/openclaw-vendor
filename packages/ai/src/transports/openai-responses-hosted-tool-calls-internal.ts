@@ -12,7 +12,9 @@ function readText(value: unknown): string | undefined {
  * Records a provider-hosted `web_search_call` output item on the assistant message.
  * Hosted calls run inside the provider, so no local tool execution or hook sees them; the
  * runtime reports the recorded facts to `after_tool_call` observers at message end.
- * Repeated items with the same id (streamed done item + terminal output) replace the earlier copy.
+ * Repeated items with the same id (streamed done item + terminal output) are merged: a later item
+ * only overrides the status and fields it actually carries, so sparse terminal copies keep the
+ * sources and action details recorded earlier.
  */
 export function recordResponsesHostedToolCall(output: AssistantMessage, item: unknown): void {
   if (!isRecord(item) || item.type !== "web_search_call") {
@@ -54,17 +56,21 @@ export function recordResponsesHostedToolCall(output: AssistantMessage, item: un
         return url ? [url] : [];
       })
     : [];
+  const status = readText(item.status);
+  const calls = (output.hostedToolCalls ??= []);
+  const existingIndex = calls.findIndex((entry) => entry.id === id);
+  const existing = existingIndex >= 0 ? calls[existingIndex] : undefined;
+  const mergedAction = { ...existing?.action, ...action };
+  const mergedSources = sources.length > 0 ? sources : existing?.sources;
   const call: HostedToolCall = {
     type: "web_search",
     id,
-    status: readText(item.status) ?? "unknown",
-    ...(Object.keys(action).length > 0 ? { action } : {}),
-    ...(sources.length > 0 ? { sources } : {}),
+    status: status ?? existing?.status ?? "unknown",
+    ...(Object.keys(mergedAction).length > 0 ? { action: mergedAction } : {}),
+    ...(mergedSources && mergedSources.length > 0 ? { sources: mergedSources } : {}),
   };
-  const calls = (output.hostedToolCalls ??= []);
-  const existing = calls.findIndex((entry) => entry.id === id);
-  if (existing >= 0) {
-    calls[existing] = call;
+  if (existingIndex >= 0) {
+    calls[existingIndex] = call;
   } else {
     calls.push(call);
   }

@@ -535,4 +535,117 @@ describe("OpenAI ChatGPT Responses inference streaming", () => {
       },
     ]);
   });
+  it("keeps hosted web_search sources when the terminal copy of the call is sparse", async () => {
+    const events = [
+      {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          type: "web_search_call",
+          id: "ws_sparse",
+          status: "completed",
+          action: {
+            type: "search",
+            query: "nishikawaguchi yakiniku",
+            sources: [{ type: "url", url: "https://example.com/yakiniku" }],
+          },
+        },
+      },
+      {
+        type: "response.completed",
+        response: {
+          id: "resp_sparse",
+          status: "completed",
+          output: [{ type: "web_search_call", id: "ws_sparse", status: "completed" }],
+          usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+        },
+      },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      ),
+    );
+
+    const result = await streamOpenAICodexResponses(model, context, {
+      apiKey: createJwt({
+        "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" },
+      }),
+      transport: "sse",
+    }).result();
+
+    expect(result.hostedToolCalls).toEqual([
+      {
+        type: "web_search",
+        id: "ws_sparse",
+        status: "completed",
+        action: { type: "search", query: "nishikawaguchi yakiniku" },
+        sources: ["https://example.com/yakiniku"],
+      },
+    ]);
+  });
+
+  it("keeps hosted web_search calls on the error message of a failed response", async () => {
+    const failedResponse = {
+      type: "response.failed",
+      response: {
+        id: "resp_failed_hosted",
+        status: "failed",
+        error: { code: "invalid_prompt", message: "rejected" },
+        output: [
+          {
+            type: "web_search_call",
+            id: "ws_failed",
+            status: "completed",
+            action: {
+              type: "search",
+              query: "nishikawaguchi yakiniku",
+              sources: [{ type: "url", url: "https://example.com/yakiniku" }],
+            },
+          },
+        ],
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(`data: ${JSON.stringify(failedResponse)}\n\n`, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      ),
+    );
+
+    const stream = streamOpenAICodexResponses(model, context, {
+      apiKey: createJwt({
+        "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" },
+      }),
+      transport: "sse",
+    });
+    const events = [];
+    for await (const event of stream) {
+      events.push(event);
+    }
+
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: {
+        stopReason: "error",
+        errorMessage: "invalid_prompt: rejected",
+        hostedToolCalls: [
+          {
+            type: "web_search",
+            id: "ws_failed",
+            status: "completed",
+            action: { type: "search", query: "nishikawaguchi yakiniku" },
+            sources: ["https://example.com/yakiniku"],
+          },
+        ],
+      },
+    });
+  });
 });

@@ -706,6 +706,10 @@ export async function processResponsesStream<TApi extends Api>(
       } else if (event.type === "response.failed") {
         const failure = normalizeResponsesFailedEvent(isRecord(event) ? event : {}, model);
         terminal.finalizeFailedResponse(event.response, failure.responseId);
+        // Hosted calls that ran before the failure still happened; keep them for observers.
+        for (const item of event.response?.output ?? []) {
+          recordResponsesHostedToolCall(output, item);
+        }
         throw new ResponsesStreamFailure(failure, event.response);
       }
     }

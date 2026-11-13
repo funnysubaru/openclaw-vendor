@@ -29,17 +29,30 @@ const WEB_FETCH_ERROR_NAME_MAX_CHARS = 64;
 // web_fetch is a network-sourced tool (`resultContentSource: "network"`), so in the real runtime
 // the before_tool_call wrapper re-throws its failures as
 // `new Error(wrapExternalContent(message, { source: "api" }))` (protectNetworkToolExecutionError,
-// src/agents/tool-result-error.ts): a fixed security notice, then one envelope
-// `<<<EXTERNAL_UNTRUSTED_CONTENT id="…">>>\nSource: API\n---\n<original message>…`. The status
-// patterns above are anchored to the original message, so that single outer envelope is skipped
-// first. Only the first real start marker counts; wrapExternalContent folds marker lookalikes in
-// the wrapped text, so the page body cannot forge an earlier one.
+// src/agents/tool-result-error.ts): the fixed security notice, then one envelope
+// `<<<EXTERNAL_UNTRUSTED_CONTENT id="…">>>\nSource: API\n---\n<original message>…`.
+// The original message is matched first (direct adapter path); only when it does not start with a
+// known status prefix is that single outer envelope skipped. The direct message also carries an
+// envelope (the page body wrapped by web-fetch.ts, `Source: Web Fetch`) after the trusted
+// `Web fetch failed (NNN):` prefix, so the outer one is recognised only at the very start and only
+// with `Source: API`. Inside, wrapExternalContent folds marker lookalikes, so the body cannot
+// forge an earlier marker.
 const PROTECTED_NETWORK_ERROR_OPEN_RE =
-  /^(?:[\s\S]*?\n)?<<<EXTERNAL_UNTRUSTED_CONTENT id="[0-9a-f]+">>>\r?\n(?:Source: [^\n]*\r?\n)?---\r?\n/u;
+  /^SECURITY NOTICE: [^\n]*\n[\s\S]*?\n<<<EXTERNAL_UNTRUSTED_CONTENT id="[0-9a-f]+">>>\r?\nSource: API\r?\n---\r?\n/u;
 
-function unwrapProtectedNetworkErrorMessage(message: string): string {
+function matchWebFetchHttpFailure(message: string): string | undefined {
+  for (const pattern of WEB_FETCH_HTTP_FAILURE_PATTERNS) {
+    const status = pattern.re.exec(message)?.[1];
+    if (status) {
+      return pattern.labels ? `status=${status} ${pattern.labels}` : `status=${status}`;
+    }
+  }
+  return undefined;
+}
+
+function matchProtectedWebFetchHttpFailure(message: string): string | undefined {
   const open = PROTECTED_NETWORK_ERROR_OPEN_RE.exec(message);
-  return open ? message.slice(open[0].length) : message;
+  return open ? matchWebFetchHttpFailure(message.slice(open[0].length)) : undefined;
 }
 
 function readWebFetchUrlParam(value: unknown): unknown {
@@ -86,14 +99,10 @@ export function describeWebFetchFailureForLog(params: {
   effectiveParams: unknown;
 }): string {
   const host = describeWebFetchHostForLog(params.effectiveParams, params.rawParams);
-  const message = unwrapProtectedNetworkErrorMessage(params.message);
-  for (const pattern of WEB_FETCH_HTTP_FAILURE_PATTERNS) {
-    const status = pattern.re.exec(message)?.[1];
-    if (status) {
-      return pattern.labels
-        ? `host=${host} status=${status} ${pattern.labels}`
-        : `host=${host} status=${status}`;
-    }
+  const httpFailure =
+    matchWebFetchHttpFailure(params.message) ?? matchProtectedWebFetchHttpFailure(params.message);
+  if (httpFailure) {
+    return `host=${host} ${httpFailure}`;
   }
   // Non-HTTP failures (network errors, SSRF blocks, invalid URLs, provider fallbacks) can
   // also echo the URL in their message, so only the error class name is logged.

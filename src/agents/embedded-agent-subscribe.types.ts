@@ -11,6 +11,7 @@ import type { ReplyPayload } from "../auto-reply/reply-payload.js";
 import type { ReasoningLevel, ThinkLevel, VerboseLevel } from "../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { HookRunner } from "../plugins/hooks.js";
+import type { PluginHookToolRequesterContext } from "../plugins/types.js";
 import type { BlockReplyPayload } from "./embedded-agent-payloads.js";
 import type { EmbeddedRunReplayState } from "./embedded-agent-runner/replay-state.js";
 import type { EmbeddedRunAttemptInternalParams } from "./embedded-agent-runner/run/internal-params.js";
@@ -43,6 +44,8 @@ export type SubscribeEmbeddedAgentSessionParams = {
   lifecycleGeneration?: string;
   /** Originating message channel used for subsystem log attribution. */
   messageChannel?: string;
+  /** Message requester for hook contexts of provider-hosted tool calls (same shape as tool hooks). */
+  requester?: PluginHookToolRequesterContext;
   initialReplayState?: EmbeddedRunReplayState;
   hookRunner?: HookRunner;
   verboseLevel?: VerboseLevel;

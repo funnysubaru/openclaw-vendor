@@ -24,6 +24,7 @@ import { withFirstStreamEventTimeout } from "../utils/stream-first-event-timeout
 import { createCompactionTracker } from "./openai-responses-compaction-replay.js";
 import { OPENAI_RESPONSES_REASONING_REPLAY_BLOCK_META_KEY } from "./openai-responses-contracts.js";
 import { normalizeResponsesFailedEvent, ResponsesStreamFailure } from "./openai-responses-debug.js";
+import { recordResponsesHostedToolCall } from "./openai-responses-hosted-tool-calls-internal.js";
 import { encodeTextSignatureV1 } from "./openai-responses-replay-internal.js";
 import { adaptResponsesStream } from "./openai-responses-stream-observer-internal.js";
 import {
@@ -522,6 +523,10 @@ export async function processResponsesStream<TApi extends Api>(
         materializeDeferredTextSlots(existingOutputSlot);
         const outputSlot = existingOutputSlot ?? createOutputSlot(event, item);
         compactionTracker.completed(item, blocks.length);
+        // Provider-hosted calls (web_search_call) never reach local tool execution; keep their
+        // facts for after_tool_call observers. ChatGPT terminal output can be empty, so this
+        // done item is the only place the call is visible.
+        recordResponsesHostedToolCall(output, item);
         if (item.type === "reasoning" && outputSlot?.type === "thinking") {
           const summaryText = item.summary?.map((s) => s.text).join("\n\n") || "";
           const contentText = item.content?.map((c) => c.text).join("\n\n") || "";
@@ -663,6 +668,9 @@ export async function processResponsesStream<TApi extends Api>(
       } else if (event.type === "response.completed" || event.type === "response.incomplete") {
         // Preserve reported accounting before rejecting unfinished tool calls.
         terminal.finalizeResponse(event.response, event.type);
+        for (const item of event.response.output ?? []) {
+          recordResponsesHostedToolCall(output, item);
+        }
         if (incompleteToolCall) {
           if (output.errorMessage) {
             throw new Error(output.errorMessage);

@@ -463,4 +463,76 @@ describe("OpenAI ChatGPT Responses inference streaming", () => {
       usage: { input: 5, output: 3, totalTokens: 8 },
     });
   });
+
+  it("asks for hosted web_search sources and keeps the hosted call on the message", async () => {
+    const searchItem = {
+      type: "web_search_call",
+      id: "ws_hosted",
+      status: "completed",
+      action: {
+        type: "search",
+        query: "nishikawaguchi yakiniku",
+        sources: [{ type: "url", url: "https://example.com/yakiniku" }],
+      },
+    };
+    const events = [
+      {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "web_search_call", id: "ws_hosted", status: "in_progress" },
+      },
+      { type: "response.output_item.done", output_index: 0, item: searchItem },
+      {
+        type: "response.completed",
+        response: {
+          id: "resp_hosted",
+          status: "completed",
+          output: [],
+          usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+        },
+      },
+    ];
+    let requestBody: Record<string, unknown> | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        const raw = init.body;
+        const json =
+          typeof raw === "string"
+            ? raw
+            : (process.getBuiltinModule("node:zlib") as typeof import("node:zlib"))
+                .zstdDecompressSync(raw as Uint8Array)
+                .toString("utf8");
+        requestBody = JSON.parse(json) as Record<string, unknown>;
+        return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      }),
+    );
+
+    const result = await streamOpenAICodexResponses(model, context, {
+      apiKey: createJwt({
+        "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" },
+      }),
+      transport: "sse",
+      // Mirrors the native web search wrapper, which adds the hosted tool in onPayload.
+      onPayload: (payload) => ({
+        ...(payload as Record<string, unknown>),
+        tools: [{ type: "web_search" }],
+      }),
+    }).result();
+
+    expect(requestBody?.include).toContain("web_search_call.action.sources");
+    expect(result.stopReason).toBe("stop");
+    expect(result.hostedToolCalls).toEqual([
+      {
+        type: "web_search",
+        id: "ws_hosted",
+        status: "completed",
+        action: { type: "search", query: "nishikawaguchi yakiniku" },
+        sources: ["https://example.com/yakiniku"],
+      },
+    ]);
+  });
 });

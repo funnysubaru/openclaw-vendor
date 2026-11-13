@@ -30,6 +30,7 @@ import {
 } from "../../../sessions/nested-tool-activity.js";
 import { raceWithAbortSignal } from "../../agent-tools.abort.js";
 import { recordStructuredReplayTrustForToolCall } from "../../agent-tools.before-tool-call.js";
+import { buildHostedToolHookRequester } from "../../embedded-agent-subscribe.handlers.hosted-tools.js";
 import { subscribeEmbeddedAgentSession } from "../../embedded-agent-subscribe.js";
 import { sanitizeToolResult } from "../../embedded-agent-tool-results.js";
 import { cancelPendingAgentQuestionForSession } from "../../harness/gateway-question.js";
@@ -293,6 +294,7 @@ export function prepareEmbeddedAttemptStream(input: {
     runId: attempt.runId,
     lifecycleGeneration: attempt.lifecycleGeneration,
     messageChannel: input.runtimeChannel,
+    ...buildHostedToolHookRequester(attempt),
     initialReplayState: attempt.initialReplayState,
     hookRunner: getGlobalHookRunner() ?? undefined,
     verboseLevel: attempt.verboseLevel,

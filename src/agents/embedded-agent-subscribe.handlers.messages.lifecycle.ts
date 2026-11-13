@@ -11,6 +11,7 @@ import {
   parseAssistantTextSignature,
   resolveAssistantMessagePhase,
 } from "../shared/chat-message-content.js";
+import { runHostedToolCallAfterHooks } from "./embedded-agent-subscribe.handlers.hosted-tools.js";
 import {
   recordPendingAssistantReplyDirectives,
   resolveManagedStreamMediaUrls,
@@ -56,6 +57,22 @@ export function handleMessageStart(
 }
 
 export function handleMessageEnd(
+  ctx: EmbeddedAgentSubscribeContext,
+  evt: AgentEvent & { message: AgentMessage },
+): void | Promise<void> {
+  const msg = evt.message;
+  if (msg?.role === "assistant" && !isSubscribeTranscriptOnlyOpenClawAssistantMessage(msg)) {
+    // Provider-hosted calls already ran inside this response; report them before the reply of
+    // the same response is finalized so observers see the call while the run is still open.
+    const hostedHooks = runHostedToolCallAfterHooks(ctx, msg);
+    if (hostedHooks) {
+      return hostedHooks.then(() => handleAssistantMessageEnd(ctx, evt));
+    }
+  }
+  return handleAssistantMessageEnd(ctx, evt);
+}
+
+function handleAssistantMessageEnd(
   ctx: EmbeddedAgentSubscribeContext,
   evt: AgentEvent & { message: AgentMessage },
 ): void | Promise<void> {

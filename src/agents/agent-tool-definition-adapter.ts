@@ -212,12 +212,17 @@ function describeToolFailureInputs(params: {
 const WEB_FETCH_TOOL_NAME = "web_fetch";
 // HTTP failures whose status code comes from our own code, not from the remote page: the direct
 // fetch (`Web fetch failed (NNN): …`, src/agents/tools/web-fetch.ts) and the Firecrawl fallback
-// that web_fetch awaits before giving up (`Firecrawl API error (NNN): …`,
-// extensions/firecrawl/src/firecrawl-client.ts, errorLabel "Firecrawl"). Only the status is
-// kept; everything after it (the wrapped error body) is dropped.
-const WEB_FETCH_HTTP_FAILURE_PATTERNS: ReadonlyArray<{ re: RegExp; provider?: string }> = [
+// that web_fetch awaits before giving up (`Firecrawl API error (NNN): …` /
+// `Firecrawl fetch failed (NNN): …`, extensions/firecrawl/src/firecrawl-client.ts). Only the
+// status is kept; everything after it (the wrapped error body) is dropped.
+const WEB_FETCH_HTTP_FAILURE_PATTERNS: ReadonlyArray<{ re: RegExp; labels?: string }> = [
   { re: /^Web fetch failed \((\d{3})\)/ },
-  { re: /^Firecrawl API error \((\d{3})\)/, provider: "firecrawl" },
+  // The Firecrawl API itself answered non-2xx (postFirecrawlJson).
+  { re: /^Firecrawl API error \((\d{3})\)/, labels: "provider=firecrawl kind=api-error" },
+  // The Firecrawl API answered 2xx but the scrape failed: normally the target site's HTTP status
+  // (parseFirecrawlScrapePayload, `target returned an unsuccessful HTTP status`), or a
+  // `success: false` payload carrying Firecrawl's own response status.
+  { re: /^Firecrawl fetch failed \((\d{3})\)/, labels: "provider=firecrawl kind=fetch-failed" },
 ];
 const WEB_FETCH_ERROR_NAME_MAX_CHARS = 64;
 
@@ -268,8 +273,8 @@ function describeWebFetchFailureForLog(params: {
   for (const pattern of WEB_FETCH_HTTP_FAILURE_PATTERNS) {
     const status = pattern.re.exec(params.message)?.[1];
     if (status) {
-      return pattern.provider
-        ? `host=${host} status=${status} provider=${pattern.provider}`
+      return pattern.labels
+        ? `host=${host} status=${status} ${pattern.labels}`
         : `host=${host} status=${status}`;
     }
   }

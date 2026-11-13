@@ -396,6 +396,13 @@ describe("agent tool definition adapter logging", () => {
           // when web_fetch falls back to Firecrawl and the Firecrawl API answers non-2xx.
           throw new Error(`Firecrawl API error (429): rate limit for ${url} firecrawl-body-marker`);
         }
+        if (url.includes("target-missing")) {
+          // Shape thrown by parseFirecrawlScrapePayload when the Firecrawl API succeeds but the
+          // target site answered non-2xx; the success:false path appends the provider detail.
+          throw new Error(
+            `Firecrawl fetch failed (404): target returned an unsuccessful HTTP status. ${url} firecrawl-target-marker`,
+          );
+        }
         throw new Error(`Web fetch failed (404): page ${url} not found repaired-body-marker`);
       },
     } satisfies AgentTool;
@@ -407,6 +414,13 @@ describe("agent tool definition adapter logging", () => {
     await def.execute(
       "call-web-fetch-firecrawl-429",
       { url: "https://blog.example.net/rate-limited/private-topic?q=secret-query" },
+      undefined,
+      undefined,
+      extensionContext,
+    );
+    await def.execute(
+      "call-web-fetch-firecrawl-target-404",
+      { url: "https://shop.example.jp/target-missing/private-topic?q=secret-query" },
       undefined,
       undefined,
       extensionContext,
@@ -423,7 +437,8 @@ describe("agent tool definition adapter logging", () => {
 
     const messages = vi.mocked(logError).mock.calls.map((call) => String(call[0]));
     expect(messages).toEqual([
-      "[tools] web_fetch failed: host=blog.example.net status=429 provider=firecrawl",
+      "[tools] web_fetch failed: host=blog.example.net status=429 provider=firecrawl kind=api-error",
+      "[tools] web_fetch failed: host=shop.example.jp status=404 provider=firecrawl kind=fetch-failed",
       "[tools] web_fetch failed: host=docs.example.com status=404",
     ]);
     const debugMessages = mocks.logDebug.mock.calls.map((call) => String(call[0]));
@@ -431,6 +446,8 @@ describe("agent tool definition adapter logging", () => {
       expect(logged).not.toContain("private-topic");
       expect(logged).not.toContain("secret-query");
       expect(logged).not.toContain("firecrawl-body-marker");
+      expect(logged).not.toContain("firecrawl-target-marker");
+      expect(logged).not.toContain("unsuccessful HTTP status");
       expect(logged).not.toContain("repaired-body-marker");
       expect(logged).not.toContain("raw_params");
     }

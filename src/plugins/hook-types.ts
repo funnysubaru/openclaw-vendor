@@ -685,7 +685,11 @@ export type PluginHookReplyPayloadSendingResult = {
   reason?: string;
 };
 
-export type PluginHookToolKind = "code_mode_exec";
+/**
+ * `provider_hosted`: the provider ran the tool inside its own response (for example OpenAI
+ * hosted `web_search`). Only `after_tool_call` sees these calls, after they already ran.
+ */
+export type PluginHookToolKind = "code_mode_exec" | "provider_hosted";
 export type PluginHookToolInputKind = "javascript" | "typescript";
 
 /** Host-derived identity for the message requester that initiated a tool call. */

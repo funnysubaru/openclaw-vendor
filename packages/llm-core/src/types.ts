@@ -382,9 +382,33 @@ export type AssistantDeliveryTtsFacts = {
   }>;
 };
 
+/**
+ * Provider-hosted tool call the provider executed itself inside one response, for example an
+ * OpenAI Responses `web_search_call`. Observational only: it is never replayed to a provider and
+ * never authorizes anything; the runtime reports it to `after_tool_call` observers.
+ */
+export interface HostedToolCall {
+  type: "web_search";
+  /** Provider item id, for example `ws_…`. */
+  id: string;
+  /** Provider item status, for example `completed`, `failed`, or `incomplete`. */
+  status: string;
+  action?: {
+    type?: string;
+    query?: string;
+    queries?: string[];
+    url?: string;
+    pattern?: string;
+  };
+  /** Source URLs the provider reported for this call (only when the request asked for them). */
+  sources?: string[];
+}
+
 export interface AssistantMessage {
   role: "assistant";
   content: (TextContent | ThinkingContent | ToolCall)[];
+  /** Provider-hosted tool calls completed during this turn; kept out of `content` and replay. */
+  hostedToolCalls?: HostedToolCall[];
   openclawDelivery?: {
     audioAsVoice?: true;
     /** Exact media directives consumed by the managed-media transcript rewrite owner. */

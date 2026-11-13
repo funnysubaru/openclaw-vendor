@@ -23,6 +23,7 @@ import {
 } from "../transports/openai-responses-compaction-replay.js";
 import { responsesPromptObserver } from "../transports/openai-responses-contracts.js";
 import { ResponsesStreamFailure } from "../transports/openai-responses-debug.js";
+import { withResponsesWebSearchSourcesInclude } from "../transports/openai-responses-hosted-tool-calls-internal.js";
 import { createResponsesPromptEgressObserver } from "../transports/openai-responses-prompt-observer-internal.js";
 import {
   commitResponsesEncryptedContentAttempt,
@@ -297,7 +298,8 @@ export const streamOpenAICodexResponses: StreamFunction<
         if (nextBody !== undefined) {
           body = nextBody as RequestBody;
         }
-        return body;
+        // The hosted web_search tool is usually injected by onPayload; ask for its sources only then.
+        return withResponsesWebSearchSourcesInclude(body);
       };
       let semanticAttempt: ResponsesEncryptedContentAttempt<RequestBody> = {
         kind: "initial",

@@ -204,6 +204,65 @@ function describeToolFailureInputs(params: {
   return parts.join(" ");
 }
 
+// Yuiwork collab patch #4 (collab-m1-beta task 247): web_fetch failure logs keep only the
+// host and the HTTP status (or the error class). The URL path/query can carry what the user
+// searched for, and the thrown message embeds the error page body (`Web fetch failed (404):
+// <body>`), so neither may reach operator logs. The model-visible error result is unchanged.
+const WEB_FETCH_TOOL_NAME = "web_fetch";
+const WEB_FETCH_HTTP_STATUS_RE = /^Web fetch failed \((\d{3})\)/;
+const WEB_FETCH_ERROR_NAME_MAX_CHARS = 64;
+
+function readWebFetchUrlParam(value: unknown): unknown {
+  let parsed = value;
+  if (typeof parsed === "string") {
+    // Tool params normally arrive as objects; a raw JSON string is tolerated the same way the
+    // exec sanitizer does, but anything unparseable is treated as "no URL" rather than logged.
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return undefined;
+    }
+  }
+  return isPlainObject(parsed) ? parsed.url : undefined;
+}
+
+function describeWebFetchHostForLog(...candidates: unknown[]): string {
+  // Effective params win (a before_tool_call hook may have rewritten the URL); raw params are
+  // the fallback. Only URL#hostname is ever emitted, never the original string.
+  for (const candidate of candidates) {
+    const url = readWebFetchUrlParam(candidate);
+    if (typeof url !== "string" || !url.trim()) {
+      continue;
+    }
+    try {
+      return new URL(url.trim()).hostname || "invalid-url";
+    } catch {
+      return "invalid-url";
+    }
+  }
+  return "unknown";
+}
+
+function describeWebFetchFailureForLog(params: {
+  err: unknown;
+  message: string;
+  rawParams: unknown;
+  effectiveParams: unknown;
+}): string {
+  const host = describeWebFetchHostForLog(params.effectiveParams, params.rawParams);
+  const status = WEB_FETCH_HTTP_STATUS_RE.exec(params.message)?.[1];
+  if (status) {
+    return `host=${host} status=${status}`;
+  }
+  // Non-HTTP failures (network errors, SSRF blocks, invalid URLs, provider fallbacks) can
+  // also echo the URL in their message, so only the error class name is logged.
+  const errorName =
+    params.err instanceof Error
+      ? sanitizeForConsole(params.err.name, WEB_FETCH_ERROR_NAME_MAX_CHARS)
+      : undefined;
+  return `host=${host} error=${errorName ?? typeof params.err}`;
+}
+
 function normalizeToolExecutionResult(params: {
   toolName: string;
   result: unknown;
@@ -261,6 +320,21 @@ async function executeAdaptedToolOperation(params: {
       });
     }
     const described = describeToolExecutionError(err);
+    if (params.normalizedToolName === WEB_FETCH_TOOL_NAME) {
+      // Collab patch #4: no params preview and no debug stack (the stack repeats the message,
+      // i.e. the error page body). Only host + status / error class reach the logs.
+      const summary = describeWebFetchFailureForLog({
+        err,
+        message: described.message,
+        rawParams: params.rawParams,
+        effectiveParams: params.getEffectiveParams(),
+      });
+      logError(`[tools] ${params.normalizedToolName} failed: ${summary}`);
+      return buildToolExecutionErrorResult({
+        toolName: params.normalizedToolName,
+        message: described.message,
+      });
+    }
     if (described.stack && described.stack !== described.message) {
       logDebug(`tools: ${params.normalizedToolName} failed stack:\n${described.stack}`);
     }

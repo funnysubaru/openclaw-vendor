@@ -275,6 +275,142 @@ describe("agent tool definition adapter logging", () => {
     expect(message).not.toContain("export XAI_API_KEY");
   });
 
+  it("logs only host and HTTP status for web_fetch failures (collab patch #4)", async () => {
+    const errorBody = "Sorry, the page /shop/secret-search was not found. user-body-marker";
+    const baseTool = {
+      name: "web_fetch",
+      label: "Web Fetch",
+      description: "fetches pages",
+      parameters: Type.Object({
+        url: Type.String(),
+      }),
+      execute: async () => {
+        throw new Error(`Web fetch failed (404): ${errorBody}`);
+      },
+    } satisfies AgentTool;
+    const [def] = toToolDefinitions([baseTool]);
+    if (!def) {
+      throw new Error("missing tool definition");
+    }
+
+    const result = await def.execute(
+      "call-web-fetch-404",
+      { url: "https://shop.example.com/shop/secret-search?q=%E7%84%BC%E8%82%89&user=alice#frag" },
+      undefined,
+      undefined,
+      extensionContext,
+    );
+
+    // The model still sees the full error (it needs the body to understand the 404).
+    const details = result.details as { status?: string; tool?: string; error?: string };
+    expect(details?.status).toBe("error");
+    expect(details?.tool).toBe("web_fetch");
+    expect(details?.error).toBe(`Web fetch failed (404): ${errorBody}`);
+
+    expect(logError).toHaveBeenCalledTimes(1);
+    expect(firstLogErrorMessage()).toBe(
+      "[tools] web_fetch failed: host=shop.example.com status=404",
+    );
+    // The debug stack repeats the message (and therefore the body), so it is skipped too.
+    const debugMessages = mocks.logDebug.mock.calls.map((call) => String(call[0]));
+    for (const logged of [String(firstLogErrorMessage()), ...debugMessages]) {
+      expect(logged).not.toContain("secret-search");
+      expect(logged).not.toContain("%E7%84%BC");
+      expect(logged).not.toContain("alice");
+      expect(logged).not.toContain("user-body-marker");
+      expect(logged).not.toContain("raw_params");
+    }
+  });
+
+  it("logs only host and error class for non-HTTP web_fetch failures (collab patch #4)", async () => {
+    class SsrFBlockedError extends Error {
+      override name = "SsrFBlockedError";
+    }
+    const baseTool = {
+      name: "web_fetch",
+      label: "Web Fetch",
+      description: "fetches pages",
+      parameters: Type.Object({
+        url: Type.String(),
+      }),
+      execute: async (_toolCallId: string, params: unknown) => {
+        const url = (params as { url: string }).url;
+        if (url.startsWith("http://10.")) {
+          throw new SsrFBlockedError(`Blocked: ${url} resolves to a private address`);
+        }
+        throw new TypeError(`fetch failed for ${url}`);
+      },
+    } satisfies AgentTool;
+    const [def] = toToolDefinitions([baseTool]);
+    if (!def) {
+      throw new Error("missing tool definition");
+    }
+
+    await def.execute(
+      "call-web-fetch-network",
+      { url: "https://news.example.org/article/private-topic?id=123" },
+      undefined,
+      undefined,
+      extensionContext,
+    );
+    await def.execute(
+      "call-web-fetch-ssrf",
+      { url: "http://10.0.0.5/admin/secret-path" },
+      undefined,
+      undefined,
+      extensionContext,
+    );
+    await def.execute(
+      "call-web-fetch-invalid",
+      { url: "not a url /private-topic" },
+      undefined,
+      undefined,
+      extensionContext,
+    );
+
+    const messages = vi.mocked(logError).mock.calls.map((call) => String(call[0]));
+    expect(messages).toEqual([
+      "[tools] web_fetch failed: host=news.example.org error=TypeError",
+      "[tools] web_fetch failed: host=10.0.0.5 error=SsrFBlockedError",
+      "[tools] web_fetch failed: host=invalid-url error=TypeError",
+    ]);
+    for (const logged of messages) {
+      expect(logged).not.toContain("private-topic");
+      expect(logged).not.toContain("secret-path");
+      expect(logged).not.toContain("id=123");
+    }
+  });
+
+  it("keeps failure logs of other tools unchanged (collab patch #4 is web_fetch only)", async () => {
+    const baseTool = {
+      name: "web_search",
+      label: "Web Search",
+      description: "searches",
+      parameters: Type.Object({
+        query: Type.String(),
+      }),
+      execute: async () => {
+        throw new Error("Web fetch failed (404): provider page body");
+      },
+    } satisfies AgentTool;
+    const [def] = toToolDefinitions([baseTool]);
+    if (!def) {
+      throw new Error("missing tool definition");
+    }
+
+    await def.execute(
+      "call-web-search-unchanged",
+      { query: "OpenClaw" },
+      undefined,
+      undefined,
+      extensionContext,
+    );
+
+    expect(firstLogErrorMessage()).toBe(
+      '[tools] web_search failed: Web fetch failed (404): provider page body raw_params={"query":"OpenClaw"}',
+    );
+  });
+
   it("logs provider AbortError failures when the agent run was not aborted", async () => {
     const baseTool = {
       name: "web_search",

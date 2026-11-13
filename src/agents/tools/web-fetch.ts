@@ -38,6 +38,7 @@ import {
   readToolStringParam,
   scheduleToolProgress,
 } from "./common.js";
+import { sanitizeWebFetchUrl } from "./web-fetch-url.js";
 import {
   extractBasicHtmlContent,
   htmlToMarkdown,
@@ -552,24 +553,8 @@ function throwIfFetchAborted(signal: AbortSignal | undefined): void {
   throw signal.reason instanceof Error ? signal.reason : new Error("aborted");
 }
 
-/**
- * Sanitize a web_fetch URL parameter that may contain LLM-injected whitespace.
- *
- * Fixes the reported case where a model emits a space between the scheme and
- * authority (e.g. `https:// docs.openclaw.ai`), which causes `new URL()` to
- * throw. Path and query whitespace is intentionally preserved — the WHATWG URL
- * parser percent-encodes those characters correctly per RFC 3986.
- */
-function sanitizeWebFetchUrl(raw: string): string {
-  let end = raw.length;
-  while (end > 0 && raw.charCodeAt(end - 1) <= 0x20) {
-    end -= 1;
-  }
-  const trimmed = raw.slice(0, end).replace(/^\s+/, "");
-  const repaired = trimmed.replace(/^(https?:\/\/)\s+/i, "$1");
-  return repaired.replace(/^(https?:\/\/[^/?#\s]+)\s+$/i, "$1");
-}
-
+// Yuiwork collab patch #4: sanitizeWebFetchUrl now lives in ./web-fetch-url.ts (unchanged) so
+// the tool adapter's failure log can reuse it; the test API below still exposes it from here.
 if (process.env.VITEST || process.env.NODE_ENV === "test") {
   (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.webFetchTestApi")] = {
     sanitizeWebFetchUrl,

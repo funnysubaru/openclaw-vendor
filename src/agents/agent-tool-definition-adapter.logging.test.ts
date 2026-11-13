@@ -381,6 +381,61 @@ describe("agent tool definition adapter logging", () => {
     }
   });
 
+  it("keeps the Firecrawl fallback HTTP status and the repaired host for web_fetch failures (collab patch #4)", async () => {
+    const baseTool = {
+      name: "web_fetch",
+      label: "Web Fetch",
+      description: "fetches pages",
+      parameters: Type.Object({
+        url: Type.String(),
+      }),
+      execute: async (_toolCallId: string, params: unknown) => {
+        const url = (params as { url: string }).url;
+        if (url.includes("rate-limited")) {
+          // Shape thrown by extensions/firecrawl/src/firecrawl-client.ts (errorLabel "Firecrawl")
+          // when web_fetch falls back to Firecrawl and the Firecrawl API answers non-2xx.
+          throw new Error(`Firecrawl API error (429): rate limit for ${url} firecrawl-body-marker`);
+        }
+        throw new Error(`Web fetch failed (404): page ${url} not found repaired-body-marker`);
+      },
+    } satisfies AgentTool;
+    const [def] = toToolDefinitions([baseTool]);
+    if (!def) {
+      throw new Error("missing tool definition");
+    }
+
+    await def.execute(
+      "call-web-fetch-firecrawl-429",
+      { url: "https://blog.example.net/rate-limited/private-topic?q=secret-query" },
+      undefined,
+      undefined,
+      extensionContext,
+    );
+    // web_fetch repairs a model-injected space after the scheme before fetching
+    // (sanitizeWebFetchUrl), so the log must name the host that was actually requested.
+    await def.execute(
+      "call-web-fetch-repaired-404",
+      { url: "  https:// docs.example.com/guide/private-topic?q=secret-query  " },
+      undefined,
+      undefined,
+      extensionContext,
+    );
+
+    const messages = vi.mocked(logError).mock.calls.map((call) => String(call[0]));
+    expect(messages).toEqual([
+      "[tools] web_fetch failed: host=blog.example.net status=429 provider=firecrawl",
+      "[tools] web_fetch failed: host=docs.example.com status=404",
+    ]);
+    const debugMessages = mocks.logDebug.mock.calls.map((call) => String(call[0]));
+    for (const logged of [...messages, ...debugMessages]) {
+      expect(logged).not.toContain("private-topic");
+      expect(logged).not.toContain("secret-query");
+      expect(logged).not.toContain("firecrawl-body-marker");
+      expect(logged).not.toContain("repaired-body-marker");
+      expect(logged).not.toContain("raw_params");
+    }
+  });
+
   it("keeps failure logs of other tools unchanged (collab patch #4 is web_fetch only)", async () => {
     const baseTool = {
       name: "web_search",

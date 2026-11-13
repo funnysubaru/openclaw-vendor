@@ -40,6 +40,7 @@ import {
 import type { ToolDefinition } from "./sessions/index.js";
 import { normalizeToolPolicyName } from "./tool-policy.js";
 import { jsonResult, payloadTextResult, ToolInputError } from "./tools/common.js";
+import { sanitizeWebFetchUrl } from "./tools/web-fetch-url.js";
 
 type AnyAgentTool = AgentTool;
 
@@ -209,7 +210,15 @@ function describeToolFailureInputs(params: {
 // searched for, and the thrown message embeds the error page body (`Web fetch failed (404):
 // <body>`), so neither may reach operator logs. The model-visible error result is unchanged.
 const WEB_FETCH_TOOL_NAME = "web_fetch";
-const WEB_FETCH_HTTP_STATUS_RE = /^Web fetch failed \((\d{3})\)/;
+// HTTP failures whose status code comes from our own code, not from the remote page: the direct
+// fetch (`Web fetch failed (NNN): …`, src/agents/tools/web-fetch.ts) and the Firecrawl fallback
+// that web_fetch awaits before giving up (`Firecrawl API error (NNN): …`,
+// extensions/firecrawl/src/firecrawl-client.ts, errorLabel "Firecrawl"). Only the status is
+// kept; everything after it (the wrapped error body) is dropped.
+const WEB_FETCH_HTTP_FAILURE_PATTERNS: ReadonlyArray<{ re: RegExp; provider?: string }> = [
+  { re: /^Web fetch failed \((\d{3})\)/ },
+  { re: /^Firecrawl API error \((\d{3})\)/, provider: "firecrawl" },
+];
 const WEB_FETCH_ERROR_NAME_MAX_CHARS = 64;
 
 function readWebFetchUrlParam(value: unknown): unknown {
@@ -231,11 +240,17 @@ function describeWebFetchHostForLog(...candidates: unknown[]): string {
   // the fallback. Only URL#hostname is ever emitted, never the original string.
   for (const candidate of candidates) {
     const url = readWebFetchUrlParam(candidate);
-    if (typeof url !== "string" || !url.trim()) {
+    if (typeof url !== "string") {
+      continue;
+    }
+    // Same repair the tool applies before fetching (e.g. `https:// docs.example.com`), so the
+    // logged host is the one actually requested.
+    const repaired = sanitizeWebFetchUrl(url);
+    if (!repaired) {
       continue;
     }
     try {
-      return new URL(url.trim()).hostname || "invalid-url";
+      return new URL(repaired).hostname || "invalid-url";
     } catch {
       return "invalid-url";
     }
@@ -250,9 +265,13 @@ function describeWebFetchFailureForLog(params: {
   effectiveParams: unknown;
 }): string {
   const host = describeWebFetchHostForLog(params.effectiveParams, params.rawParams);
-  const status = WEB_FETCH_HTTP_STATUS_RE.exec(params.message)?.[1];
-  if (status) {
-    return `host=${host} status=${status}`;
+  for (const pattern of WEB_FETCH_HTTP_FAILURE_PATTERNS) {
+    const status = pattern.re.exec(params.message)?.[1];
+    if (status) {
+      return pattern.provider
+        ? `host=${host} status=${status} provider=${pattern.provider}`
+        : `host=${host} status=${status}`;
+    }
   }
   // Non-HTTP failures (network errors, SSRF blocks, invalid URLs, provider fallbacks) can
   // also echo the URL in their message, so only the error class name is logged.

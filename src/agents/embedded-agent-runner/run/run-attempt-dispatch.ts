@@ -480,6 +480,7 @@ export async function prepareAndDispatchEmbeddedRunAttempt(input: {
     images: promptMedia.images,
     imageOrder: promptMedia.imageOrder,
     media: promptMedia.media,
+    internalDeliveryMediaUrls: params.internalDeliveryMediaUrls,
     clientTools: params.clientTools,
     disableTools: params.disableTools,
     provider,

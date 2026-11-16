@@ -1336,6 +1336,7 @@ export function runAgentAttempt(params: {
     // removes the persisted CLI turn before the embedded prompt is submitted.
     images: shouldForwardImagesToEmbedded ? params.opts.images : undefined,
     imageOrder: shouldForwardImagesToEmbedded ? params.opts.imageOrder : undefined,
+    internalDeliveryMediaUrls: params.opts.internalDeliveryMediaUrls,
     media: params.opts.media,
     clientTools: params.opts.clientTools,
     provider: embeddedAgentProvider,

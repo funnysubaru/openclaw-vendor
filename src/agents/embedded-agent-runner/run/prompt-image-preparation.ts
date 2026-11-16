@@ -7,7 +7,12 @@ import type { RunEmbeddedAgentParams } from "./params.js";
 
 type PromptExecutionAttempt = Pick<
   RunEmbeddedAgentParams,
-  "config" | "imageOrder" | "images" | "media" | "userTurnTranscriptRecorder"
+  | "config"
+  | "imageOrder"
+  | "images"
+  | "internalDeliveryMediaUrls"
+  | "media"
+  | "userTurnTranscriptRecorder"
 > & { model: { input?: string[] } };
 type PromptImageResult = Awaited<ReturnType<typeof detectAndLoadPromptImages>>;
 
@@ -55,6 +60,7 @@ export async function prepareEmbeddedAttemptPromptExecution(input: {
     maxBytes: MAX_IMAGE_BYTES,
     maxDimensionPx: resolveImageSanitizationLimits(attempt.config).maxDimensionPx,
     workspaceOnly: input.effectiveFsWorkspaceOnly,
+    hostDeliveredMediaPaths: attempt.internalDeliveryMediaUrls,
     localRoots: input.effectiveFsWorkspaceOnly
       ? undefined
       : getAgentScopedMediaLocalRoots(attempt.config ?? {}, input.mediaOwnerAgentId),

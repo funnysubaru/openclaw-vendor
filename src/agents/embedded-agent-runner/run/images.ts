@@ -303,6 +303,13 @@ export async function detectAndLoadPromptImages(params: {
   workspaceOnly?: boolean;
   localRoots?: readonly string[];
   sandbox?: { root: string; bridge: SandboxFsBridge };
+  /**
+   * Exact generated files the host itself delivers for this turn (internalDeliveryMediaUrls).
+   * The prompt names them as delivery directives. When prompt discovery detects one of these
+   * exact paths it is read as that single file even under workspaceOnly, so the model can
+   * inspect what it just generated; roots for every other detected path are unchanged.
+   */
+  hostDeliveredMediaPaths?: readonly string[];
 }): Promise<{
   images: ImageContent[];
   imageFactIndexes: ImageFactIndex[];
@@ -413,6 +420,11 @@ export async function detectAndLoadPromptImages(params: {
   const attachmentRawKeys = new Set(
     attachmentRefs.flatMap((ref) => ref.aliases.flatMap((alias) => rawAliasDedupeKey(alias) ?? [])),
   );
+  const hostDeliveredKeys = new Set(
+    (params.hostDeliveredMediaPaths ?? []).flatMap(
+      (mediaPath) => rawAliasDedupeKey(mediaPath) ?? [],
+    ),
+  );
   const promptRefs = detectImageReferences(params.prompt).filter(
     (ref) =>
       !attachmentRawKeys.has(rawAliasDedupeKey(ref.raw) ?? "") &&
@@ -430,11 +442,18 @@ export async function detectAndLoadPromptImages(params: {
   let loadedCount = 0;
   let failedMediaCount = 0;
   let skippedCount = 0;
-  const loadRef = async (ref: MediaFileRef & { workspaceDir?: string }) => {
+  const loadRef = async (
+    ref: MediaFileRef & { workspaceDir?: string },
+    hostDeliveredFile = false,
+  ) => {
     const image = await loadImageFromRef(ref, ref.workspaceDir ?? params.workspaceDir, {
       maxBytes: params.maxBytes,
       workspaceOnly: params.workspaceOnly,
-      localRoots: params.localRoots ?? (params.workspaceOnly ? [params.workspaceDir] : undefined),
+      // A host-delivered file is admitted as itself: its own directory is the only root for
+      // this one read of this exact path; other detected paths keep the configured roots.
+      localRoots: hostDeliveredFile
+        ? [path.dirname(ref.resolved)]
+        : (params.localRoots ?? (params.workspaceOnly ? [params.workspaceDir] : undefined)),
       sandbox: params.sandbox,
     });
     if (image) {
@@ -465,7 +484,13 @@ export async function detectAndLoadPromptImages(params: {
   }
   promptImages.push(...unusedExisting);
   for (const ref of promptRefs) {
-    const image = await loadRef(ref);
+    // Only workspace-only runs need the exception; other runs keep their configured roots.
+    const hostDeliveredFile =
+      params.workspaceOnly === true &&
+      !params.sandbox &&
+      path.isAbsolute(ref.resolved) &&
+      hostDeliveredKeys.has(rawAliasDedupeKey(ref.raw) ?? "");
+    const image = await loadRef(ref, hostDeliveredFile);
     if (image) {
       promptImages.push({ image, factIndex: null });
     }

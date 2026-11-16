@@ -372,6 +372,49 @@ describe("detectAndLoadPromptImages", () => {
     }
   });
 
+  it("reads host-delivered generated files outside the workspace, and only those files", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-host-media-ws-"));
+    const mediaDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-host-media-store-"));
+    const imagePath = path.join(mediaDir, "generated.png");
+    const siblingPath = path.join(mediaDir, "other.png");
+    await fs.writeFile(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
+    await fs.writeFile(siblingPath, Buffer.from(TINY_PNG_BASE64, "base64"));
+    // The queued completion turn lists the producer's output as an attachment line (quoted path,
+    // which prompt discovery detects) and as a MEDIA: delivery directive.
+    const completion = (file: string) =>
+      `Attachments:\n1. type=image path="${file}"\n\nGenerated media:\nMEDIA:${file}`;
+    const prompt = completion(imagePath);
+
+    try {
+      const delivered = await detectAndLoadPromptImages({
+        prompt,
+        workspaceDir,
+        model: { input: ["text", "image"] },
+        workspaceOnly: true,
+        hostDeliveredMediaPaths: [imagePath],
+      });
+      expect(delivered.images).toHaveLength(1);
+      expect(delivered.loadedCount).toBe(1);
+      expect(delivered.skippedCount).toBe(0);
+
+      // A path the host did not deliver keeps the workspace-only roots, even beside the
+      // delivered file in the same media directory.
+      const sibling = await detectAndLoadPromptImages({
+        prompt: `${prompt}\n\n${completion(siblingPath)}`,
+        workspaceDir,
+        model: { input: ["text", "image"] },
+        workspaceOnly: true,
+        hostDeliveredMediaPaths: [imagePath],
+      });
+      expect(sibling.images).toHaveLength(1);
+      expect(sibling.loadedCount).toBe(1);
+      expect(sibling.skippedCount).toBe(1);
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+      await fs.rm(mediaDir, { recursive: true, force: true });
+    }
+  });
+
   it("uses a described fact identity to suppress its generated media-note path", async () => {
     const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-described-dedupe-"));
     const imagePath = path.join(workspaceDir, "photo.png");

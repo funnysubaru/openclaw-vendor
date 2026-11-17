@@ -261,8 +261,8 @@ export type RunEmbeddedAgentParams = {
   images?: ImageContent[];
   imageOrder?: PromptImageOrderEntry[];
   /**
-   * Host-owned generated media this turn delivers itself. When the prompt names one of these
-   * exact files, prompt-path image discovery reads it even under workspaceOnly so the model can
+   * Host-owned generated media this turn delivers itself. Local image files in this list are
+   * loaded as prompt images (as those exact files, even under workspaceOnly) so the model can
    * inspect what it just generated; they are not passed as agent input attachments.
    */
   internalDeliveryMediaUrls?: string[];

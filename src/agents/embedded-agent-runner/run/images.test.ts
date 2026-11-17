@@ -16,6 +16,10 @@ import {
   mergePreparedUserTurnMessageForRuntime,
 } from "../../../sessions/user-turn-transcript.js";
 import { captureEnv, setTestEnvValue } from "../../../test-utils/env.js";
+import {
+  formatAgentInternalEventsForPrompt,
+  formatGeneratedMediaDeliveryRetryForPrompt,
+} from "../../internal-events.js";
 import type { AgentMessage } from "../../runtime/index.js";
 import { createUnsafeMountedSandbox } from "../../test-helpers/unsafe-mounted-sandbox.js";
 import {
@@ -374,46 +378,163 @@ describe("detectAndLoadPromptImages", () => {
 
   it("reads host-delivered generated files outside the workspace, and only those files", async () => {
     const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-host-media-ws-"));
-    const mediaDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-host-media-store-"));
+    // A state directory with a space: prompt path scanning cannot recover this path.
+    const mediaDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw host media store-"));
     const imagePath = path.join(mediaDir, "generated.png");
     const siblingPath = path.join(mediaDir, "other.png");
+    const audioPath = path.join(mediaDir, "generated.mp3");
     await fs.writeFile(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
     await fs.writeFile(siblingPath, Buffer.from(TINY_PNG_BASE64, "base64"));
-    // The queued completion turn lists the producer's output as an attachment line (quoted path,
-    // which prompt discovery detects) and as a MEDIA: delivery directive.
+    await fs.writeFile(audioPath, "not audio");
+    // Real queued completion prompt: JSON-quoted attachment line plus MEDIA: directive.
     const completion = (file: string) =>
-      `Attachments:\n1. type=image path="${file}"\n\nGenerated media:\nMEDIA:${file}`;
-    const prompt = completion(imagePath);
-
-    try {
-      const delivered = await detectAndLoadPromptImages({
+      formatAgentInternalEventsForPrompt([
+        {
+          type: "task_completion",
+          source: "image_generation",
+          childSessionKey: "image_generate:task",
+          announceType: "image generation task",
+          taskLabel: "image",
+          status: "ok",
+          statusLabel: "completed successfully",
+          result: "Generated 1 image.",
+          attachments: [{ type: "image", path: file, mimeType: "image/png" }],
+          mediaUrls: [file],
+          replyInstruction: "Describe the image.",
+        },
+      ]);
+    const load = (prompt: string, hostDeliveredMediaPaths: string[]) =>
+      detectAndLoadPromptImages({
         prompt,
         workspaceDir,
         model: { input: ["text", "image"] },
         workspaceOnly: true,
-        hostDeliveredMediaPaths: [imagePath],
+        hostDeliveredMediaPaths,
       });
-      expect(delivered.images).toHaveLength(1);
-      expect(delivered.loadedCount).toBe(1);
-      expect(delivered.skippedCount).toBe(0);
+
+    try {
+      for (const prompt of [
+        completion(imagePath),
+        // Real retry prompt: bare MEDIA: lines only, which path scanning never detects.
+        formatGeneratedMediaDeliveryRetryForPrompt([imagePath]),
+      ]) {
+        const delivered = await load(prompt, [imagePath, audioPath]);
+        expect(delivered.images).toHaveLength(1);
+        expect(delivered.loadedCount).toBe(1);
+        expect(delivered.skippedCount).toBe(0);
+      }
 
       // A path the host did not deliver keeps the workspace-only roots, even beside the
       // delivered file in the same media directory.
-      const sibling = await detectAndLoadPromptImages({
-        prompt: `${prompt}\n\n${completion(siblingPath)}`,
-        workspaceDir,
-        model: { input: ["text", "image"] },
-        workspaceOnly: true,
-        hostDeliveredMediaPaths: [imagePath],
-      });
-      expect(sibling.images).toHaveLength(1);
-      expect(sibling.loadedCount).toBe(1);
-      expect(sibling.skippedCount).toBe(1);
+      const siblingDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-host-media-sibling-"));
+      const plainSibling = path.join(siblingDir, "other.png");
+      await fs.writeFile(plainSibling, Buffer.from(TINY_PNG_BASE64, "base64"));
+      try {
+        const sibling = await load(`${completion(imagePath)}\n\n${completion(plainSibling)}`, [
+          imagePath,
+        ]);
+        expect(sibling.images).toHaveLength(1);
+        expect(sibling.loadedCount).toBe(1);
+        expect(sibling.skippedCount).toBe(1);
+      } finally {
+        await fs.rm(siblingDir, { recursive: true, force: true });
+      }
+      // Without the delivery record nothing outside the workspace is admitted.
+      expect(
+        (await load(formatGeneratedMediaDeliveryRetryForPrompt([siblingPath]), [])).images,
+      ).toEqual([]);
     } finally {
       await fs.rm(workspaceDir, { recursive: true, force: true });
       await fs.rm(mediaDir, { recursive: true, force: true });
     }
   });
+
+  it("reads a listed plain or file:// generated image once, and keeps configured roots elsewhere", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-host-once-ws-"));
+    const mediaDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-host-once-media-"));
+    const imagePath = path.join(mediaDir, "generated.png");
+    await fs.writeFile(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
+    const completion = (mediaUrl: string) =>
+      formatAgentInternalEventsForPrompt([
+        {
+          type: "task_completion",
+          source: "image_generation",
+          childSessionKey: "image_generate:task",
+          announceType: "image generation task",
+          taskLabel: "image",
+          status: "ok",
+          statusLabel: "completed successfully",
+          result: "Generated 1 image.",
+          attachments: [{ type: "image", path: mediaUrl }],
+          mediaUrls: [mediaUrl],
+          replyInstruction: "Describe the image.",
+        },
+      ]);
+    const load = (mediaUrl: string, options: { workspaceOnly: boolean; localRoots?: string[] }) =>
+      detectAndLoadPromptImages({
+        prompt: completion(mediaUrl),
+        workspaceDir,
+        model: { input: ["text", "image"] },
+        ...options,
+        hostDeliveredMediaPaths: [mediaUrl],
+      });
+
+    try {
+      // The prompt names a plain path (detectable) and a file:// URL; each is read exactly once.
+      for (const mediaUrl of [imagePath, pathToFileURL(imagePath).href]) {
+        const result = await load(mediaUrl, { workspaceOnly: true });
+        expect(result.images).toHaveLength(1);
+        expect(result.loadedCount).toBe(1);
+        expect(result.skippedCount).toBe(0);
+      }
+      // Outside workspaceOnly the configured roots still decide, even for host-delivered files.
+      const narrowed = await load(imagePath, { workspaceOnly: false, localRoots: [workspaceDir] });
+      expect(narrowed.images).toEqual([]);
+      expect(narrowed.skippedCount).toBe(1);
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+      await fs.rm(mediaDir, { recursive: true, force: true });
+    }
+  });
+
+  // The attachment line JSON-escapes Windows backslashes; only win32 treats these as absolute.
+  it.runIf(process.platform === "win32")(
+    "reads a host-delivered Windows path once despite its JSON-escaped attachment line",
+    async () => {
+      const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-host-win-ws-"));
+      const mediaDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-host-win-media-"));
+      const imagePath = path.join(mediaDir, "generated.png");
+      await fs.writeFile(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
+      try {
+        const result = await detectAndLoadPromptImages({
+          prompt: formatAgentInternalEventsForPrompt([
+            {
+              type: "task_completion",
+              source: "image_generation",
+              childSessionKey: "image_generate:task",
+              announceType: "image generation task",
+              taskLabel: "image",
+              status: "ok",
+              statusLabel: "completed successfully",
+              result: "Generated 1 image.",
+              attachments: [{ type: "image", path: imagePath }],
+              replyInstruction: "Describe the image.",
+            },
+          ]),
+          workspaceDir,
+          model: { input: ["text", "image"] },
+          workspaceOnly: true,
+          hostDeliveredMediaPaths: [imagePath],
+        });
+        expect(result.images).toHaveLength(1);
+        expect(result.loadedCount).toBe(1);
+        expect(result.skippedCount).toBe(0);
+      } finally {
+        await fs.rm(workspaceDir, { recursive: true, force: true });
+        await fs.rm(mediaDir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("uses a described fact identity to suppress its generated media-note path", async () => {
     const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-described-dedupe-"));

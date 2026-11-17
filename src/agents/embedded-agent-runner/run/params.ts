@@ -260,6 +260,12 @@ export type RunEmbeddedAgentParams = {
   explicitSkillSelections?: ExplicitSkillSelection[];
   images?: ImageContent[];
   imageOrder?: PromptImageOrderEntry[];
+  /**
+   * Host-owned generated media this turn delivers itself. Local image files in this list are
+   * loaded as prompt images (as those exact files, even under workspaceOnly) so the model can
+   * inspect what it just generated; they are not passed as agent input attachments.
+   */
+  internalDeliveryMediaUrls?: string[];
   /** Ordered facts represented by attachment text in the current prompt. */
   media?: MediaFact[];
   /** Optional client-provided tools (OpenResponses hosted tools). */

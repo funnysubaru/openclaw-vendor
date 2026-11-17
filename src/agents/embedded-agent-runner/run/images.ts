@@ -303,6 +303,12 @@ export async function detectAndLoadPromptImages(params: {
   workspaceOnly?: boolean;
   localRoots?: readonly string[];
   sandbox?: { root: string; bridge: SandboxFsBridge };
+  /**
+   * Generated files the host itself delivers this turn (internalDeliveryMediaUrls). Local images
+   * here are loaded from this list, not from prompt text (JSON-escaped or MEDIA:-only paths are
+   * not reliably detectable), so the model can inspect what it just generated.
+   */
+  hostDeliveredMediaPaths?: readonly string[];
 }): Promise<{
   images: ImageContent[];
   imageFactIndexes: ImageFactIndex[];
@@ -413,10 +419,37 @@ export async function detectAndLoadPromptImages(params: {
   const attachmentRawKeys = new Set(
     attachmentRefs.flatMap((ref) => ref.aliases.flatMap((alias) => rawAliasDedupeKey(alias) ?? [])),
   );
+  // Delivery records hold absolute paths or file:// URLs; remote URLs keep prompt discovery, as
+  // do sandboxed runs, which resolve media through the sandbox bridge.
+  const hostDeliveredRefs: MediaFileRef[] = params.sandbox
+    ? []
+    : [...new Set(params.hostDeliveredMediaPaths ?? [])]
+        .flatMap((entry): MediaFileRef[] => {
+          let resolved: string;
+          try {
+            resolved = /^file:\/\//i.test(entry) ? safeFileURLToPath(entry) : entry;
+          } catch {
+            return [];
+          }
+          return path.isAbsolute(resolved) && isImageExtension(resolved)
+            ? [{ raw: entry, type: "path", resolved }]
+            : [];
+        })
+        .filter((ref) => !attachmentKeys.has(refDedupeKey(ref, params.workspaceDir)));
+  // The prompt also names these files (JSON-quoted on attachment lines), so skip prompt refs for
+  // exactly the files read above, in raw, resolved, or JSON-escaped (Windows backslash) form.
+  const hostDeliveredKeys = new Set(
+    hostDeliveredRefs.flatMap(({ raw, resolved }) =>
+      [raw, resolved, JSON.stringify(resolved).slice(1, -1)].flatMap(
+        (alias) => rawAliasDedupeKey(alias) ?? [],
+      ),
+    ),
+  );
   const promptRefs = detectImageReferences(params.prompt).filter(
     (ref) =>
       !attachmentRawKeys.has(rawAliasDedupeKey(ref.raw) ?? "") &&
-      !attachmentKeys.has(refDedupeKey(ref, params.workspaceDir)),
+      !attachmentKeys.has(refDedupeKey(ref, params.workspaceDir)) &&
+      !hostDeliveredKeys.has(rawAliasDedupeKey(ref.raw) ?? ""),
   );
   const detectedRefs = [
     ...availableRefs.flatMap(({ detect, hydrate, raw, type, resolved }) =>
@@ -425,6 +458,7 @@ export async function detectAndLoadPromptImages(params: {
         ? [{ raw, type, resolved }]
         : [],
     ),
+    ...hostDeliveredRefs,
     ...promptRefs,
   ];
   let loadedCount = 0;
@@ -434,7 +468,12 @@ export async function detectAndLoadPromptImages(params: {
     const image = await loadImageFromRef(ref, ref.workspaceDir ?? params.workspaceDir, {
       maxBytes: params.maxBytes,
       workspaceOnly: params.workspaceOnly,
-      localRoots: params.localRoots ?? (params.workspaceOnly ? [params.workspaceDir] : undefined),
+      // Under workspaceOnly a host-delivered file is admitted as itself (its directory is the root
+      // for this one read); other runs and paths keep configured roots, which cover agent media.
+      localRoots:
+        params.workspaceOnly === true && hostDeliveredRefs.includes(ref)
+          ? [path.dirname(ref.resolved)]
+          : (params.localRoots ?? (params.workspaceOnly ? [params.workspaceDir] : undefined)),
       sandbox: params.sandbox,
     });
     if (image) {
@@ -464,7 +503,7 @@ export async function detectAndLoadPromptImages(params: {
     }
   }
   promptImages.push(...unusedExisting);
-  for (const ref of promptRefs) {
+  for (const ref of [...hostDeliveredRefs, ...promptRefs]) {
     const image = await loadRef(ref);
     if (image) {
       promptImages.push({ image, factIndex: null });

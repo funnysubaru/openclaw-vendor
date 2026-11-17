@@ -425,20 +425,20 @@ describe("detectAndLoadPromptImages", () => {
       }
 
       // A path the host did not deliver keeps the workspace-only roots, even beside the
-      // delivered file in the same media directory.
-      const siblingDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-host-media-sibling-"));
-      const plainSibling = path.join(siblingDir, "other.png");
-      await fs.writeFile(plainSibling, Buffer.from(TINY_PNG_BASE64, "base64"));
-      try {
-        const sibling = await load(`${completion(imagePath)}\n\n${completion(plainSibling)}`, [
-          imagePath,
-        ]);
-        expect(sibling.images).toHaveLength(1);
-        expect(sibling.loadedCount).toBe(1);
-        expect(sibling.skippedCount).toBe(1);
-      } finally {
-        await fs.rm(siblingDir, { recursive: true, force: true });
-      }
+      // delivered file in the same media directory. A file:// URL keeps it detectable in the
+      // prompt even when the directory (or TMPDIR) contains spaces, so the refusal really runs.
+      const siblingUrl = pathToFileURL(siblingPath).href;
+      const sibling = await load(`${completion(imagePath)}\n\n${completion(siblingUrl)}`, [
+        imagePath,
+      ]);
+      expect(sibling.detectedRefs).toContainEqual({
+        raw: siblingUrl,
+        type: "path",
+        resolved: siblingPath,
+      });
+      expect(sibling.images).toHaveLength(1);
+      expect(sibling.loadedCount).toBe(1);
+      expect(sibling.skippedCount).toBe(1);
       // Without the delivery record nothing outside the workspace is admitted.
       expect(
         (await load(formatGeneratedMediaDeliveryRetryForPrompt([siblingPath]), [])).images,

@@ -8,7 +8,7 @@
   },
   "type": "module",
   "dependencies": {
-    "ws": "8.21.3",
+    "ws": "8.23.0",
     "zod": "4.4.3"
   },
   "devDependencies": {

@@ -184,7 +184,7 @@ overrides:
   basic-ftp: 6.2.0
   brace-expansion: 5.0.13
   undici@>=7.0.0 <7.30.2: 7.30.2
-  ws: 8.23.0
+  ws@>=8.0.0 <8.23.0: 8.23.0
   file-type: 22.0.2
   form-data: 4.0.6
   werift-ice@0.2.2>ip: npm:neoip@3.1.0

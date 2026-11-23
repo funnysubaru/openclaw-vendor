@@ -16,7 +16,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 const source = readFileSync("scripts/crabbox-untrusted-bootstrap.sh", "utf8");
 const historicalPnpmSpec =
-  "pnpm@12.1.0+sha512.d9b8276d97f6ec86e49815877f91ee9f63cee61f2063b304e43b6dab8fa07ce8a9afd46d2facd39f921e6a9d06b3c75a81349c7b888c2d22886bae0229901037";
+  "pnpm@12.3.4+sha512.961aa41fb077da3a04a441d9f8e15ebc0c96da8ef710b2eb67bf9ee7cb0610eabd48f1fd85f51cffe73846785fa0f87c56a3a872a1d893f8446741b5cce45457";
 const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) {

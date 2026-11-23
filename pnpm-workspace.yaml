@@ -77,8 +77,9 @@ overrides:
   brace-expansion: 5.0.13
   # Yuiwork 协作版任务 289：间接依赖里的 undici 7.x（jsdom）与 ws 8.x（twitch / feishu / zalo 插件、vitest browser）
   # 也拉到修复版（undici 7.30.2、ws 8.23.0，GHSA 公告的修复下限）；直接依赖的钉版另在各 package.json。
+  # 两条都只覆盖低于修复版的范围：以后 package.json 再升到更高版本时不会被这里压回去。
   "undici@>=7.0.0 <7.30.2": 7.30.2
-  ws: 8.23.0
+  "ws@>=8.0.0 <8.23.0": 8.23.0
   file-type: 22.0.2
   form-data: 4.0.6
   "werift-ice@0.2.2>ip": "npm:neoip@3.1.0"

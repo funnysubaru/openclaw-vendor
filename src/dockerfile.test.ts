@@ -164,6 +164,23 @@ describe("Dockerfile", () => {
     expect(resolveOptionalAptPackages(dockerfile, env)).toBe(expected);
   });
 
+  // Yuiwork 协作版任务 289：默认保留运行层 pnpm（CI 从默认镜像取），构建参数为 0 时整段跳过并反查镜像里没有 pnpm。
+  it("keeps runtime pnpm by default and can skip it with OPENCLAW_DOCKER_RUNTIME_PNPM=0", async () => {
+    const dockerfile = collapseDockerContinuations(await readFile(dockerfilePath, "utf8"));
+    const argIndex = dockerfile.indexOf("ARG OPENCLAW_DOCKER_RUNTIME_PNPM=1");
+    const prepareIndex = dockerfile.indexOf('corepack prepare "$pnpm_spec" --activate');
+
+    expect(argIndex).toBeGreaterThan(-1);
+    expect(prepareIndex).toBeGreaterThan(argIndex);
+    // 构建参数为 0 时：预装段直接 exit 0，末尾自检反过来确认没有 pnpm。
+    expect(dockerfile).toMatch(
+      /if \[ "\$OPENCLAW_DOCKER_RUNTIME_PNPM" = "0" \]; then\s+exit 0;\s+fi &&\s+install -d -m 0755 "\$COREPACK_HOME"/,
+    );
+    expect(dockerfile).toMatch(
+      /if \[ "\$OPENCLAW_DOCKER_RUNTIME_PNPM" = "0" \]; then\s+! command -v pnpm >\/dev\/null 2>&1 && test ! -e \/usr\/local\/share\/corepack\/v1\/pnpm;\s+else\s+COREPACK_ENABLE_NETWORK=0 PNPM_CONFIG_OFFLINE=true pnpm --version;\s+fi/,
+    );
+  });
+
   it("installs optional browser dependencies after pnpm install", async () => {
     const dockerfile = await readFile(dockerfilePath, "utf8");
     const installIndex = dockerfile.indexOf("pnpm install --frozen-lockfile");

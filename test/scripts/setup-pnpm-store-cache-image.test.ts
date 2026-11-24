@@ -41,24 +41,24 @@ function fixture() {
       .update(readFileSync(join(image, name)))
       .digest("hex");
   }
-  const wrapperHash = archive("pnpm-12.15.0.tgz");
-  const nativeHash = archive("exe.linux-x64-12.15.0.tgz");
+  const wrapperHash = archive("pnpm-12.3.4.tgz");
+  const nativeHash = archive("exe.linux-x64-12.3.4.tgz");
   // The fixture is a trusted script with synthetic anchors, not a candidate-supplied pin.
   const script = source
     .replaceAll("/opt/crabbox/toolchain-archives", image)
     .replaceAll("process.platform", '"linux"')
     .replaceAll("process.arch", '"x64"')
     .replace(
-      "b3951d6d6ff4a9f13dc7cf56cd28d2b8eb37dbcc9c68e52e1e1191873ea9f82a017287ab50baadc5ccc494f036c67c0e47eb13608c2fa36f47711b61ea128e61",
+      "961aa41fb077da3a04a441d9f8e15ebc0c96da8ef710b2eb67bf9ee7cb0610eabd48f1fd85f51cffe73846785fa0f87c56a3a872a1d893f8446741b5cce45457",
       wrapperHash,
     )
     .replace(
-      "c9cf9095947ef7e9ebdbd2787d1ce13286a98314c10e776affea5eca8ab55d4b9f9d01677db5d4305b9d0c82b31e2e78e658a71aa98e9977e7d0da2e7cd81c3a",
+      "d99a8e9523e47f05f5879711f853e259ff3e17eda1653ff74ef8542b9b22807ab06900888aaf11ec21b186774ab3adc9b5c2e2d9ad50a68fb05ff128c9f8f225",
       nativeHash,
     );
   const scriptPath = join(root, "seed.mjs");
   writeFileSync(scriptPath, script);
-  const spec = `pnpm@12.15.0+sha512.${wrapperHash}`;
+  const spec = `pnpm@12.3.4+sha512.${wrapperHash}`;
   return {
     root,
     image,
@@ -82,11 +82,11 @@ describe("pnpm image archive consumer", () => {
       expect(result.status, result.stderr).toBe(0);
       const home = result.stdout.trim();
       homes.push(home);
-      const pnpmRoot = join(home, "v1", "pnpm", "12.15.0");
-      expect(readFileSync(join(pnpmRoot, "pnpm"), "utf8")).toBe("pnpm-12.15.0.tgz");
+      const pnpmRoot = join(home, "v1", "pnpm", "12.3.4");
+      expect(readFileSync(join(pnpmRoot, "pnpm"), "utf8")).toBe("pnpm-12.3.4.tgz");
       expect(
         readFileSync(join(pnpmRoot, "node_modules", "@pnpm", "exe.linux-x64", "pnpm"), "utf8"),
-      ).toBe("exe.linux-x64-12.15.0.tgz");
+      ).toBe("exe.linux-x64-12.3.4.tgz");
       const metadata = JSON.parse(readFileSync(join(pnpmRoot, ".corepack"), "utf8"));
       expect(metadata.hash).toBe(f.spec.slice(f.spec.indexOf("+") + 1));
       expect(metadata.bin.pnpm).toBe("./bin/pnpm.mjs");
@@ -97,7 +97,7 @@ describe("pnpm image archive consumer", () => {
     expect(readdirSync(f.runnerTemp)).toHaveLength(2);
   });
 
-  it.each(["pnpm-12.15.0.tgz", "exe.linux-x64-12.15.0.tgz"])(
+  it.each(["pnpm-12.3.4.tgz", "exe.linux-x64-12.3.4.tgz"])(
     "refuses substituted %s without accepting adjacent hash or completion files",
     (name) => {
       const f = fixture();
@@ -119,11 +119,11 @@ describe("pnpm image archive consumer", () => {
     (kind) => {
       const f = fixture();
       if (kind === "missing") {
-        rmSync(join(f.image, "pnpm-12.15.0.tgz"));
+        rmSync(join(f.image, "pnpm-12.3.4.tgz"));
       }
       const spec =
         kind === "different-version"
-          ? f.spec.replace("12.15.0", "12.3.5")
+          ? f.spec.replace("12.3.4", "12.3.5")
           : kind === "different-hash"
             ? f.spec.replace(/.$/u, "z")
             : f.spec;
